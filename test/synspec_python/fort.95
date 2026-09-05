@@ -1,0 +1,19 @@
+ 22500  4.0      ! TEFF, GRAV
+ F  F                ! LTE,  LTGRAY
+ ''                  ! no change of general optional parameters
+ 2000                  ! NFREAD
+  8                   ! NATOMS
+    2   0.00000e+00       0
+    2   1.000000e-1       0
+    0   0.00000e+00       0
+    0   0.00000e+00       0
+    0   0.00000e+00       0
+    1   0.00000e+00       0
+    1   0.00000e+00       0
+    1   0.00000e+00       0
+   1    0     9      0      0      0    ' H 1' 'data/h1.dat'
+   1    1     1      1      0      0    ' H 2' ' '
+   2    0    24      0      0      0    'He 1' 'data/he1.dat'
+   2    1    20      0      0      0    'He 2' 'data/he2.dat'
+   2    2     1      1      0      0    'He 3' ' '
+   0    0     0     -1      0      0    '    ' ' '
