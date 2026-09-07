@@ -39,7 +39,9 @@ synspec/         SYNSPEC spectral synthesis
 test/            benchmark runs and three-way comparisons (test/README.md)
 ```
 
-Requirements: Python 3 + NumPy. Usage:
+Requirements: Python 3 + NumPy; optional: tqdm (live iteration/region
+progress bar when running in a terminal; without it, one progress line per
+iteration/region is still printed to the run log). Usage:
 
 ```python
 import sys

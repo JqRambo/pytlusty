@@ -15,6 +15,12 @@ from params import *
 import commons as C
 from fortran import *
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    # tqdm 未安装时回退为纯文本打印(每个波长区段一行), 不影响计算
+    _tqdm = None
+
 # -*- coding: utf-8 -*-
 """chunk01: synspec54.f 行 1–1115 的逐行直译。
 
@@ -197,6 +203,7 @@ C ==================================================================== I
                         inmoli(ilist)
 
         # 标号 5：线表/分子线表更新后的重入点
+        _pbar = None                  # tqdm 进度条(惰性创建)
         while True:  # 对应 Fortran 标号 5
             # ACTUAL CALCULATION OF THE SYNTHETIC SPECTRUM
             if C.IFEOS > 0:
@@ -225,6 +232,21 @@ C ==================================================================== I
                     idtab()
                     if C.IFMOL > 0:
                         idmtab()
+                # 每个波长区段完成后打印一行进度, 并刷新进度条(若 tqdm 可用);
+                # 进度条仅当 stderr 是终端时启用, 重定向到日志时自动禁用
+                if _pbar is None and _tqdm is not None and C.NBLANK > 0:
+                    _pbar = _tqdm(total=C.NBLANK, desc="SYNSPEC region",
+                                  unit="region",
+                                  disable=not sys.stderr.isatty())
+                if C.NFREQ > 0:
+                    _wl0, _wl1 = C.WLAM[1], C.WLAM[C.NFREQ]
+                else:
+                    _wl0 = _wl1 = 0.0
+                print(f" REGION {C.IBLANK:4d}/{C.NBLANK:4d}   "
+                      f"lambda = {_wl0:10.3f} - {_wl1:10.3f} A")
+                if _pbar is not None:
+                    _pbar.set_postfix_str(f"lambda ~ {_wl0:.1f} A")
+                    _pbar.update(1)
                 if C.IBLANK < C.NBLANK:
                     continue  # GO TO 10
                 if C.NXTSET == 1 and C.IRLIST == 0:
@@ -257,6 +279,8 @@ C ==================================================================== I
         break
     if C.IMODE0 <= -3 and C.IFEOS <= 0:
         fingrd()
+    if _pbar is not None:
+        _pbar.close()
     timing(2, C.IBLANK)
     return  # END
 

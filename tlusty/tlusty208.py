@@ -21,6 +21,12 @@ from params import *
 import commons as C
 from fortran import *
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    # tqdm 未安装时回退为纯文本打印(每次迭代一行), 不影响计算
+    _tqdm = None
+
 
 
 # ==========================================================================
@@ -165,6 +171,14 @@ C *********************************************************
     C.LFIN = False
     if C.NITER == 0:
         C.LFIN = True
+    # 迭代进度条: 仅当 stderr 是终端时启用(经 driver 重定向到日志文件时
+    # 自动禁用, 避免进度条的 \r 刷新污染 pyerr.log); 无论是否启用,
+    # 每次迭代结束都向 stdout(运行日志)打印一行最大相对变化。
+    if _tqdm is not None and not C.LFIN:
+        _pbar = _tqdm(total=C.NITER, desc="TLUSTY iteration", unit="iter",
+                      disable=not sys.stderr.isatty())
+    else:
+        _pbar = None
     #
     #     Basic iteration loop of the hybrid CL/ALI method:
     #
@@ -195,8 +209,15 @@ C *********************************************************
         else:
             rybsol()
         timing(2, C.ITER)
+        # 每次迭代打印一次最大相对变化, 并刷新进度条
+        print(f" ITER {C.ITER:4d}   max. relative change = {C.CHMX:10.3e}")
+        if _pbar is not None:
+            _pbar.set_postfix_str(f"max rel. change = {C.CHMX:.3e}")
+            _pbar.update(1)
         # GO TO 10
     #  20 CONTINUE
+    if _pbar is not None:
+        _pbar.close()
     raise SystemExit                  # STOP
 
 
@@ -15318,6 +15339,8 @@ def solve():
         print(_msg)
         write_line(10, _msg)
 
+    # 记录当次迭代的最大相对变化, 供 main() 的进度显示使用
+    C.CHMX = chmx
     # Finally, set up quantity LFIN that indicates whether or not
     # this iteration of complete linearization is the last one
     C.LFIN = abs(chmx) <= C.CHMAX or C.ITER >= C.NITER
@@ -15603,6 +15626,8 @@ def solves():
         print(_msg)
         write_line(10, _msg)
 
+    # 记录当次迭代的最大相对变化, 供 main() 的进度显示使用
+    C.CHMX = chmx
     # Finally, set up quantity LFIN that indicates whether or not
     # this iteration of complete linearization is the last one
     C.LFIN = abs(chmx) <= C.CHMAX or C.ITER >= C.NITER
@@ -47426,6 +47451,8 @@ def rybchn(changt):
         write_line(10, ' Max change:%12.2e' % chmx)
         raise SystemExit                            # STOP
 
+    # 记录当次迭代的最大相对变化, 供 main() 的进度显示使用
+    C.CHMX = chmx
     # Finally, set up quantity LFIN that indicates whether or not
     # this iteration of complete linearization is the last one
     C.LFIN = abs(chmx) <= C.CHMAX or C.ITER >= C.NITER

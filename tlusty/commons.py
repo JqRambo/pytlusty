@@ -145,6 +145,7 @@ DECLS = {
     "INIT": ("scalar", (), "np.int64"),  # BASICS.FOR /RUNKEY/ INIT
     "LAC2": ("scalar", (), "bool"),  # BASICS.FOR /RUNKEY/ LAC2
     "LFIN": ("scalar", (), "bool"),  # BASICS.FOR /RUNKEY/ LFIN
+    "CHMX": ("scalar", (), "np.float64"),  # Python 新增: 当次迭代最大相对变化(SOLVE/SOLVES/RYBSOL 写入, 供 main 进度显示)
 
     # ===== BASICS.FOR : COMMON /CONKEY/ =====
     "HMIX0": ("scalar", (), "np.float64"),  # BASICS.FOR /CONKEY/ HMIX0
