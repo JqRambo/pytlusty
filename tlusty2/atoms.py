@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-atoms.py — 元素周期表、太阳丰度与显式离子标准配置
+atoms.py — periodic table, solar abundances, and standard explicit-ion setup
 
-数据来源（保证与 TLUSTY 程序本身的丰度原理完全一致）:
-- 元素符号与太阳丰度: TLUSTY 内置表 (tlusty208.f 中 STATE 的 DATA D / DYP,
-  前 30 个元素取自 Grevesse & Sauval 1998, 其余为程序自带值,
-  丰度为数密度比 N(E)/N(H))。
-- 显式离子标准配置: TLUSTY 官方测试算例
-  tests/tlusty/bstar/BGA20000g400v2a.5 (bstar2006 网格的标准设置)。
+Data sources (kept fully consistent with the abundance scheme of TLUSTY itself):
+- Element symbols and solar abundances: TLUSTY built-in table (DATA D / DYP
+  in routine STATE of tlusty208.f; first 30 elements from Grevesse & Sauval
+  1998, the rest built-in; abundances are number-density ratios N(E)/N(H)).
+- Standard explicit-ion setup: official TLUSTY test case
+  tests/tlusty/bstar/BGA20000g400v2a.5 (standard setup of the bstar2006 grid).
 """
 
-# Z=1..99 元素符号(与 TLUSTY DYP 一致)
+# Z=1..99 element symbols (consistent with TLUSTY DYP)
 SYMBOLS = [
     'H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne',
     'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca',
@@ -24,11 +24,11 @@ SYMBOLS = [
     'Pa', 'U', 'Np', 'Pu', 'Am', 'Cm', 'Bk', 'Cf', 'Es',
 ]
 
-# 符号 -> 原子序数
+# symbol -> atomic number
 Z_OF = {sym: z + 1 for z, sym in enumerate(SYMBOLS)}
 
-# Z -> 太阳丰度(数密度比 N(E)/N(H), 与 TLUSTY 内置 DATA D 一致)
-# 注: TLUSTY 中 .5 文件某元素 ABN=0 时即自动使用此太阳丰度。
+# Z -> solar abundance (number-density ratio N(E)/N(H), consistent with TLUSTY built-in DATA D)
+# Note: in TLUSTY, ABN=0 for an element in the .5 file means this solar abundance is used automatically.
 SOLAR_ABUNDANCE = [
     1.0,          1.00e-1,      1.26e-11,     2.51e-11,     5.0e-10,
     3.31e-4,      8.32e-5,      6.76e-4,      3.16e-8,      1.20e-4,
@@ -54,24 +54,24 @@ SOLAR_ABUNDANCE = [
 
 
 def solar_abundance(symbol):
-    """返回某元素的太阳丰度(数密度比 N(E)/N(H))。"""
+    """Return the solar abundance of an element (number-density ratio N(E)/N(H))."""
     return SOLAR_ABUNDANCE[Z_OF[symbol] - 1]
 
 
 # ---------------------------------------------------------------------------
-# 显式离子标准配置(mode=2 元素用)
+# Standard explicit-ion setup (for mode=2 elements)
 #
-# 每个元素给出一个离子列表, 每条:
+# Each element maps to a list of ions; each entry is:
 #   (iz, nlevs, filei, odf)
-#     iz      电离度(0=中性)
-#     nlevs   该离子在模型中用的能级数(与数据文件一致,
-#             取自 bstar2006 标准算例或由数据文件数出)
-#     filei   原子数据文件路径(相对运行目录, 即 'data/xxx');
-#             最后一个一能级离子为 None(无文件, ilast=1)
-#     odf     仅 Fe 这类用 ODF 的离子: (gam文件, lin文件, rap文件),
-#             对应 .5 中 nonstd=-1 的三行附加记录; 其余为 None
+#     iz      ionization stage (0 = neutral)
+#     nlevs   number of levels of this ion used in the model (consistent with
+#             the data file; from the bstar2006 standard case or the data file)
+#     filei   atomic data file path (relative to the run directory, i.e. 'data/xxx');
+#             the last one-level ion is None (no file, ilast=1)
+#     odf     only for ions using ODFs such as Fe: (gam file, lin file, rap file),
+#             corresponding to the three extra records with nonstd=-1 in the .5 file; None otherwise
 #
-# 最后一个离子自动按 ilast=1, nlevs=1 处理(裸核一能级离子)。
+# The last ion is automatically treated as ilast=1, nlevs=1 (bare-nucleus one-level ion).
 # ---------------------------------------------------------------------------
 EXPLICIT_IONS = {
     'H':  [(0, 9,  'data/h1.dat', None),
@@ -123,8 +123,8 @@ EXPLICIT_IONS = {
            (2, 44, 'data/ar3_27+17lev.dat', None),
            (3, 36, 'data/ar4_25+11lev.dat', None),
            (4, 1,  None, None)],
-    # Fe 使用 ODF(非标准离子记录 nonstd=-1), 与 bstar2006 一致;
-    # 注意: 使用 Fe 显式时建议在 NST 中设 ISPODF=1
+    # Fe uses ODFs (non-standard ion records with nonstd=-1), as in bstar2006;
+    # note: when using explicit Fe, setting ISPODF=1 in NST is recommended
     'Fe': [(1, 36, 'data/fe2va.dat',
             ('data/gf2601.gam', 'data/gf2601.lin', 'data/fe2p_14+11lev.rap')),
            (2, 50, 'data/fe3va.dat',
@@ -138,5 +138,5 @@ EXPLICIT_IONS = {
 
 
 def has_explicit(symbol):
-    """该元素是否有现成的显式(mode=2)原子数据配置。"""
+    """Whether a ready-made explicit (mode=2) atomic data setup exists for this element."""
     return symbol in EXPLICIT_IONS

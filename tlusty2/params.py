@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-params.py — TLUSTY 全部 PARAMETER 常量。
+params.py — all TLUSTY PARAMETER constants.
 
-来源：BASICS.FOR / ATOMIC.FOR / ITERAT.FOR / MODELQ.FOR / ODFPAR.FOR 中的
-PARAMETER 语句（注释掉的 PARAMETER 不纳入）。注释保留英文原文。
+Source: PARAMETER statements in BASICS.FOR / ATOMIC.FOR / ITERAT.FOR /
+MODELQ.FOR / ODFPAR.FOR (commented-out PARAMETERs excluded). Comments kept in original English.
 
-注意：Fortran 整数除法为向零截断，如 MPAG = MLEVEL/6+1 = 1134//6+1 = 190。
-有依赖关系的常量按依赖顺序定义。
+Note: Fortran integer division truncates toward zero, e.g. MPAG = MLEVEL/6+1 = 1134//6+1 = 190.
+Constants with dependencies are defined in dependency order.
 """
 
 # ======================================================================
@@ -29,7 +29,7 @@ MTOT    =   280  # max.num. of linearized parameters
 MMU     =     6  # max.num. of angle points
 MFIT    =   357  # max.num. of fit points (OP b-f c.s)
 MITJ    =   380  # max.num. of overlapping transitions
-MMCDW   =    26  # max.num. of levels with pseudocont.
+MMCDW   =   100  # max.num. of levels with pseudocont.
 MMER    =    12  # max.num. of merged levels
 MVOIGT  =  8080  # max.num. of lines with Voigt profile
 MZZ     =    10  # maximum charge for occup.prob. ions
@@ -76,7 +76,7 @@ IBUFF = 95
 # ATOMIC.FOR
 # ======================================================================
 
-MPAG = MLEVEL // 6 + 1  # Fortran 整数除法：MLEVEL/6+1 = 1134//6+1 = 190
+MPAG = MLEVEL // 6 + 1  # Fortran integer division: MLEVEL/6+1 = 1134//6+1 = 190
 MTRPRD = 5
 
 # ======================================================================

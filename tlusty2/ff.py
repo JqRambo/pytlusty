@@ -1,36 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-ff.py — teddy: 直接计算 FF (NLTE/L) 模型
-=========================================
+ff.py — teddy: directly compute an FF (NLTE/L) model
+=====================================================
 
-设置好下面的参数后运行:   python3 ff.py
+After setting the parameters below, run:   python3 ff.py
 
-FF 是完整非 LTE 模型, 必须从起始模型出发(TLUSTY 本身的要求):
-在 START_MODEL 中给出起始模型名(不带后缀), 例如起始大气模型文件为
-old.7, 就写 START_MODEL = 'old', 程序自动把 old.7 作为初始模型
-(先在当前目录找, 再在 OUTPUT_DIR 中找)。
+FF is a full non-LTE model and must start from a starting model (TLUSTY
+requirement): START_MODEL gives the starting model name (no suffix); for
+file old.7 write START_MODEL = 'old'; old.7 is the initial model (found
+first in the current directory, then in OUTPUT_DIR).
 
-元素的离子能级表根据 ELEMENTS 的设置自动识别配置
-(nlevs/ilast/ilvlin 等, 按 TLUSTY 官方标准算例), 不需要手工输入。
+Ion level tables are configured automatically from the ELEMENTS settings
+(nlevs/ilast/ilvlin etc., per TLUSTY standard cases); no manual input.
 
-输出在 OUTPUT_DIR 中: FF.5, FF.6(日志), FF.7(模型), FF.9(收敛历史),
-FF.14, FF.69, nst 以及全部 fort.* 文件; 不保留 data 链接。
+Output goes to OUTPUT_DIR: FF.5, FF.6 (log), FF.7 (model), FF.9
+(convergence history), FF.14, FF.69, nst, all fort.* files; no data links.
 
-并行: NPAR 设置频率循环(程序最热点)的多进程并行进程数;
-NPAR=None 为串行, 与原版 TLUSTY 逐位一致; 并行只改变浮点求和顺序,
-数值差异在 1e-16 量级, 建议 NPAR = os.cpu_count()。
+Parallelism: NPAR = worker count for the frequency loop (the hot spot);
+NPAR=None is serial, bit-identical to original TLUSTY; parallel only
+reorders float sums (~1e-16); recommend NPAR = os.cpu_count().
 """
 
 from driver import run_model
 
-# ------------------------- 基本参数 -------------------------
-TEFF = 22000.0          # 有效温度 [K]
-LOGG = 4.0              # 表面重力 log g [cgs]
-NFREAD = 2000           # 频率点数
+# ------------------------- Basic parameters -------------------------
+TEFF = 22000.0          # effective temperature [K]
+LOGG = 4.0              # surface gravity log g [cgs]
+NFREAD = 2000           # number of frequency points
 
-# ------------------------- 元素与丰度 -------------------------
-# mode: 2=显式 NLTE(能级表自动识别) / 1=隐式 LTE / 0=不考虑
-# abn : 丰度(相对氢数密度比, 如 1.000000e-01); 0 = TLUSTY 内置太阳丰度
+# ------------------------- Elements and abundances -------------------------
+# mode: 2=explicit NLTE (level tables auto-detected) / 1=implicit LTE / 0=not considered
+# abn : abundance (number-density ratio relative to hydrogen, e.g. 1.000000e-01); 0 = TLUSTY built-in solar abundance
 ELEMENTS = {
     'H':  {'mode': 2, 'abn': 0.000000e+00, 'modpf': 0},
     'He': {'mode': 2, 'abn': 1.000000e-01, 'modpf': 0},
@@ -39,18 +39,18 @@ ELEMENTS = {
     'O':  {'mode': 1, 'abn': 0.000000e+00, 'modpf': 0},
 }
 
-# ------------------------- nst 非标准参数 -------------------------
-# 光深层数 ND 也在这里设置; 不需要 nst 就写 NST = None
+# ------------------------- nst non-standard parameters -------------------------
+# the number of depth points ND is also set here; write NST = None if nst is not needed
 NST = {'ND': 50, 'NLAMBD': 6, 'ITEK': 40, 'IACC': 40, 'NITER': 31}
 
-# ------------------------- 起始模型与输出 -------------------------
-START_MODEL = 'old'             # 起始模型名(不带 .7 后缀)
+# ------------------------- Starting model and output -------------------------
+START_MODEL = 'old'             # starting model name (without the .7 suffix)
 OUTPUT_DIR = './output/FF'
 
-# ------------------------- 并行设置 -------------------------
-NPAR = None  # 并行进程数; None=串行(与原版逐位一致), 建议 os.cpu_count()
+# ------------------------- Parallel settings -------------------------
+NPAR = None  # number of parallel processes; None=serial (bit-identical to the original), recommend os.cpu_count()
 
-# ------------------------- 执行 -------------------------
+# ------------------------- Execute -------------------------
 if __name__ == '__main__':
     ok, outdir = run_model(
         teff=TEFF, logg=LOGG, elements=ELEMENTS,

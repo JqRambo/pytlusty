@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-fortran.py — Fortran 运行时辅助函数。
+fortran.py — Fortran runtime helper functions.
 
-提供 Fortran 77 内建函数语义（整数除法、MOD、DINT、DNINT、DSIGN、字符串比较）
-以及文件单元（OPEN/READ/WRITE/CLOSE）和无格式顺序临时文件（SCRATCH）的模拟。
+Emulates Fortran 77 intrinsic semantics (integer division, MOD, DINT, DNINT,
+DSIGN, string comparison), file units, and unformatted scratch files (SCRATCH).
 """
 
 import math
@@ -11,10 +11,10 @@ import sys
 
 import numpy as np
 
-# ---------------------------------------------------------------- 内建函数
+# ------------------------------------------------------------- intrinsics
 
 def idiv(a, b):
-    """Fortran 整数除法 I/J：向零截断（与 Python // 的向下取整不同）。"""
+    """Fortran integer division I/J: truncation toward zero (unlike Python //)."""
     q = abs(a) // abs(b)
     if (a < 0) != (b < 0):
         q = -q
@@ -22,36 +22,36 @@ def idiv(a, b):
 
 
 def imod(a, b):
-    """Fortran MOD(I,J)：余数符号与被除数一致（向零截断语义）。"""
+    """Fortran MOD(I,J): remainder has the sign of the dividend (truncation semantics)."""
     return a - idiv(a, b) * b
 
 
 def dint(x):
-    """Fortran DINT(X)：截断取整（向零），返回浮点数。"""
+    """Fortran DINT(X): truncation toward zero, returns a float."""
     return float(math.trunc(x))
 
 
 def dnint(x):
-    """Fortran DNINT(X)：四舍五入到最近整数，半进时远离零，返回浮点数。"""
+    """Fortran DNINT(X): round to nearest integer, halves away from zero, float."""
     if x >= 0:
         return float(math.floor(x + 0.5))
     return float(math.ceil(x - 0.5))
 
 
 def dsign(a, b):
-    """Fortran DSIGN(A,B)：取 |a| 并赋予 b 的符号（b>=0 为正）。"""
+    """Fortran DSIGN(A,B): take |a| with the sign of b (positive if b>=0)."""
     return abs(a) if b >= 0 else -abs(a)
 
 
 def feq(a, b):
-    """Fortran 字符串相等比较：忽略尾部空格（rstrip 后比较）。"""
+    """Fortran string equality: ignores trailing blanks (compare after rstrip)."""
     return str(a).rstrip() == str(b).rstrip()
 
 
 def flog(x):
-    """Fortran 语义的 LOG：log(0)=-inf、log(负数)=nan（IEEE，不 trap）。
+    """Fortran-semantics LOG: log(0)=-inf, log(negative)=nan (IEEE, no trap).
 
-    Python 的 math.log 会抛 ValueError，而 Fortran 默认继续执行。
+    Python's math.log raises ValueError, whereas Fortran continues by default.
     """
     if x > 0.0:
         return math.log(x)
@@ -60,15 +60,15 @@ def flog(x):
     return float("nan")
 
 
-# ---------------------------------------------------------------- 文件单元
+# -------------------------------------------------------------- file units
 
 funits = {}
 
 
 def open_unit(unit, filename=None, mode='r', scratch=False):
-    """对应 Fortran OPEN(UNIT=unit, FILE=filename, ...)。
+    """Corresponds to Fortran OPEN(UNIT=unit, FILE=filename, ...).
 
-    scratch=True 对应 STATUS='SCRATCH'（用 ScratchFile 模拟无格式临时文件）。
+    scratch=True corresponds to STATUS='SCRATCH' (unformatted scratch file).
     """
     if scratch:
         fh = ScratchFile()
@@ -79,16 +79,16 @@ def open_unit(unit, filename=None, mode='r', scratch=False):
 
 
 def _implicit_open(unit, mode):
-    """Fortran 隐式打开：未 OPEN 的单元首次 I/O 时连接 fort.<unit> 文件。
+    """Fortran implicit open: first I/O on an unopened unit connects fort.<unit>.
 
-    读模式下文件不存在时抛 EOFError：Fortran 中隐式 OPEN 失败属于
-    ERR=/END= 可捕获的错误条件，这里统一按 EOF 分支处理。
+    In read mode a missing file raises EOFError: a failed implicit OPEN is an
+    ERR=/END= error condition in Fortran, here handled as the EOF branch.
     """
     try:
         fh = open("fort.%d" % unit, mode)
     except FileNotFoundError:
         if "r" in mode:
-            raise EOFError("unit %d: fort.%d 不存在（隐式 OPEN 失败）"
+            raise EOFError("unit %d: fort.%d does not exist (implicit OPEN failed)"
                            % (unit, unit))
         raise
     funits[unit] = fh
@@ -96,7 +96,7 @@ def _implicit_open(unit, mode):
 
 
 def read_line(unit):
-    """从文件单元读一行，返回不含换行符的 str；EOF 时抛 EOFError。"""
+    """Read one line from a file unit; return str without newline; EOFError at EOF."""
     fh = funits.get(unit)
     if fh is None:
         fh = _implicit_open(unit, "r")
@@ -107,7 +107,7 @@ def read_line(unit):
 
 
 def write_line(unit, s):
-    """向文件单元写一行（自动追加换行符），对应 Fortran 格式 WRITE。"""
+    """Write one line to a file unit (newline appended), like Fortran formatted WRITE."""
     fh = funits.get(unit)
     if fh is None:
         fh = _implicit_open(unit, "w")
@@ -115,28 +115,28 @@ def write_line(unit, s):
 
 
 def close_unit(unit):
-    """对应 Fortran CLOSE(UNIT=unit)：关闭并从 funits 中移除。"""
+    """Corresponds to Fortran CLOSE(UNIT=unit): close and remove from funits."""
     fh = funits.pop(unit)
     if hasattr(fh, "close"):
         fh.close()
 
 
 def read_stdin_line():
-    """对应 Fortran READ(5,...) / READ(*,...)：从标准输入读一行；
-    遇到 EOF 时抛 SystemExit（模拟 Fortran 程序读不到输入而终止）。"""
+    """Corresponds to Fortran READ(5,...) / READ(*,...): read a line from stdin;
+    raise SystemExit on EOF (mimicking a Fortran program aborting with no input)."""
     line = sys.stdin.readline()
     if line == "":
         raise SystemExit("stdin EOF")
     return line.rstrip("\n")
 
 
-# ---------------------------------------------------------------- 临时文件
+# ----------------------------------------------------------- scratch files
 
 class ScratchFile:
-    """模拟 Fortran 无格式顺序临时文件（STATUS='SCRATCH'）。
+    """Emulates a Fortran unformatted sequential scratch file (STATUS='SCRATCH').
 
-    每条 WRITE 存一个记录；numpy 数组在写入时用 np.copy 做快照，
-    读出时返回写时的快照本身（与 Fortran 无格式读语义一致）。
+    Each WRITE stores one record; numpy arrays are snapshotted with np.copy on
+    write, and reads return the write-time snapshot itself (Fortran semantics).
     """
 
     def __init__(self):
@@ -144,10 +144,10 @@ class ScratchFile:
         self._pos = 0
 
     def write(self, *vals):
-        """写一条记录：WRITE(u) A,B,... ；数组自动快照。
+        """Write one record: WRITE(u) A,B,... ; arrays are snapshotted automatically.
 
-        若读/写指针不在记录末尾，先截断其后旧记录再追加——模拟 Fortran
-        顺序写的覆盖语义（在当前位置写入会使原文件中其后的内容失效）。
+        If the read/write pointer is not at the end of the records, truncate the
+        old records after it before appending — Fortran sequential-write semantics.
         """
         snap = tuple(np.copy(v) if isinstance(v, np.ndarray) else v
                      for v in vals)
@@ -157,7 +157,7 @@ class ScratchFile:
         self._pos += 1
 
     def read(self):
-        """读下一条记录：单值返回该值，多值返回元组；数组返回快照本身。"""
+        """Read the next record: single value returned as-is, multiple as a tuple; arrays return the snapshot itself."""
         if self._pos >= len(self._records):
             raise EOFError("scratch file: read past end of records")
         rec = self._records[self._pos]
@@ -165,29 +165,29 @@ class ScratchFile:
         return rec[0] if len(rec) == 1 else rec
 
     def rewind(self):
-        """对应 Fortran REWIND：读指针回到开头。"""
+        """Corresponds to Fortran REWIND: move the read pointer to the start."""
         self._pos = 0
 
     def backspace(self):
-        """对应 Fortran BACKSPACE：读/写指针后退一条记录（开头处则不动）。"""
+        """Corresponds to Fortran BACKSPACE: move the read/write pointer back one record (no-op at the start)."""
         if self._pos > 0:
             self._pos -= 1
 
     def endfile(self):
-        """对应 Fortran ENDFILE：截断当前位置之后的所有记录。
+        """Corresponds to Fortran ENDFILE: truncate all records after the current position.
 
-        近似语义：Fortran 的 ENDFILE 是在当前位置写一个文件结束标记，
-        之后再 BACKSPACE/REWIND 仍可读前面的记录；这里直接丢弃尾部记录，
-        对本程序的 scratch 用法（写满→REWIND→读）足够。
+        Approximate semantics: Fortran's ENDFILE writes an end-of-file mark at
+        the current position; BACKSPACE/REWIND can still read earlier records.
+        Here we drop trailing records, enough for fill → REWIND → read usage.
         """
         del self._records[self._pos:]
 
 
 def rewind_unit(unit):
-    """对应 Fortran REWIND unit：普通文件 seek(0)，scratch 调 rewind()。
+    """Corresponds to Fortran REWIND unit: seek(0) for plain files, rewind() for scratch.
 
-    未打开的单元：Fortran 会隐式连接 fort.<unit>；这里以 w+ 打开
-    （截断旧文件，因为随后的写就是从文件开头重写全部内容）。
+    Unopened unit: Fortran would implicitly connect fort.<unit>; here it is
+    opened as w+ (truncating the old file; a later write rewrites from the start).
     """
     fh = funits.get(unit)
     if isinstance(fh, ScratchFile):
@@ -202,23 +202,23 @@ def rewind_unit(unit):
 
 
 def endfile_unit(unit):
-    """对应 Fortran ENDFILE unit。
+    """Corresponds to Fortran ENDFILE unit.
 
-    普通文件：截断到当前位置（file.truncate()）；scratch：截断记录列表。
-    近似语义见 ScratchFile.endfile 的注释。
+    Plain files: truncate at the current position (file.truncate()); scratch:
+    truncate the record list. See ScratchFile.endfile for the semantics.
     """
     fh = funits.get(unit)
     if isinstance(fh, ScratchFile):
         fh.endfile()
     elif fh is not None:
-        # r+ 模式下读操作后必须先 flush 再 truncate，否则截断不生效
+        # in r+ mode a read must be followed by flush before truncate, else truncation has no effect
         fh.flush()
         fh.truncate(fh.tell())
     elif unit in scratch:
         scratch[unit].endfile()
     else:
-        raise KeyError("unit %d 未打开" % unit)
+        raise KeyError("unit %d not open" % unit)
 
 
-# 单元 91/92/93 是无格式临时文件（STATUS='SCRATCH'）
+# units 91/92/93 are unformatted scratch files (STATUS='SCRATCH')
 scratch = {91: ScratchFile(), 92: ScratchFile(), 93: ScratchFile()}

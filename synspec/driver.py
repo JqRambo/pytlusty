@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-driver.py — teddy/synspec 驱动: 用 Python 版 SYNSPEC 合成光谱
+driver.py — teddy/synspec driver: synthesize spectra with the Python SYNSPEC.
 
-用户在含有同名 .5 和 .7 的目录下工作, 只需给出文件名前缀和路径:
-  - <名>.5  TLUSTY 格式的设置文件(与 TLUSTY 输入相同; 第三行 nst 文件名
-            由本驱动按 nst 参数重写, 原文件不动)
-  - <名>.7  模型大气(TLUSTY 的输出模型)
-  - .5 与 .7 前缀必须相同, 代表同一个模型; 前缀纯粹是文件名, 与模型种类无关
+Work in a directory holding same-named .5 and .7 files; give the prefix and path:
+  - <name>.5  TLUSTY-format setup file (same as TLUSTY input; its third
+            line, the nst filename, is rewritten per nst; original untouched)
+  - <name>.7  model atmosphere (TLUSTY output model)
+  - .5/.7 prefixes must match (same model); the prefix is just a filename
 
-nst=None → 不设非标准参数(.5 第三行置 ''); nst=dict → 生成 nst 文件
-(KEY=VALUE)并令 .5 指向它。
+nst=None -> no non-standard params (.5 line 3 set to ''); nst=dict ->
+generate an nst file (KEY=VALUE) and point the .5 at it.
 
-输出(对照原版 RSynspec 脚本的约定):
-  <名>.spec  合成光谱(fort.7)    <名>.cont  连续谱流量(fort.17)
-  <名>.id    谱线证认表(fort.12)  <名>.eqw   等值宽度(fort.16)
-  <名>.log   运行日志(unit 6)     pyerr.log  Python 报错(应为空)
-  另保留 fort.* 全套(含 fort.5 = 实际使用的修补版输入);
-  不保留 data 链接(运行期间临时建立, 结束后删除)。
+Outputs (conventions of the original RSynspec script):
+  <name>.spec  synthetic spectrum (fort.7)  <name>.cont  continuum flux (fort.17)
+  <name>.id  line identification (fort.12)  <name>.eqw  equivalent widths (fort.16)
+  <name>.log  run log (unit 6)  pyerr.log  Python errors (should be empty)
+  The full fort.* set is kept (incl. fort.5 = patched input actually used);
+  the data link is not kept (created temporarily, removed after the run).
 """
 import os
 import shutil
@@ -30,7 +30,7 @@ DATA_DIR = os.path.normpath(os.path.join(PACKAGE_DIR, os.pardir,
 
 
 def write_nst(path, nst):
-    """写出 nst 非标准参数文件(KEY=VALUE, 逗号分隔, 70 列折行)。"""
+    """Write the nst non-standard parameter file (KEY=VALUE, comma-separated, wrapped at 70 columns)."""
     def fmt(v):
         if isinstance(v, bool):
             return 'T' if v else 'F'
@@ -56,14 +56,14 @@ def write_fort55(path, imode=0, idstd=0, iprin=1,
                  alam0=4000., alast=7000., cutof0=10., cutofs=0.,
                  relop=1.e-4, space=2.,
                  nmlist=0, iunitm=20):
-    """生成 SYNSPEC 附加输入 fort.55(格式与 ivan.py 的 create_fort55_lin 一致)。
+    """Generate the SYNSPEC auxiliary input fort.55 (same format as create_fort55_lin in ivan.py).
 
-    imode  0=正常合成谱 / 1=谱线轮廓细节 / 2=纯连续谱(不含线, 不需要线列表)
-           -1=只出线证认表 / -2=iron-curtain 单色不透明度
-    inmod  1=输入模型是 TLUSTY 模型(fort.8), 默认即可
-    inlist 线列表格式: 0=文本(官方算例约定, ibin=mod(inlist,10)=0) /
-           1=二进制无格式; 文本线列表必须用 0
-    alam0/alast  合成波段 [Å](alast<0 表示全用真空波长)
+    imode  0=normal synthetic spectrum / 1=detailed line profile / 2=pure
+           continuum (no lines, no line list) / -1=line ID list only / -2=iron-curtain opacity
+    inmod  1=input model is a TLUSTY model (fort.8); the default is fine
+    inlist line list format: 0=text (official example convention, ibin=mod(inlist,10)=0) /
+           1=binary unformatted; text line lists must use 0
+    alam0/alast  synthesis wavelength range [Å] (alast<0 means all vacuum wavelengths)
     """
     with open(path, 'w') as f:
         f.write(f"{imode:8d} {idstd:7d} {iprin:7d}                                \n")
@@ -76,11 +76,11 @@ def write_fort55(path, imode=0, idstd=0, iprin=1,
 
 
 def _patched_fort5(src5, dst, nst_name):
-    """把 <名>.5 复制为 fort.5, 并按 nst 设置重写第三行(nst 文件名行)。"""
+    """Copy <name>.5 to fort.5, rewriting the third line (nst filename) per the nst setting."""
     with open(src5) as f:
         lines = f.readlines()
     if len(lines) < 3:
-        raise ValueError(f"{src5} 行数不足, 不是合法的 TLUSTY 格式 .5 文件")
+        raise ValueError(f"{src5} has too few lines; not a valid TLUSTY-format .5 file")
     if nst_name:
         lines[2] = f" '{nst_name}'                  ! non-standard parameter file ('' = none)\n"
     else:
@@ -91,16 +91,16 @@ def _patched_fort5(src5, dst, nst_name):
 
 def run_synspec(name, workdir='.', nst=None, linelist=None,
                 run=True, verbose=True, **kw):
-    """在 workdir 中用 <name>.5 + <name>.7 合成光谱。
+    """Synthesize a spectrum in workdir from <name>.5 + <name>.7.
 
-    name      文件名前缀(如 'FF'; 要求 workdir 下同时存在 FF.5 和 FF.7)
-    workdir   工作路径
-    nst       None=不设非标准参数; dict=写入 nst 文件并启用
-    linelist  线列表: 'gfATO'/'gfMOL'/'gfTiO' 选内置线列表
-              (teddy/synspec/data/<名>.dat, 复制为 fort.19);
-              也可直接给文件路径; imode=2 纯连续谱时可为 None
-    **kw      fort.55 的全部参数, 见 write_fort55(imode/alam0/alast/...)
-    返回 (ok, workdir)
+    name      filename prefix (e.g. 'FF'; requires FF.5 and FF.7 to both exist in workdir)
+    workdir   working directory
+    nst       None=no non-standard parameters; dict=write an nst file and enable it
+    linelist  line list: 'gfATO'/'gfMOL'/'gfTiO' selects a built-in line list
+              (teddy/synspec/data/<name>.dat, copied to fort.19);
+              a direct file path may also be given; may be None for imode=2 pure continuum
+    **kw      all fort.55 parameters, see write_fort55(imode/alam0/alast/...)
+    Returns (ok, workdir)
     """
     workdir = os.path.abspath(workdir)
     src5 = os.path.join(workdir, name + '.5')
@@ -108,14 +108,14 @@ def run_synspec(name, workdir='.', nst=None, linelist=None,
     for src in (src5, src7):
         if not os.path.exists(src):
             raise FileNotFoundError(
-                f"缺少输入文件: {src}(.5 和 .7 必须同名前缀同时存在)")
+                f"missing input file: {src}(.5 and .7 must exist with the same prefix)")
 
-    # 内置线列表名 → teddy/synspec/data/<名>.dat
+    # built-in line list name -> teddy/synspec/data/<name>.dat
     if linelist and not os.path.sep in linelist and not os.path.exists(linelist):
         builtin = os.path.join(PACKAGE_DIR, 'data', linelist + '.dat')
         if not os.path.exists(builtin):
             raise FileNotFoundError(
-                f"未知内置线列表: {linelist}(可选 gfATO/gfMOL/gfTiO, 或给文件路径)")
+                f"unknown built-in line list: {linelist}(choose gfATO/gfMOL/gfTiO, or give a file path)")
         linelist = builtin
 
     if nst:
@@ -128,17 +128,17 @@ def run_synspec(name, workdir='.', nst=None, linelist=None,
         shutil.copy(linelist, os.path.join(workdir, 'fort.19'))
 
     if verbose:
-        print(f"[teddy/synspec] 模型 {name}  工作目录 {workdir}")
-        print(f"[teddy/synspec]   输入: {name}.5 + {name}.7"
-              f"  nst: {'有 ' + str(nst) if nst else '无'}"
-              f"  线列表: {linelist if linelist else '无'}")
+        print(f"[teddy/synspec] model {name}  workdir {workdir}")
+        print(f"[teddy/synspec]   input: {name}.5 + {name}.7"
+              f"  nst: {'yes ' + str(nst) if nst else 'none'}"
+              f"  line list: {linelist if linelist else 'none'}")
         print(f"[teddy/synspec]   fort.55: imode={kw.get('imode', 0)} "
-              f"波段 {kw.get('alam0', 4000.):.0f}-{kw.get('alast', 7000.):.0f} Å")
+              f"range {kw.get('alam0', 4000.):.0f}-{kw.get('alast', 7000.):.0f} Å")
 
     if not run:
         return True, workdir
 
-    # data 链接: 运行前建立, 结束后删除
+    # data link: created before the run, removed afterwards
     link = os.path.join(workdir, 'data')
     made_link = False
     if not os.path.exists(link):
@@ -165,9 +165,9 @@ def run_synspec(name, workdir='.', nst=None, linelist=None,
 
     if verbose:
         if ok:
-            print(f"[teddy/synspec] {name} 合成完成, 输出在 {workdir}")
-            print(f"[teddy/synspec]   {name}.spec 合成光谱   {name}.cont 连续谱")
-            print(f"[teddy/synspec]   {name}.id 谱线证认表   {name}.log 运行日志")
+            print(f"[teddy/synspec] {name} synthesis done, output in {workdir}")
+            print(f"[teddy/synspec]   {name}.spec synthetic spectrum   {name}.cont continuum")
+            print(f"[teddy/synspec]   {name}.id line identification list   {name}.log run log")
         else:
-            print(f"[teddy/synspec] {name} 合成失败, 请查看 {log} 和 {errlog}")
+            print(f"[teddy/synspec] {name} synthesis failed, see {log} and {errlog}")
     return ok, workdir

@@ -1,34 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-commons.py — SYNSPEC 全部 COMMON 块变量的懒分配命名空间。
+commons.py — Lazy-allocation namespace for all SYNSPEC COMMON-block variables.
 
-对应 5 个 include 文件（PARAMS.FOR / MODELP.FOR / LINDAT.FOR / SYNTHP.FOR /
-WINCOM.FOR）中的全部 COMMON 块，以及 synspec54.f 子程序体内补充声明的
-COMMON 块（含 3 处无名 blank COMMON）。
+Covers all COMMON blocks in the 5 include files (PARAMS.FOR / MODELP.FOR /
+LINDAT.FOR / SYNTHP.FOR / WINCOM.FOR), plus COMMON blocks additionally
+declared inside the synspec54.f subroutine bodies (including 3 unnamed blank COMMONs).
 
-用法：
+Usage:
     import commons as C
-    C.POPUL[i, j] = 1.0  # 数组：首次访问时按 Fortran 声明维度（每维 +1）分配
-    C.ND = 5             # 标量：首次访问返回默认 0 / 0.0 / False / ''
+    C.POPUL[i, j] = 1.0  # array: allocated on first access with Fortran declared dims (+1 per dim)
+    C.ND = 5             # scalar: first access returns the default 0 / 0.0 / False / ''
 
-规则：
-- 保留 Fortran 1 基索引：数组每维多分配一个元素，索引 0 不使用
-  （LINDAT.FOR 中 AMLIST(0:MMLIST)、IBIN(0:MMLIST) 为 0 基，分配后 0..MMLIST 全可用）。
-- 类型遵循 PARAMS.FOR：IMPLICIT REAL*8 (A-H,O-Z), LOGICAL*1 (L)，
-  即首字母 I-N → int64、A-H/O-Z → float64、L 开头 → bool；显式声明优先：
-  INTEGER*4 → np.int64，REAL*4 → np.float32，CHARACTER*n → dtype=object（元素初值 ''）。
-- DECLS 记录 {名字: (种类, 维度表达式元组, dtype)}；模块级 __getattr__（PEP 562）
-  在首次访问时据此分配，并缓存到模块 globals()，后续访问走正常属性。
-- 维度表达式中的 PARAMETER 名取自 params.py（Fortran 大小写不敏感，此处用规范拼写）；
-  子程序局部 PARAMETER（如 MVOI=2001、NXMAX=1400）直接写成字面量并在注释中注明。
+Rules:
+- Keep Fortran 1-based indexing: each array dimension gets one extra element; index 0 unused
+  (AMLIST(0:MMLIST) and IBIN(0:MMLIST) in LINDAT.FOR are 0-based; after allocation 0..MMLIST are all usable).
+- Types follow PARAMS.FOR: IMPLICIT REAL*8 (A-H,O-Z), LOGICAL*1 (L),
+  i.e. first letter I-N -> int64, A-H/O-Z -> float64, L-prefixed -> bool; explicit declarations win:
+  INTEGER*4 -> np.int64, REAL*4 -> np.float32, CHARACTER*n -> dtype=object (elements initialized to '').
+- DECLS records {name: (kind, tuple of dimension expressions, dtype)}; the module-level __getattr__
+  (PEP 562) allocates accordingly on first access and caches into module globals(); later access is a normal attribute.
+- PARAMETER names in dimension expressions come from params.py (Fortran is case-insensitive; canonical spelling used here);
+  subroutine-local PARAMETERs (e.g. MVOI=2001, NXMAX=1400) are written as literals and noted in the comments.
 """
 
 import numpy as np
 
 import params as P
 
-# {名字: (种类 "array"/"scalar", (维度表达式, ...), dtype)}
-# 每条注释注明来源：文件名/行号 + COMMON 块名 + 原始维度声明。
+# {name: (kind "array"/"scalar", (dimension expression, ...), dtype)}
+# Each entry comment notes its source: file/line + COMMON block name + original dimension declaration.
 DECLS = {
     # ===== PARAMS.FOR : COMMON /BASNUM/ =====
     "NATOM": ("scalar", (), "np.int64"),  # PARAMS.FOR /BASNUM/ NATOM
@@ -301,7 +301,7 @@ DECLS = {
     "WOP": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # MODELP.FOR /MODELP/ WOP(MLEVEL,MDEPTH)
     "WNHINT": ("array", ("NLMX", "MDEPTH", ), "np.float64"),  # MODELP.FOR /MODELP/ WNHINT(NLMX,MDEPTH)
     "WNHE2": ("array", ("NLMX", "MDEPTH", ), "np.float64"),  # MODELP.FOR /MODELP/ WNHE2(NLMX,MDEPTH)
-    "RRR": ("array", ("MDEPTH", "MION", "MATOM", ), "np.float64"),  # MODELP.FOR /MODELP/ RRR(MDEPTH,MION,MATOM)（即注释所称 COMMON/RRRVAL/，synspec54.f:1883）
+    "RRR": ("array", ("MDEPTH", "MION", "MATOM", ), "np.float64"),  # MODELP.FOR /MODELP/ RRR(MDEPTH,MION,MATOM) (i.e. the COMMON/RRRVAL/ referred to in the comments, synspec54.f:1883)
     "JT": ("array", ("MDEPTH", ), "np.int64"),  # MODELP.FOR /MODELP/ JT(MDEPTH)
     "TI0": ("array", ("MDEPTH", ), "np.float64"),  # MODELP.FOR /MODELP/ TI0(MDEPTH)
     "TI1": ("array", ("MDEPTH", ), "np.float64"),  # MODELP.FOR /MODELP/ TI1(MDEPTH)
@@ -328,7 +328,7 @@ DECLS = {
     "DGRADP": ("array", ("MATOM", "MATOM", "MDEPTH", ), "np.float64"),  # MODELP.FOR /OPACAT/ DGRADP(MATOM,MATOM,MDEPTH)
 
     # ===== MODELP.FOR : COMMON /RADFLD/ =====
-    # （注释掉的 FAK/ALI/FLXH(MFREQ,MDEPTH) 不收录）
+    # (commented-out FAK/ALI/FLXH(MFREQ,MDEPTH) not included)
     "RAD": ("array", ("MFREQ", "MDEPTH", ), "np.float64"),  # MODELP.FOR /RADFLD/ RAD(MFREQ,MDEPTH)
     "RAD0": ("array", ("MFREQ", "MDEPTH", ), "np.float64"),  # MODELP.FOR /RADFLD/ RAD0(MFREQ,MDEPTH)
     "FLX0": ("array", ("MFREQ", "MDEPTH", ), "np.float64"),  # MODELP.FOR /RADFLD/ FLX0(MFREQ,MDEPTH)
@@ -394,8 +394,8 @@ DECLS = {
     "NMLIST": ("scalar", (), "np.int64"),  # LINDAT.FOR /MOLTOT/ NMLIST
 
     # ===== LINDAT.FOR : COMMON /LISPAR/ =====
-    "AMLIST": ("array", ("MMLIST", ), "object"),  # LINDAT.FOR /LISPAR/ CHARACTER*40 AMLIST(0:MMLIST)（0 基，分配后 0..MMLIST 可用）
-    "IBIN": ("array", ("MMLIST", ), "np.int64"),  # LINDAT.FOR /LISPAR/ IBIN(0:MMLIST)（0 基，同上）
+    "AMLIST": ("array", ("MMLIST", ), "object"),  # LINDAT.FOR /LISPAR/ CHARACTER*40 AMLIST(0:MMLIST) (0-based; after allocation 0..MMLIST usable)
+    "IBIN": ("array", ("MMLIST", ), "np.int64"),  # LINDAT.FOR /LISPAR/ IBIN(0:MMLIST) (0-based, same as above)
 
     # ===== LINDAT.FOR : COMMON /LINPRF/ =====
     "GAMR0": ("array", ("MPRF", ), "np.float32"),  # LINDAT.FOR /LINPRF/ REAL*4 GAMR0(MPRF)
@@ -510,7 +510,7 @@ DECLS = {
     "DENSCON": ("array", ("MDEPTH", ), "np.float64"),  # WINCOM.FOR /OPAVEL/ DENSCON(MDEPTH)
 
     # ==================================================================
-    # 以下为 synspec54.f 子程序体内补充声明的 COMMON 块
+    # The following are COMMON blocks additionally declared inside the synspec54.f subroutine bodies
     # ==================================================================
 
     # ===== synspec54.f:190 /quasun/ =====
@@ -524,16 +524,16 @@ DECLS = {
     "indexp": ("array", ("MLEVEL", ), "np.int64"),  # /dissol/ indexp(mlevel)
 
     # ===== synspec54.f:310 /PRINTP/ =====
-    "TYPLEV": ("array", ("MLEVEL", ), "object"),  # /PRINTP/ CHARACTER*10 TYPLEV(MLEVEL)（声明见 :304）
+    "TYPLEV": ("array", ("MLEVEL", ), "object"),  # /PRINTP/ CHARACTER*10 TYPLEV(MLEVEL) (declaration at :304)
 
     # ===== synspec54.f:311 /IONDAT/ =====
     "IATI": ("array", ("MION", ), "np.int64"),  # /IONDAT/ IATI(MION)
     "IZI": ("array", ("MION", ), "np.int64"),  # /IONDAT/ IZI(MION)
-    "NLEVS": ("array", ("MION", ), "np.int64"),  # /IONDAT/ NLEVS(MION)；/NL2PAR/ NLEVS(MNION)（MNION=MIOEX=90=MION，同尺寸共用此条目）
+    "NLEVS": ("array", ("MION", ), "np.int64"),  # /IONDAT/ NLEVS(MION); /NL2PAR/ NLEVS(MNION) (MNION=MIOEX=90=MION, same size, shares this entry)
     "NLLIM": ("array", ("MION", ), "np.int64"),  # /IONDAT/ NLLIM(MION)
 
     # ===== synspec54.f:312 /IONFIL/ =====
-    "FIDATA": ("array", ("MION", ), "object"),  # /IONFIL/ CHARACTER*40 FIDATA(MION)（声明见 :306）
+    "FIDATA": ("array", ("MION", ), "object"),  # /IONFIL/ CHARACTER*40 FIDATA(MION) (declaration at :306)
     "FIODF1": ("array", ("MION", ), "object"),  # /IONFIL/ CHARACTER*40 FIODF1(MION)
     "FIODF2": ("array", ("MION", ), "object"),  # /IONFIL/ CHARACTER*40 FIODF2(MION)
     "FIBFCS": ("array", ("MION", ), "object"),  # /IONFIL/ CHARACTER*40 FIBFCS(MION)
@@ -601,7 +601,7 @@ DECLS = {
     "FRLIM": ("scalar", (), "np.float64"),  # /LIMPAR/ FRLIM
 
     # ===== synspec54.f:2093 /lasers/ =====
-    "lasdel": ("scalar", (), "bool"),  # /lasers/ lasdel（IMPLICIT LOGICAL*1 (L)）
+    "lasdel": ("scalar", (), "bool"),  # /lasers/ lasdel (IMPLICIT LOGICAL*1 (L))
 
     # ===== synspec54.f:2094 /linrej/ =====
     "ilne": ("array", ("MDEPTH", ), "np.int64"),  # /linrej/ ilne(mdepth)
@@ -652,19 +652,19 @@ DECLS = {
     "IJCTR": ("array", ("MFREQ", ), "np.int64"),  # /CTRFUN/ IJCTR(MFREQ)
 
     # ===== synspec54.f:2767 /REFDEP/ =====
-    "IREFD": ("array", ("MFREQ", ), "np.int64"),  # /REFDEP/ IREFD(MFREQ)（:9648 处写作 MFRQ，同值 2000）
+    "IREFD": ("array", ("MFREQ", ), "np.int64"),  # /REFDEP/ IREFD(MFREQ) (written MFRQ at :9648, same value 2000)
 
     # ===== synspec54.f:2768 /CENTRL/ =====
     "ZND": ("scalar", (), "np.float64"),  # /CENTRL/ ZND
     "IFZ0": ("scalar", (), "np.int64"),  # /CENTRL/ IFZ0
 
     # ===== synspec54.f:4396 /TOPB/ =====
-    # 局部 PARAMETER：MMAXOP=200, MOP=15（:4392-4393）
+    # local PARAMETER: MMAXOP=200, MOP=15 (:4392-4393)
     "SOP": ("array", ("15", "200", ), "np.float64"),  # /TOPB/ SOP(MOP,MMAXOP)  ! sigma = alog10(sigma/10^-18) of fit point
     "XOP": ("array", ("15", "200", ), "np.float64"),  # /TOPB/ XOP(MOP,MMAXOP)  ! x = alog10(nu/nu0) of fit point
     "NOP": ("array", ("200", ), "np.int64"),  # /TOPB/ NOP(MMAXOP)  ! number of fit points for current level
     "NTOTOP": ("scalar", (), "np.int64"),  # /TOPB/ NTOTOP  ! total number of levels in OP data
-    "IDLVOP": ("array", ("200", ), "object"),  # /TOPB/ CHARACTER*10 IDLVOP(MMAXOP)（声明见 :4394）
+    "IDLVOP": ("array", ("200", ), "object"),  # /TOPB/ CHARACTER*10 IDLVOP(MMAXOP) (declaration at :4394)
     "LOPREA": ("scalar", (), "bool"),  # /TOPB/ LOPREA  ! .T. OP data read in; .F. OP data not yet read in
 
     # ===== synspec54.f:6262 /HE2PRF/ =====
@@ -674,7 +674,7 @@ DECLS = {
     "ILHE2": ("array", ("19", ), "np.int64"),  # /HE2PRF/ ILHE2(19)
     "IUHE2": ("array", ("19", ), "np.int64"),  # /HE2PRF/ IUHE2(19)
 
-    # ===== synspec54.f:7254 /PROHE1/（取字面量维度版本；:7392 处 NT=4 同值） =====
+    # ===== synspec54.f:7254 /PROHE1/ (literal-dimension version; NT=4 at :7392 has the same value) =====
     "PRFHE1": ("array", ("50", "4", "8", "3", ), "np.float64"),  # /PROHE1/ PRFHE1(50,4,8,3)
     "DLMHE1": ("array", ("50", "8", "3", ), "np.float64"),  # /PROHE1/ DLMHE1(50,8,3)
     "XNEHE1": ("array", ("8", ), "np.float64"),  # /PROHE1/ XNEHE1(8)
@@ -694,7 +694,7 @@ DECLS = {
     "NT2": ("scalar", (), "np.int64"),  # /HE2DAT/ NT2
     "NE2": ("scalar", (), "np.int64"),  # /HE2DAT/ NE2
 
-    # ===== synspec54.f:8443 /PHOTCS/（:3502 注释所称 COMMON/PHOPAR/ 即此块） =====
+    # ===== synspec54.f:8443 /PHOTCS/ (the COMMON/PHOPAR/ referred to in the :3502 comment is this block) =====
     "PHOT": ("array", ("MFRQ", "MPHOT", ), "np.float64"),  # /PHOTCS/ PHOT(MFRQ,MPHOT)
     "WPHT0": ("scalar", (), "np.float64"),  # /PHOTCS/ WPHT0
     "WPHT1": ("scalar", (), "np.float64"),  # /PHOTCS/ WPHT1
@@ -716,7 +716,7 @@ DECLS = {
     "VDWC": ("array", ("MDEPTH", ), "np.float64"),  # /PRFQUA/ VDWC(MDEPTH)
 
     # ===== synspec54.f:9881 /NL2PAR/ =====
-    # 局部 PARAMETER：MNION=MIOEX, MNLEV=MLEVEL（:9877-9878）
+    # local PARAMETER: MNION=MIOEX, MNLEV=MLEVEL (:9877-9878)
     "ELIMEV": ("array", ("MIOEX", "MLEVEL", ), "np.float64"),  # /NL2PAR/ ELIMEV(MNION,MNLEV)
     "ELIMOD": ("array", ("MIOEX", "MLEVEL", ), "np.float64"),  # /NL2PAR/ ELIMOD(MNION,MNLEV)
     "ELIML": ("array", ("MIOEX", "MLEVEL", ), "np.float64"),  # /NL2PAR/ ELIML(MNION,MNLEV)
@@ -736,35 +736,35 @@ DECLS = {
     # ===== synspec54.f:10335 /NLTPOP/ =====
     "PNLT": ("array", ("MATOM", "MION", "MDEPTH", ), "np.float64"),  # /NLTPOP/ PNLT(MATOM,MION,MDEPTH)
 
-    # ===== synspec54.f:11065 无名 COMMON（INKUR） =====
-    # DIMENSION POP(MLEVEL),ES(MLEVEL,MLEVEL),BS(MLEVEL)（:11064）
-    "POP": ("array", ("MLEVEL", ), "np.float64"),  # 无名 COMMON POP(MLEVEL)
-    "ES": ("array", ("MLEVEL", "MLEVEL", ), "np.float64"),  # 无名 COMMON ES(MLEVEL,MLEVEL)
-    "BS": ("array", ("MLEVEL", ), "np.float64"),  # 无名 COMMON BS(MLEVEL)
+    # ===== synspec54.f:11065 unnamed COMMON (INKUR) =====
+    # DIMENSION POP(MLEVEL),ES(MLEVEL,MLEVEL),BS(MLEVEL) (:11064)
+    "POP": ("array", ("MLEVEL", ), "np.float64"),  # unnamed COMMON POP(MLEVEL)
+    "ES": ("array", ("MLEVEL", "MLEVEL", ), "np.float64"),  # unnamed COMMON ES(MLEVEL,MLEVEL)
+    "BS": ("array", ("MLEVEL", ), "np.float64"),  # unnamed COMMON BS(MLEVEL)
 
-    # ===== synspec54.f:11156 无名 COMMON（INMOD/INSTART） =====
-    # DIMENSION ESEMAT(MLEVEL,MLEVEL),BESE(MLEVEL),POPLTE(MLEVEL)（:11154）；
-    # 局部 PARAMETER MINPUT=MLEVEL+4（:11153）
-    "ESEMAT": ("array", ("MLEVEL", "MLEVEL", ), "np.float64"),  # 无名 COMMON ESEMAT(MLEVEL,MLEVEL)
-    "BESE": ("array", ("MLEVEL", ), "np.float64"),  # 无名 COMMON BESE(MLEVEL)
-    "POPLTE": ("array", ("MLEVEL", ), "np.float64"),  # 无名 COMMON POPLTE(MLEVEL)
-    "POPUL0": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # 无名 COMMON POPUL0(MLEVEL,MDEPTH)；/relabu/ popul0(mlevel,1)（:21788）与其同名，共用此条目（relabu 只用第 1 列）
-    "X": ("array", ("MLEVEL + 4", ), "np.float64"),  # 无名 COMMON X(MINPUT)，MINPUT=MLEVEL+4
-    "TEMP0": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON TEMP0(MDEPTH)
-    "ELEC0": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON ELEC0(MDEPTH)
-    "DENS0": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON DENS0(MDEPTH)
-    "PPL0": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON PPL0(MDEPTH)
-    "PPL": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON PPL(MDEPTH)
-    "DEPTH": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON DEPTH(MDEPTH)
-    "DM0": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON DM0(MDEPTH)
-    "DP": ("array", ("MDEPTH", ), "np.float64"),  # 无名 COMMON DP(MDEPTH)
+    # ===== synspec54.f:11156 unnamed COMMON (INMOD/INSTART) =====
+    # DIMENSION ESEMAT(MLEVEL,MLEVEL),BESE(MLEVEL),POPLTE(MLEVEL) (:11154);
+    # local PARAMETER MINPUT=MLEVEL+4 (:11153)
+    "ESEMAT": ("array", ("MLEVEL", "MLEVEL", ), "np.float64"),  # unnamed COMMON ESEMAT(MLEVEL,MLEVEL)
+    "BESE": ("array", ("MLEVEL", ), "np.float64"),  # unnamed COMMON BESE(MLEVEL)
+    "POPLTE": ("array", ("MLEVEL", ), "np.float64"),  # unnamed COMMON POPLTE(MLEVEL)
+    "POPUL0": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # unnamed COMMON POPUL0(MLEVEL,MDEPTH); /relabu/ popul0(mlevel,1) (:21788) has the same name and shares this entry (relabu uses only column 1)
+    "X": ("array", ("MLEVEL + 4", ), "np.float64"),  # unnamed COMMON X(MINPUT), MINPUT=MLEVEL+4
+    "TEMP0": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON TEMP0(MDEPTH)
+    "ELEC0": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON ELEC0(MDEPTH)
+    "DENS0": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON DENS0(MDEPTH)
+    "PPL0": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON PPL0(MDEPTH)
+    "PPL": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON PPL(MDEPTH)
+    "DEPTH": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON DEPTH(MDEPTH)
+    "DM0": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON DM0(MDEPTH)
+    "DP": ("array", ("MDEPTH", ), "np.float64"),  # unnamed COMMON DP(MDEPTH)
 
-    # ===== synspec54.f:11423 无名 COMMON（CHANGE） =====
-    "POPULL": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # 无名 COMMON POPULL(MLEVEL,MDEPTH)
-    "POPL": ("array", ("MLEVEL", ), "np.float64"),  # 无名 COMMON POPL(MLEVEL)
+    # ===== synspec54.f:11423 unnamed COMMON (CHANGE) =====
+    "POPULL": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # unnamed COMMON POPULL(MLEVEL,MDEPTH)
+    "POPL": ("array", ("MLEVEL", ), "np.float64"),  # unnamed COMMON POPL(MLEVEL)
 
     # ===== synspec54.f:12450 /callarda/ =====
-    # 局部 PARAMETER：NXMAX=1400, NNMAX=5（:12448）
+    # local PARAMETER: NXMAX=1400, NNMAX=5 (:12448)
     "xlalp": ("array", ("1400", ), "np.float64"),  # /callarda/ xlalp(NXMAX)
     "plalp": ("array", ("1400", "5", ), "np.float64"),  # /callarda/ plalp(NXMAX,NNMAX)
     "stnnea": ("scalar", (), "np.float64"),  # /callarda/ stnnea
@@ -805,13 +805,13 @@ DECLS = {
     "iwarnc": ("scalar", (), "np.int64"),  # /callardc/ iwarnc
 
     # ===== synspec54.f:12777 /calhhe/ =====
-    # 局部 PARAMETER：nxmax=1000（:12774；与 callard* 的 NXMAX=1400 不同子程序）
+    # local PARAMETER: nxmax=1000 (:12774; a different subroutine from callard*'s NXMAX=1400)
     "xlhhe": ("array", ("1000", ), "np.float64"),  # /calhhe/ xlhhe(nxmax)
     "sighhe": ("array", ("1000", ), "np.float64"),  # /calhhe/ sighhe(nxmax)
     "nxhhe": ("scalar", (), "np.int64"),  # /calhhe/ nxhhe
 
     # ===== synspec54.f:12868 /VOITAB/ =====
-    # 局部 PARAMETER：MVOI=2001（:12867）
+    # local PARAMETER: MVOI=2001 (:12867)
     "H0TAB": ("array", ("2001", ), "np.float64"),  # /VOITAB/ H0TAB(MVOI)
     "H1TAB": ("array", ("2001", ), "np.float64"),  # /VOITAB/ H1TAB(MVOI)
     "H2TAB": ("array", ("2001", ), "np.float64"),  # /VOITAB/ H2TAB(MVOI)
@@ -821,7 +821,7 @@ DECLS = {
     "SCC2": ("array", ("MDEPTH", ), "np.float64"),  # /CONSCA/ SCC2(MDEPTH)
 
     # ===== synspec54.f:17491 /fracop/ =====
-    # 局部 PARAMETER：mtemp=100, melec=60, mion1=30（:17488）
+    # local PARAMETER: mtemp=100, melec=60, mion1=30 (:17488)
     "frac": ("array", ("100", "60", "30", ), "np.float64"),  # /fracop/ frac(mtemp,melec,mion1)
     "fracm": ("array", ("100", "60", ), "np.float64"),  # /fracop/ fracm(mtemp,melec)
     "itemp": ("array", ("100", ), "np.int64"),  # /fracop/ itemp(mtemp)
@@ -914,10 +914,10 @@ DECLS = {
 
     # ===== synspec54.f:21788 /relabu/ =====
     "relabn": ("array", ("MATOM", ), "np.float64"),  # /relabu/ relabn(matom)
-    # popul0(mlevel,1) 与无名 COMMON 的 POPUL0 同名，见上方 POPUL0 条目注释
+    # popul0(mlevel,1) shares its name with the unnamed COMMON's POPUL0; see the POPUL0 entry comment above
 
     # ===== synspec54.f:21791 /tabout/ =====
-    "tabname": ("scalar", (), "object"),  # /tabout/ character*(80) tabname（声明见 :21790）
+    "tabname": ("scalar", (), "object"),  # /tabout/ character*(80) tabname (declaration at :21790)
     "ibingr": ("scalar", (), "np.int64"),  # /tabout/ ibingr
     "idens": ("scalar", (), "np.int64"),  # /tabout/ idens
 
@@ -954,12 +954,12 @@ _SCALAR_DEFAULTS = {
 
 
 def _dim(expr):
-    """求值维度表达式（标识符取自 params.py）。"""
+    """Evaluate a dimension expression (identifiers taken from params.py)."""
     return int(eval(expr, {"__builtins__": {}}, dict(vars(P))))
 
 
 def _allocate(name):
-    """按 DECLS 声明分配变量：数组每维 +1，标量返回默认值。"""
+    """Allocate a variable per its DECLS declaration: arrays get +1 per dimension, scalars return the default."""
     kind, dims, dtype = DECLS[name]
     if kind == "scalar":
         return _SCALAR_DEFAULTS[dtype]
@@ -972,9 +972,9 @@ def _allocate(name):
 
 
 def __getattr__(name):
-    """PEP 562：首次访问 COMMON 变量时懒分配并缓存到模块全局。"""
+    """PEP 562: lazily allocate a COMMON variable on first access and cache it in module globals."""
     if name not in DECLS:
-        raise AttributeError("commons 中未声明的 COMMON 变量: %r" % name)
+        raise AttributeError("undeclared COMMON variable in commons: %r" % name)
     value = _allocate(name)
     globals()[name] = value
     return value

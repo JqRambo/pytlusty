@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-driver.py — teddy 包的驱动逻辑: 生成 TLUSTY 输入并运行 Python 版 TLUSTY
+driver.py — driver logic of the teddy package: generate TLUSTY input and run the Python version of TLUSTY
 
-用户在 basic.py 中给出配置(元素/丰度/mode/modpf/TEFF/LOGG/NFREAD/NST/
-输出路径等), 这里负责:
-  1. 自动生成 .5 标准输入文件(包括显式离子的完整离子表)
-  2. 可选生成 nst 非标准参数文件
-  3. 在输出目录中运行 Python 版 TLUSTY
-  4. 运行期间临时建立 data 链接, 结束后删除
-     (输出目录里不保留 data 链接, 其余 fort.* 与 MOD.* 文件全部保留)
+The user gives the configuration in basic.py (elements/abundances/mode/modpf/TEFF/LOGG/NFREAD/NST/
+output path, etc.); this module is responsible for:
+  1. automatically generating the .5 standard input file (including the full ion table for explicit ions)
+  2. optionally generating the nst non-standard parameter file
+  3. running the Python version of TLUSTY in the output directory
+  4. temporarily creating the data symlink during the run and removing it afterwards
+     (the data symlink is not kept in the output directory; all other fort.* and MOD.* files are kept)
 """
 import os
 import shutil
@@ -21,15 +21,15 @@ PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 TLUSTY_PY = os.path.join(PACKAGE_DIR, "tlusty208.py")
 DATA_DIR = os.path.join(PACKAGE_DIR, "data")
 
-# 三种计算模式 (与 ivan.py / TLUSTY 文档一致):
-#   'TT'  LTE       : LTE=T, LTGRAY=T, 所有线细致辐射平衡 (ilvlin=100)
-#   'TF'  NLTE/C    : 仅连续谱 NLTE, 线细致辐射平衡 (ilvlin=100)
-#   'FF'  NLTE/L    : 完整 NLTE, 显式谱线 (ilvlin=0)
+# Three computation modes (consistent with ivan.py / the TLUSTY documentation):
+#   'TT'  LTE       : LTE=T, LTGRAY=T, detailed radiative balance for all lines (ilvlin=100)
+#   'TF'  NLTE/C    : NLTE for continua only, detailed radiative balance for lines (ilvlin=100)
+#   'FF'  NLTE/L    : full NLTE, explicit lines (ilvlin=0)
 MODEL_TYPES = {
     'TT': {'lte': True,  'ltgray': True,  'ilvlin': 100},
     'TF': {'lte': False, 'ltgray': False, 'ilvlin': 100},
     'FF': {'lte': False, 'ltgray': False, 'ilvlin': 0},
-    # 别名
+    # aliases
     'LTE':    {'lte': True,  'ltgray': True,  'ilvlin': 100},
     'NLTEC':  {'lte': False, 'ltgray': False, 'ilvlin': 100},
     'NLTEL':  {'lte': False, 'ltgray': False, 'ilvlin': 0},
@@ -37,38 +37,38 @@ MODEL_TYPES = {
 
 
 # ---------------------------------------------------------------------------
-# .5 输入文件生成
+# .5 input file generation
 # ---------------------------------------------------------------------------
 
 def _fmt_abn(abn):
-    """丰度格式化为 Fortran 浮点写法, 8 位小数不足补零, 如 1.00000000e-01
-    (与 create.py 的 format_abundance 一致; 所有数值长度固定为 14 字符,
-    保证 .5 文件第二列对齐)。"""
+    """Format an abundance in Fortran floating-point notation, 8 decimal digits zero-padded, e.g. 1.00000000e-01
+    (consistent with format_abundance in create.py; all values have a fixed length of 14 characters,
+    ensuring the second column of the .5 file is aligned)."""
     if isinstance(abn, str):
-        return abn                      # 允许直接给字符串(特殊写法)
+        return abn                      # allow passing a string directly (special notation)
     if abn == 0:
         return "0.00000000e+00"
     return f"{abn:.8e}"
 
 
 def atoms_section(elements, model_type='FF'):
-    """根据用户元素设置生成 NATOMS 记录和 ion 记录。
+    """Generate the NATOMS record and the ion records from the user element settings.
 
-    elements: {符号: {'mode': m, 'abn': a, 'modpf': p}}, 支持元素 H..Es(Z<=99)
-    model_type: 'TT'/'TF'/'FF' (或其别名 'LTE'/'NLTEC'/'NLTEL')
+    elements: {symbol: {'mode': m, 'abn': a, 'modpf': p}}; elements H..Es (Z<=99) supported
+    model_type: 'TT'/'TF'/'FF' (or the aliases 'LTE'/'NLTEC'/'NLTEL')
 
-    离子表随模式变化(与 ivan.py 一致):
-      FF (NLTE/L): 所有显式离子 ilvlin=0, 完整能级
-      TT/TF:       每个元素第一个带数据文件的离子保持完整能级,
-                   其后的普通离子压缩为一能级(ilast=1, 保留数据文件),
-                   ODF 离子(如 Fe)保持完整; 带文件离子 ilvlin=100,
-                   一能级裸核离子 ilvlin=0
-    返回 (natoms, atom_lines, ion_lines)
+    The ion table depends on the mode (consistent with ivan.py):
+      FF (NLTE/L): all explicit ions have ilvlin=0, full levels
+      TT/TF:       the first ion of each element with a data file keeps its full levels;
+                   subsequent ordinary ions are compressed to one level (ilast=1, data file kept);
+                   ODF ions (e.g. Fe) stay complete; ions with files get ilvlin=100,
+                   one-level bare-nucleus ions get ilvlin=0
+    Returns (natoms, atom_lines, ion_lines)
     """
     mt = MODEL_TYPES[model_type]
     for sym in elements:
         if sym not in atoms.Z_OF:
-            raise ValueError(f"未知元素符号: {sym!r} (支持 H 到 Es)")
+            raise ValueError(f"unknown element symbol: {sym!r} (supported: H through Es)")
     natoms = max(atoms.Z_OF[sym] for sym in elements)
 
     atom_lines = []
@@ -89,8 +89,8 @@ def atoms_section(elements, model_type='FF'):
             continue
         if sym not in atoms.EXPLICIT_IONS:
             raise ValueError(
-                f"元素 {sym} 没有现成的显式原子数据配置, "
-                f"请改用 mode=1 (隐式), 或在 atoms.py 的 EXPLICIT_IONS 中补充")
+                f"element {sym} has no ready-made explicit atomic data configuration; "
+                f"use mode=1 (implicit) instead, or add it to EXPLICIT_IONS in atoms.py")
         z = atoms.Z_OF[sym]
         ions = cfg.get('ions') or atoms.EXPLICIT_IONS[sym]
         first_file_ion_done = False
@@ -102,7 +102,7 @@ def atoms_section(elements, model_type='FF'):
                 if filei is not None:
                     ilvlin = mt['ilvlin']
                     if first_file_ion_done and odf is None:
-                        # 后续普通离子压缩为一能级(与 ivan.py 的 TT/TF 一致)
+                        # subsequent ordinary ions are compressed to one level (consistent with TT/TF in ivan.py)
                         nlevs = 1
                         ilast = 1
                     first_file_ion_done = True
@@ -113,9 +113,9 @@ def atoms_section(elements, model_type='FF'):
 
 
 def write_model5(path, teff, logg, model_type, nst_name, nfread, elements):
-    """写出 TLUSTY 标准输入文件 MODEL.5。
+    """Write the TLUSTY standard input file MODEL.5.
 
-    model_type: 'TT'/'TF'/'FF' (或别名 'LTE'/'NLTEC'/'NLTEL')
+    model_type: 'TT'/'TF'/'FF' (or the aliases 'LTE'/'NLTEC'/'NLTEL')
     """
     mt = MODEL_TYPES[model_type]
     natoms, atom_lines, ion_lines = atoms_section(elements, model_type)
@@ -157,7 +157,7 @@ def write_model5(path, teff, logg, model_type, nst_name, nfread, elements):
 
 
 def write_nst(path, nst):
-    """写出 nst 非标准参数文件(KEY=VALUE, 逗号分隔, 70 列折行)。"""
+    """Write the nst non-standard parameter file (KEY=VALUE, comma-separated, 70-column wrapping)."""
     def fmt(v):
         if isinstance(v, bool):
             return 'T' if v else 'F'
@@ -176,24 +176,24 @@ def write_nst(path, nst):
 
 
 # ---------------------------------------------------------------------------
-# 运行
+# run
 # ---------------------------------------------------------------------------
 
 def run_model(teff, logg, elements, nfread=2000,
               model_type='FF', nst=None,
               model='FF', output_dir='.', start_model=None,
               run=True, verbose=True):
-    """生成输入并(可选)运行 Python 版 TLUSTY。
+    """Generate the input and (optionally) run the Python version of TLUSTY.
 
     model_type  'TT'(LTE) / 'TF'(NLTE/C) / 'FF'(NLTE/L)
-    输出目录内容: MODEL.5, MODEL.6(日志), nst(若设置), fort.* 全套,
-                  MODEL.7/.9/.69/.14; 不保留 data 链接。
-    返回 (ok, output_dir)
+    Output directory contents: MODEL.5, MODEL.6 (log), nst (if set), the full fort.* set,
+                               MODEL.7/.9/.69/.14; the data symlink is not kept.
+    Returns (ok, output_dir)
     """
     if model_type not in MODEL_TYPES:
-        raise ValueError(f"model_type 必须是 {sorted(MODEL_TYPES)} 之一")
+        raise ValueError(f"model_type must be one of {sorted(MODEL_TYPES)}")
     if not model:
-        model = model_type           # 文件名默认跟随模式: TT/TF/FF
+        model = model_type           # file name follows the mode by default: TT/TF/FF
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -208,30 +208,30 @@ def run_model(teff, logg, elements, nfread=2000,
     if verbose:
         nexp = sum(1 for c in elements.values()
                    if int(c.get('mode', 0)) == 2)
-        print(f"[teddy] 已生成 {mod5}")
-        print(f"[teddy] {model_type} 模式  TEFF={teff:.0f} logg={logg}  "
-              f"NATOMS={natoms}  显式元素数={nexp}  NFREAD={nfread}")
+        print(f"[teddy] generated {mod5}")
+        print(f"[teddy] {model_type} mode  TEFF={teff:.0f} logg={logg}  "
+              f"NATOMS={natoms}  explicit elements={nexp}  NFREAD={nfread}")
         if nst:
-            print(f"[teddy] nst 参数: {nst}")
+            print(f"[teddy] nst parameters: {nst}")
 
-    # 起始模型 -> fort.8
+    # starting model -> fort.8
     if start_model:
-        # 依次尝试: 直接路径 / 路径+.7 / OUTPUT_DIR下 / OUTPUT_DIR下+.7
+        # try in order: direct path / path+.7 / under OUTPUT_DIR / under OUTPUT_DIR+.7
         cands = [start_model, start_model + '.7',
                  os.path.join(output_dir, start_model),
                  os.path.join(output_dir, start_model + '.7')]
         src = next((c for c in cands if os.path.exists(c)), None)
         if src is None:
             raise FileNotFoundError(
-                f"起始模型不存在: 已尝试 {cands}")
+                f"starting model not found: tried {cands}")
         shutil.copy(src, os.path.join(output_dir, 'fort.8'))
         if verbose:
-            print(f"[teddy] 起始模型: {src} -> fort.8")
+            print(f"[teddy] starting model: {src} -> fort.8")
 
     if not run:
         return True, output_dir
 
-    # data 链接: 运行前建立, 结束后删除
+    # data symlink: created before the run, removed afterwards
     link = os.path.join(output_dir, 'data')
     made_link = False
     if not os.path.exists(link):
@@ -259,30 +259,30 @@ def run_model(teff, logg, elements, nfread=2000,
 
     if verbose:
         if ok:
-            print(f"[teddy] 模型 {model} 计算完成, 输出在 {output_dir}")
-            print(f"[teddy]   {model}.7  模型大气   {model}.9  收敛历史")
-            print(f"[teddy]   {model}.6  运行日志   {model}.14 模型摘要")
+            print(f"[teddy] model {model} finished, output in {output_dir}")
+            print(f"[teddy]   {model}.7  model atmosphere   {model}.9  convergence history")
+            print(f"[teddy]   {model}.6  run log            {model}.14 model summary")
         else:
-            print(f"[teddy] 模型 {model} 计算失败, 请查看 {log6} 和 {errlog}")
+            print(f"[teddy] model {model} failed, see {log6} and {errlog}")
     return ok, output_dir
 
 
 def run_chain(teff, logg, elements, nfread=2000, nst=None,
               output_dir='.', verbose=True):
-    """完整的 TT -> TF -> FF 三步链式计算(与 ivan.py 的工作流程一致):
+    """Full TT -> TF -> FF three-step chained computation (consistent with the workflow of ivan.py):
 
-      TT (LTE)     从头计算 -> TT.7
-      TF (NLTE/C)  以 TT.7 为起始模型 -> TF.7
-      FF (NLTE/L)  以 TF.7 为起始模型 -> FF.7  (最终模型)
+      TT (LTE)     computed from scratch -> TT.7
+      TF (NLTE/C)  with TT.7 as the starting model -> TF.7
+      FF (NLTE/L)  with TF.7 as the starting model -> FF.7  (final model)
 
-    nfread 可以是:
-      - 整数: 三步共用同一 NFREAD
-      - {'TT': n1, 'TF': n2, 'FF': n3}: 每一步各自的频率点数
-    nst 可以是:
-      - 普通 dict: 三步共用同一组 nst 参数
-      - {'TT': {...}, 'TF': {...}, 'FF': {...}}: 每一步各自的 nst 参数
-        (某一步缺省则该步不用 nst)
-    返回 (ok, output_dir); ok 表示三步全部成功。
+    nfread can be:
+      - an integer: all three steps share the same NFREAD
+      - {'TT': n1, 'TF': n2, 'FF': n3}: per-step number of frequency points
+    nst can be:
+      - a plain dict: all three steps share the same nst parameters
+      - {'TT': {...}, 'TF': {...}, 'FF': {...}}: per-step nst parameters
+        (a missing step runs without nst)
+    Returns (ok, output_dir); ok means all three steps succeeded.
     """
     def per_stage(x):
         if isinstance(x, dict) and all(k in ('TT', 'TF', 'FF') for k in x):

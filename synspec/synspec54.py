@@ -1,13 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-synspec54.py — SYNSPEC54 的 Python 逐行直译(物理公式、数值方法完全不变)
+synspec54.py - line-by-line Python translation of SYNSPEC54 (physics formulas and numerical methods completely unchanged)
 
-由 fragments/chunk01..17.py 按序拼接而成; 源文件: tlusty/synspec/synspec54.f
-(23917 行固定格式 F77)。翻译约定见 CONVENTIONS.md。
+SYNSPEC computes the synthetic spectrum of a given model atmosphere: it
+assembles continuum and line opacities and emissivities (hydrogen and helium
+lines with detailed Stark broadening, metal lines from an input line list,
+optional molecular lines, and line blanketing through opacity distribution
+functions) and solves the radiative transfer equation through the
+atmosphere, producing the emergent flux and, optionally, specific
+intensities at arbitrary inclination angles. The atmospheric structure is
+taken from TLUSTY/TLUSDISK or Kurucz-type input; SYNSPEC itself does not
+iterate the model.
 
-运行方式: python3 -u synspec54.py < fort.5 > 日志
-(unit 5=stdin 与 TLUSTY 相同的 .5; unit 55=fort.55 附加输入;
- unit 8=fort.8 模型大气; unit 19=fort.19 线列表)
+This file is a faithful line-by-line Python translation of synspec54.f
+(Hubeny & Lanz, SYNSPEC version 54), assembled in order from fragments/chunk01..17.py;
+source file: tlusty/synspec/synspec54.f
+(23917 lines of fixed-format F77). See CONVENTIONS.md for the translation conventions.
+
+Usage: python3 -u synspec54.py < fort.5 > log
+(unit 5 = stdin, the same .5 input as TLUSTY; unit 55 = fort.55 additional input;
+ unit 8 = fort.8 model atmosphere; unit 19 = fort.19 line list)
+
+Numerical methods: for each wavelength interval the lines that may
+contribute opacity are selected and the monochromatic opacity, emissivity,
+and scattering are assembled (INISET, OPAC, LINOP); the transfer equation
+is then solved frequency by frequency for the known source function by the
+second-order Feautrier scheme with variable Eddington factors (RTE), or,
+optionally, by the higher-order discontinuous finite element (DFE) method
+(RTEDFE, with RTECD for the two continuum points).
+
+References:
+- Hubeny 1988, Comput. Phys. Commun. 52, 103 (TLUSTY)
+- Hubeny & Lanz 2017, arXiv:1706.01937 (SYNSPEC); Hubeny & Lanz 2017,
+  arXiv:1706.01935, and 2021, arXiv:2104.02829 (user guides)
+- Hubeny & Lanz 1995, ApJ 439, 875 (hybrid CL/ALI method of the TLUSTY
+  input models)
+- Feautrier 1964, CR 258, 3189 (Feautrier scheme)
+- Auer 1976, JQSRT 16, 931 (Hermitian method)
+- Castor, Dykema & Klein 1992, ApJ 387, 561 (DFE method)
 """
 import math, sys
 import numpy as np
@@ -18,25 +48,25 @@ from fortran import *
 try:
     from tqdm import tqdm as _tqdm
 except ImportError:
-    # tqdm 未安装时回退为纯文本打印(每个波长区段一行), 不影响计算
+    # tqdm falls back to plain-text printing (one line per wavelength interval) when not installed; does not affect the computation
     _tqdm = None
 
 # -*- coding: utf-8 -*-
-"""chunk01: synspec54.f 行 1–1115 的逐行直译。
+"""chunk01: line-by-line translation of synspec54.f lines 1-1115.
 
-包含：PROGRAM SYNSPEC（→ main）、SUBROUTINE START、SUBROUTINE INITIA、
-SUBROUTINE RDATA。
-按 CONVENTIONS.md：禁止 import；COMMON 变量一律用 C.名字；数组保持 1 基索引。
+Contains: PROGRAM SYNSPEC (-> main), SUBROUTINE START, SUBROUTINE INITIA,
+SUBROUTINE RDATA.
+Per CONVENTIONS.md: no import allowed; COMMON variables always referenced as C.<name>; arrays keep 1-based indexing.
 """
 
 
-# ---------------------------------------------------------------- 本片的局部辅助
+# ---------------------------------------------------------------- local helpers for this chunk
 
 def _ld(line):
-    """列表导向（自由格式）READ 的分词：逗号视为分隔符, 支持引号字符串。
+    """Tokenizer for list-directed (free-format) READ: commas treated as delimiters, quoted strings supported.
 
-    引号字符串作为单个 token 返回并去掉引号(如  ' H 1' 'data/h1.dat'
-    → [' H 1', 'data/h1.dat'])。TODO(port): 不支持 r*c 重复计数。
+    Quoted strings are returned as a single token with the quotes stripped (e.g.  ' H 1' 'data/h1.dat'
+    -> [' H 1', 'data/h1.dat']). TODO(port): r*c repeat counts not supported.
     """
     toks = []
     i, n = 0, len(line)
@@ -60,21 +90,21 @@ def _ld(line):
 
 
 def _f(tok):
-    """列表导向浮点转换，兼容 Fortran 的 D 指数。"""
+    """List-directed float conversion; compatible with Fortran D exponents."""
     return float(str(tok).replace('D', 'e').replace('d', 'e'))
 
 
 def _l(tok):
-    """列表导向逻辑转换：T/.TRUE. 开头为真。"""
+    """List-directed logical conversion: true if it starts with T/.TRUE.."""
     t = str(tok).strip().upper()
     return t.startswith('T') or t.startswith('.T')
 
 
-# DATA iexp0/0/（RDATA），之后会被修改 → 隐含 SAVE，提升为模块级变量
+# DATA iexp0/0/ (RDATA); modified later -> implicit SAVE, promoted to a module-level variable
 _save_rdata_iexp0 = 0
 
 
-# ==================================================================== 主程序
+# ==================================================================== main program
 
 def main():
     """PROGRAM SYNSPEC
@@ -130,13 +160,20 @@ c                 opacity for a homogeneous slab of a given T and n_e  I
 C                                                                      I
 C ==================================================================== I
 
-    对应 synspec54.f 行 1–174
+    corresponds to synspec54.f lines 1-174
+
+    Method: reads the input model atmosphere and line data, then loops over
+    the wavelength intervals; for each interval RESOLV assembles the
+    opacities and emissivities and RTE (or RTEDFE/RTECD) solves the
+    transfer equation for the emergent flux.
+    References: Hubeny & Lanz 2017, arXiv:1706.01937; Hubeny 1988,
+    Comput. Phys. Commun. 52, 103.
     """
     # INCLUDE 'PARAMS.FOR' / 'LINDAT.FOR' / 'MODELP.FOR' / 'SYNTHP.FOR' → C.*
     # OPEN(UNIT=12,STATUS='UNKNOWN') / OPEN(UNIT=14,STATUS='UNKNOWN')
-    # 未指定 FILE，Fortran 约定连接 fort.<unit>
-    open_unit(12, 'fort.12', 'w')  # TODO(port): 假定写模式；Fortran STATUS='UNKNOWN' 在首次 I/O 时才创建文件
-    open_unit(14, 'fort.14', 'w')  # TODO(port): 同上
+    # FILE not specified; Fortran convention connects fort.<unit>
+    open_unit(12, 'fort.12', 'w')  # TODO(port): write mode assumed; Fortran STATUS='UNKNOWN' creates the file only on first I/O
+    open_unit(14, 'fort.14', 'w')  # TODO(port): same as above
 
     # INITIALIZATION - INPUT OF BASIC PARAMETERS AND MODEL ATMOSPHERE
     start()
@@ -145,7 +182,7 @@ C ==================================================================== I
     if C.IBFAC > 1:
         lte0 = C.LTE
         C.LTE = True
-    inext = 0  # TODO(port): Fortran 中 inext 未初始化即传入 INGRID
+    inext = 0  # TODO(port): in Fortran, inext is passed to INGRID uninitialized
     if C.IMODE >= -2 and C.IFEOS <= 0:
         if C.INMOD > 0:
             inpmod()
@@ -159,7 +196,7 @@ C ==================================================================== I
         if C.IFWIN > 1:
             setwin()
     else:
-        # ingrid 给标量哑元 inext 赋值 → 按约定解包接收全部标量哑元
+        # ingrid assigns the scalar dummy inext -> unpack and receive all scalar dummies per convention
         _mode, inext, _igrd = ingrid(0, inext, 0)
 
     inibl0()
@@ -170,8 +207,8 @@ C ==================================================================== I
     if C.IMODE0 == -4:
         C.IMODE = 2
     igrd = 0
-    # 标号 1：不透明度网格（IMODE0<-2 时的网格点）循环
-    while True:  # 对应 Fortran 标号 1
+    # label 1: loop over the opacity grid (grid points when IMODE0<-2)
+    while True:  # corresponds to Fortran label 1
         if C.IMODE0 <= -3 and C.IFEOS <= 0:
             inibl1(igrd)
         if C.IFMOL > 0:
@@ -202,21 +239,21 @@ C ==================================================================== I
                     if C.IMODE >= -2 and C.IMODE <= 1:
                         inmoli(ilist)
 
-        # 标号 5：线表/分子线表更新后的重入点
-        _pbar = None                  # tqdm 进度条(惰性创建)
-        while True:  # 对应 Fortran 标号 5
+        # label 5: re-entry point after line list / molecular line list update
+        _pbar = None                  # tqdm progress bar (created lazily)
+        while True:  # corresponds to Fortran label 5
             # ACTUAL CALCULATION OF THE SYNTHETIC SPECTRUM
             if C.IFEOS > 0:
                 break  # GO TO 30
             _go5 = False
-            # 标号 10：IBLANK（波长区段）循环
-            while True:  # 对应 Fortran 标号 10
+            # label 10: IBLANK (wavelength interval) loop
+            while True:  # corresponds to Fortran label 10
                 C.IBLANK = C.IBLANK + 1
                 _skip_outpri = False
                 if C.IFWIN <= 0:
                     resolv()
                     if C.IMODE0 < 0:
-                        _skip_outpri = True  # GO TO 20（跳过 RTE/RTECD 与 OUTPRI）
+                        _skip_outpri = True  # GO TO 20 (skip RTE/RTECD and OUTPRI)
                     else:
                         if C.IFREQ <= 10 and C.INMOD <= 1:
                             rtecd()
@@ -232,8 +269,8 @@ C ==================================================================== I
                     idtab()
                     if C.IFMOL > 0:
                         idmtab()
-                # 每个波长区段完成后打印一行进度, 并刷新进度条(若 tqdm 可用);
-                # 进度条仅当 stderr 是终端时启用, 重定向到日志时自动禁用
+                # print one progress line after each wavelength interval, and refresh the progress bar (if tqdm is available);
+                # the progress bar is enabled only when stderr is a terminal, and is automatically disabled when redirected to a log
                 if _pbar is None and _tqdm is not None and C.NBLANK > 0:
                     _pbar = _tqdm(total=C.NBLANK, desc="SYNSPEC region",
                                   unit="region",
@@ -263,17 +300,17 @@ C ==================================================================== I
                             break  # GO TO 5
                     if _go5:
                         break
-                break  # 顺序落入标号 30
+                break  # fall through to label 30
             if not _go5:
-                break  # 落入标号 30
-            # _go5 为真 → GO TO 5（继续本层 while）
+                break  # fall through to label 30
+            # _go5 true -> GO TO 5 (continue this while level)
 
         # 30 CONTINUE
         if C.IMODE0 < -2:
-            # ingrid 给标量哑元 inext 赋值 → 按约定解包接收
+            # ingrid assigns the scalar dummy inext -> unpack and receive per convention
             _mode, inext, igrd = ingrid(1, inext, igrd)
             igrd = igrd + 1
-            # call timing(1,igrd)  —— 原代码已注释，保留注释
+            # call timing(1,igrd)  - commented out in the original code; comment kept
             if inext > 0:
                 continue  # GO TO 1
         break
@@ -346,7 +383,7 @@ def start():
                  be read from unit 56
     IOPHLI     - switch for treatment the Lyman line wings -see LYMLIN
 
-    对应 synspec54.f 行 181–287
+    corresponds to synspec54.f lines 181-287
     """
     C.IFWIN = 0
     C.nunalp = 0
@@ -357,7 +394,7 @@ def start():
     C.NMLIST = 0
     C.NDSTEP = 0
     if C.IFEOS <= 0:
-        # READ(55,*,END=3) ... 三组；任一读遇 END/ERR 跳到标号 3
+        # READ(55,*,END=3) ... three groups; any read hitting END/ERR jumps to label 3
         try:
             _w = _ld(read_line(55))
             C.IMODE = int(_w[0])
@@ -375,7 +412,7 @@ def start():
             C.nungam = int(_w[3])
             C.nunbal = int(_w[4])
         except (EOFError, ValueError, IndexError):
-            pass  # 标号 3：END=/ERR= 跳转至此
+            pass  # label 3: END=/ERR= jumps here
     if C.IMODE < -90:
         C.IMODE = -C.IMODE - 100
         C.IFWIN = 1
@@ -413,14 +450,14 @@ def initia():
 
     driver for input and initializations
 
-    对应 synspec54.f 行 294–632
+    corresponds to synspec54.f lines 294-632
     """
-    # PARAMETER (WI1=911.753578, WI2=227.837832)  —— 本例程内未使用，原样保留
+    # PARAMETER (WI1=911.753578, WI2=227.837832)  - unused in this routine; kept as in the original
     WI1 = 911.753578
     WI2 = 227.837832
-    # CHARACTER*4 TYPION(MIOEX),TYPIOI  —— TYPION 为局部字符数组（1 基）
+    # CHARACTER*4 TYPION(MIOEX),TYPIOI  - TYPION is a local character array (1-based)
     typion = [''] * (MIOEX + 1)
-    # DATA IGLE/.../ IGMN/.../ IGFE/.../ IGNI/.../  —— DATA 初始化且不再修改（1 基，索引 0 为填充）
+    # DATA IGLE/.../ IGMN/.../ IGFE/.../ IGNI/.../  - DATA-initialized and never modified (1-based; index 0 is padding)
     igle = [0, 2, 1, 2, 1, 6, 9, 4, 9, 6, 1, 2, 1, 6, 9, 4, 9, 6, 1]
     igmn = [0, 2, 1, 2, 1, 6, 9, 4, 9, 6, 1, 2, 1, 6, 9, 4, 9, 6, 1,
             10, 21, 28, 25, 6, 7, 6]
@@ -444,18 +481,18 @@ def initia():
         # ------------------------------
         # Basic input parameters - disks
         # ------------------------------
-        # READ(IBUFF,*) DISPAR  —— DISPAR 未在任何 COMMON 中声明，按局部标量处理
+        # READ(IBUFF,*) DISPAR  - DISPAR is not declared in any COMMON; treated as a local scalar
         _w = _ld(read_line(IBUFF))
         dispar = _f(_w[0])
 
     # ----------------------------
     # other basic input parameters
     # ----------------------------
-    # READ(IBUFF,*) LTE,LTGREY  —— LTGREY 为局部逻辑变量
+    # READ(IBUFF,*) LTE,LTGREY  - LTGREY is a local logical variable
     _w = _ld(read_line(IBUFF))
     C.LTE = _l(_w[0])
     ltgrey = _l(_w[1])
-    # READ(IBUFF,*) FINSTD  —— 局部 CHARACTER*20
+    # READ(IBUFF,*) FINSTD  - local CHARACTER*20
     finstd = _ld(read_line(IBUFF))[0]
     nstpar(finstd)
 
@@ -470,7 +507,7 @@ def initia():
         njread = -njread
         C.NFREQC = njread
         for ij in range(1, njread + 1):
-            # READ(IBUFF,*) FREQEXP  —— FREQEXP 读出后未再使用（原样保留）
+            # READ(IBUFF,*) FREQEXP  - FREQEXP is not used after being read (kept as in the original)
             freqexp = _f(_ld(read_line(IBUFF))[0])
     else:
         C.NFREQC = njread
@@ -545,8 +582,8 @@ def initia():
     print()
     print(' ION     N0    N1    NK    IZ')
     print()
-    nki = 0  # TODO(port): Fortran 中 NKI 未初始化；若首次 READ 即 END=20 则使用此值
-    while True:  # 对应 Fortran 标号 10
+    nki = 0  # TODO(port): NKI is uninitialized in Fortran; this value is used if the very first READ hits END=20
+    while True:  # corresponds to Fortran label 10
         # READ(IBUFF,*,END=20,ERR=20) IATII,IZII,NLEVSI,ILASTI,ILVLIN,
         #            NONSTD,TYPIOI,FILEI
         try:
@@ -668,7 +705,7 @@ def initia():
                     C.G[ilev] = igni[iatii - izii]
         else:
             break  # GO TO 20
-        # GO TO 10 → 继续循环
+        # GO TO 10 -> continue the loop
     # 20 CONTINUE
     C.NION = ion
     C.NLEVEL = nki
@@ -792,25 +829,25 @@ def rdata(ion):
     """SUBROUTINE RDATA(ION)
     =====================
 
-    读入一个电离种的能级、连续跃迁与线跃迁输入参数
-    （对应数据文件 FIDATA(ION)）。
+    reads the energy-level, continuum-transition, and line-transition input parameters
+    of one ionization species (corresponding to the data file FIDATA(ION)).
 
-    对应 synspec54.f 行 639–1110
+    corresponds to synspec54.f lines 639-1110
     """
     global _save_rdata_iexp0
     # PARAMETER (WI1=911.753578, WI2=227.837832)
     WI1 = 911.753578
     WI2 = 227.837832
-    # PARAMETER (T15=1.D-15)  —— 未使用，原样保留
+    # PARAMETER (T15=1.D-15)  - unused; kept as in the original
     T15 = 1.e-15
     # PARAMETER (ECONST=  5.03411142E15)
     ECONST = 5.03411142e15
     # PARAMETER (MCFIT=10)
     MCFIT = 10
-    # dimension CTEMP(MCFIT),CRATE(MCFIT)  —— 1 基局部数组
+    # dimension CTEMP(MCFIT),CRATE(MCFIT)  - 1-based local arrays
     ctemp = np.zeros(MCFIT + 1)
     crate = np.zeros(MCFIT + 1)
-    # data iexp0/0/  —— 之后被修改，隐含 SAVE → 模块级 _save_rdata_iexp0
+    # data iexp0/0/  - modified later, implicit SAVE -> module-level _save_rdata_iexp0
 
     # IUNIT=94
     C.IUNIT = 94
@@ -828,15 +865,15 @@ def rdata(ion):
     #
     #   If ILIMITS(ION) < 0, the program finds out whether energy and
     #   quantum numbers are included in the input data files
-    ie = 0  # TODO(port): Fortran 中 IE 在能级循环外沿用上次循环的遗留值；若循环未执行则未定义
+    ie = 0  # TODO(port): in Fortran, IE outside the level loop carries the leftover value from the previous loop; undefined if the loop never ran
     if C.ILIMITS[ion] < 0:
         # READ(IUNIT,'(1000A)')CADENA
         _fh = funits[C.IUNIT]
         _pos = _fh.tell()
-        cadena = read_line(C.IUNIT).ljust(1000)  # TODO(port): (1000A) 格式，右侧补空格至 1000 字符
-        # BACKSPACE(IUNIT)：普通文件回退一行
-        _fh.seek(_pos)  # TODO(port): 用 tell/seek 模拟 BACKSPACE
-        # count_words（行 1257）给标量哑元 n 赋值 → 按约定解包接收
+        cadena = read_line(C.IUNIT).ljust(1000)  # TODO(port): (1000A) format, right-padded with blanks to 1000 characters
+        # BACKSPACE(IUNIT): rewind a regular file by one line
+        _fh.seek(_pos)  # TODO(port): BACKSPACE emulated with tell/seek
+        # count_words (line 1257) assigns the scalar dummy n -> unpack and receive per convention
         now = 0
         cadena, now = count_words(cadena, now)
         if now < 14:
@@ -847,7 +884,7 @@ def rdata(ion):
     #   Standard format: ENION(I),G(I),NQUANT(I),TYPLEV(I),ifwop(i)
     if C.ILIMITS[ion] == 0:
 
-        # 注意：IL 属于 COMMON/STRPAR/，Fortran 中 DO 循环直接改写 COMMON 变量
+        # Note: IL belongs to COMMON/STRPAR/; in Fortran the DO loop directly rewrites the COMMON variable
         for C.IL in range(1, C.NLEVS[ion] + 1):
             i = C.IL + C.NFIRST[ion] - 1
             ie = C.IEL[i]
@@ -858,14 +895,14 @@ def rdata(ion):
                 _save_rdata_iexp0 = _save_rdata_iexp0 + 1
                 C.iexpl[i] = _save_rdata_iexp0
                 C.iltot[_save_rdata_iexp0] = i
-                # write(6,671) il,i,ia,ion,isemex(ia),iexp0,iltot(iexp0)  —— 原代码已注释
+                # write(6,671) il,i,ia,ion,isemex(ia),iexp0,iltot(iexp0) - commented out in the original code
                 if C.IL == C.NLEVS[ion]:
                     if nki == C.NKA[C.IATM[i]]:
                         _save_rdata_iexp0 = _save_rdata_iexp0 + 1
                         C.iexpl[nki] = _save_rdata_iexp0
                         C.iltot[_save_rdata_iexp0] = nki
-                        # write(6,671) il+1,nki,ia,ion,isemex(ia),iexp0,iltot(iexp0)  —— 原代码已注释
-                #  671 format('il,i,ia,ion,isem,iexp,iltot',7i4)  —— 原代码已注释
+                        # write(6,671) il+1,nki,ia,ion,isemex(ia),iexp0,iltot(iexp0) - commented out in the original code
+                #  671 format('il,i,ia,ion,isem,iexp,iltot',7i4) - commented out in the original code
             iq = i - n0i + 1
             x = float(iq * iq)
             C.ifwop[i] = 0
@@ -888,7 +925,7 @@ def rdata(ion):
                     e = -e
                     e0 = e
                 if e == 0.:
-                    # if(izz.le.2) then  —— 原代码已注释，实际条件为 izz.le.-2
+                    # if(izz.le.2) then  - commented out in the original code; the actual condition is izz.le.-2
                     if izz <= -2:
                         w0 = WI1
                         if izz == 2:
@@ -916,7 +953,7 @@ def rdata(ion):
                 if C.NQUANT[i] == 0:
                     C.NQUANT[i] = iq
             else:
-                # if(modref.ge.0) nref(iatm(i))=nka(iatm(i))  —— 原代码已注释
+                # if(modref.ge.0) nref(iatm(i))=nka(iatm(i)) - commented out in the original code
                 if C.G[i] == 0. and nki == C.NKA[C.IATM[i]]:
                     C.G[i] = 1.
             if C.ifwop[i] < 0:
@@ -981,7 +1018,7 @@ def rdata(ion):
                     e = -e
                     e0 = e
                 if e == 0.:
-                    # if(izz.le.2) then  —— 原代码已注释，实际条件为 izz.le.-2
+                    # if(izz.le.2) then  - commented out in the original code; the actual condition is izz.le.-2
                     if izz <= -2:
                         w0 = WI1
                         if izz == 2:
@@ -1012,7 +1049,7 @@ def rdata(ion):
                     e = -e
                     e0 = e
                 if e == 0.:
-                    # if(izz.le.2) then  —— 原代码已注释，实际条件为 izz.le.-2
+                    # if(izz.le.2) then  - commented out in the original code; the actual condition is izz.le.-2
                     if izz <= -2:
                         w0 = WI1
                         if izz == 2:
@@ -1043,7 +1080,7 @@ def rdata(ion):
                     e = -e
                     e0 = e
                 if e == 0.:
-                    # if(izz.le.2) then  —— 原代码已注释，实际条件为 izz.le.-2
+                    # if(izz.le.2) then  - commented out in the original code; the actual condition is izz.le.-2
                     if izz <= -2:
                         w0 = WI1
                         if izz == 2:
@@ -1084,7 +1121,7 @@ def rdata(ion):
                 if C.NQUANT[i] == 0:
                     C.NQUANT[i] = iq
             else:
-                # if(modref.ge.0) nref(iatm(i))=nka(iatm(i))  —— 原代码已注释
+                # if(modref.ge.0) nref(iatm(i))=nka(iatm(i)) - commented out in the original code
                 if C.G[i] == 0. and nki == C.NKA[C.IATM[i]]:
                     C.G[i] = 1.
             if C.ifwop[i] < 0:
@@ -1092,7 +1129,7 @@ def rdata(ion):
                 print('RDATA:  IFWOP<0 and ILIMITS is not 0')
                 # stop
                 raise SystemExit
-                # STOP 之后的不可达代码（原 Fortran 语句，原样保留）
+                # unreachable code after STOP (original Fortran statements, kept as-is)
                 C.ENION[i] = 0.
                 C.FF[ie] = 0.
                 C.IMER = C.IMER + 1
@@ -1105,24 +1142,24 @@ def rdata(ion):
     #   skip lines if more levels than needed, and skip the continuum transition
     #   label
     #
-    # 标号 5：跳行直到 '*' 行
-    while True:  # 对应 Fortran 标号 5
+    # label 5: skip lines until a '*' line
+    while True:  # corresponds to Fortran label 5
         # READ(IUNIT,501) A
         a = (read_line(C.IUNIT) + ' ')[0]
         if feq(a, '*'):
-            break  # A.EQ.'*' 退出；否则 GO TO 5
+            break  # A.EQ.'*' exits; otherwise GO TO 5
     ii0 = C.NFIRST[ion] - 1
-    illim = C.NLLIM[ion] + ii0  # ILLIM 计算后未再使用（原样保留）
+    illim = C.NLLIM[ion] + ii0  # ILLIM is not used after being computed (kept as in the original)
     jcorr = 0
 
     #   -----------------------------------------------------
     #   input parameters for continuum transitions
     #   -----------------------------------------------------
-    fropci = 0.0  # TODO(port): Fortran 中 FROPCI 可能沿用上次迭代值；首次迭代未定义
+    fropci = 0.0  # TODO(port): in Fortran, FROPCI may carry over the previous iteration's value; undefined on the first iteration
     _goto = None
-    while True:  # 对应 Fortran 标号 10
+    while True:  # corresponds to Fortran label 10
         #     READ(IUNIT,*,END=20,ERR=15) II,JJ,MODE,IFANCY,ICOLIS,
-        #                                 IFRQ0,IFRQ1,OSC,CPARAM  —— 原代码已注释
+        #                                 IFRQ0,IFRQ1,OSC,CPARAM - commented out in the original code
         # READ(IUNIT,'(A100)',END=20) DUM
         try:
             dum = read_line(C.IUNIT)[:100]
@@ -1130,7 +1167,7 @@ def rdata(ion):
             _goto = 20  # END=20 → GO TO 20
             break
         # READ(DUM,*,IOSTAT=KSTAT) II,JJ,MODE,IFANCY,ICOLIS,
-        #      IFRQ0,IFRQ1,OSC,CPARAM,NCOL  —— 内部文件读
+        #      IFRQ0,IFRQ1,OSC,CPARAM,NCOL  - internal-file read
         _w = _ld(dum)
         try:
             ii = int(_w[0])
@@ -1145,7 +1182,7 @@ def rdata(ion):
             ncol = int(_w[9])
             kstat = 0
         except (ValueError, IndexError):
-            kstat = -1  # TODO(port): IOSTAT 具体错误码未知，仅区分成功/失败
+            kstat = -1  # TODO(port): the exact IOSTAT error code is unknown; only success/failure is distinguished
         if kstat != 0:
             # READ(DUM,*,ERR=15) II,JJ,MODE,IFANCY,ICOLIS,IFRQ0,IFRQ1,OSC,CPARAM
             try:
@@ -1209,7 +1246,7 @@ def rdata(ion):
         ii = ii + ii0
         jj = jj + ii0 + jcorr
         C.fropc[ii] = fropci
-        n0i = C.NFIRST[ie]  # IE 为前面能级输入循环的遗留值（Fortran 语义）
+        n0i = C.NFIRST[ie]  # IE is the leftover value from the earlier level-input loop (Fortran semantics)
         nki = C.NNEXT[ie]
         if jj >= nki:
             lpc = False
@@ -1229,8 +1266,8 @@ def rdata(ion):
                     C.fropc[ii] = C.ENION[ii] / 6.6256e-27 * (1. - xi * xi / (x2 * x2))
                 else:
                     C.fropc[ii] = abs(C.fropc[ii])
-                # write(6,671) ii,fropc(ii),enion(ii)/h,2.997925e18/fropc(ii)  —— 原代码已注释
-                #  671 format(i4,1p2e13.5,0pf10.1)  —— 原代码已注释
+                # write(6,671) ii,fropc(ii),enion(ii)/h,2.997925e18/fropc(ii) - commented out in the original code
+                #  671 format(i4,1p2e13.5,0pf10.1) - commented out in the original code
         if mode == 0:
             if ii < C.NLAST[ion]:
                 continue  # GO TO 10
@@ -1277,22 +1314,22 @@ def rdata(ion):
         C.indexp[ii] = abs(mode)
         if ii < C.NLAST[ion]:
             continue  # GO TO 10
-        _goto = 15  # 顺序落入标号 15
+        _goto = 15  # fall through to label 15
         break
 
-    # 标号 15：跳行直到 '*' 行
+    # label 15: skip lines until a '*' line
     if _goto == 15:
-        while True:  # 对应 Fortran 标号 15
-            # READ(IUNIT,501) A  —— 无 END=，遇 EOF 按 Fortran 语义报错（EOFError 抛出）
+        while True:  # corresponds to Fortran label 15
+            # READ(IUNIT,501) A  - no END=; on EOF an error is raised per Fortran semantics (EOFError thrown)
             a = (read_line(C.IUNIT) + ' ')[0]
             if feq(a, '*'):
-                break  # A.EQ.'*' 退出；否则 GO TO 15
+                break  # A.EQ.'*' exits; otherwise GO TO 15
 
     #  -----------------------------------------------------------
     #  Input parameters for line transitions
     #  -----------------------------------------------------------
     if _goto != 30:
-        while True:  # 对应 Fortran 标号 20
+        while True:  # corresponds to Fortran label 20
             # READ(IUNIT,*,END=30,ERR=30) II,JJ,MODE,IFANCY,ICOLIS,
             #                             IFRQ0,IFRQ1,OSC,CPARAM
             try:
@@ -1325,8 +1362,8 @@ def rdata(ion):
                     continue  # GO TO 20
                 if abs(mode) == 1:
                     # READ(IUNIT,*) LCMP
-                    # TODO(port): LCMP 以 L 开头，按 PARAMS.FOR 的 IMPLICIT LOGICAL*1(L)
-                    # 为 LOGICAL（数据文件中为 'T'/'F'），且读入后未使用
+                    # TODO(port): LCMP starts with L; per PARAMS.FOR's IMPLICIT LOGICAL*1(L)
+                    # it is LOGICAL ('T'/'F' in the data file), and is unused after being read
                     lcmp = _ld(read_line(C.IUNIT))[0].upper().startswith('T')
                 if abs(ifancy) == 1:
                     # READ(IUNIT,*) GAMR,STARK1,STARK2,STARK3,VDWH
@@ -1359,8 +1396,8 @@ def rdata(ion):
             #  -----------------------------------------------------------
             # READ(IUNIT,*) LCOMP,INTMOD,NF,XMAX,TSTD
             _w = _ld(read_line(C.IUNIT))
-            # TODO(port): LCOMP 以 L 开头，按 PARAMS.FOR 的 IMPLICIT LOGICAL*1(L)
-            # 为 LOGICAL（数据文件中为 'T'/'F'），且读入后未使用
+            # TODO(port): LCOMP starts with L; per PARAMS.FOR's IMPLICIT LOGICAL*1(L)
+            # it is LOGICAL ('T'/'F' in the data file), and is unused after being read
             lcomp = _w[0].upper().startswith('T')
             intmod = int(_w[1])
             nf = int(_w[2])
@@ -1380,11 +1417,11 @@ def rdata(ion):
     close_unit(C.IUNIT)
     return
 # ============================================================================
-# chunk02: synspec54.f 行 1116–2075
+# chunk02: synspec54.f lines 1116-2075
 # NSTPAR / count_words / GETWRD / STATE0 / INIMOD / STATE / TINT
 # ============================================================================
 
-# --- DATA PVALUE（NSTPAR），之后会被修改（Fortran 隐含 SAVE）→ 提升为模块级
+# --- DATA PVALUE (NSTPAR); modified later (Fortran implicit SAVE) -> promoted to module level
 _save_nstpar_pvalue = [''] + [
     '     1', '  1.D0', '     0', '     0', ' 1.e19',
     '    70', '   120', '     0', '     0', '     0',
@@ -1397,8 +1434,8 @@ _save_nstpar_pvalue = [''] + [
     '  0.10', '     1', '     1', '     1',
 ]
 
-# --- DATA D（STATE0）：D(3,MATOM)，列主序填充；之后被修改（d(2,i)=...，
-#     Fortran 隐含 SAVE）→ 提升为模块级
+# --- DATA D (STATE0): D(3,MATOM), filled in column-major order; modified later (d(2,i)=...,
+#     Fortran implicit SAVE) -> promoted to module level
 _save_state0_D = np.zeros((4, MATOM + 1))
 _save_state0_D[1:4, 1:MATOM + 1] = np.array([
     1.008, 1.0, 2.0, 4.003, 0.1, 3.0,
@@ -1459,16 +1496,16 @@ def nstpar(finstd):
     settiing up the default values of various input flags, and
     input of non-standard values of various input flags and parameters
 
-    对应 synspec54.f 行 1116–1251
+    corresponds to synspec54.f lines 1116-1251
 
-    原 COMMON 声明：
+    original COMMON declarations:
       common/hhebrd/sthe,nunhhe
       common/gompar/hglim,ihgom
       common/brdstd/gsstd,gwstd
     """
     MVAR = 44          # PARAMETER(MVAR=44)
     INPFI = 4          # PARAMETER(INPFI=4)
-    # DATA VARNAM /.../ —— 只读，不作为 SAVE 提升
+    # DATA VARNAM /.../ - read-only, not promoted as SAVE
     varnam = [''] + [
         'IATREF', 'BERGFC', 'IHYDPR', 'NUNHHE', 'STHE  ',
         'ND    ', 'NFREQS', 'IBFAC ', 'INTRPL', 'ICHANG',
@@ -1480,18 +1517,18 @@ def nstpar(finstd):
         'IHXENB', 'GSSTD ', 'GWSTD ', 'IHGOM ', 'HGLIM ',
         'ERANGE', 'ISPICK', 'ILPICK', 'IPPICK',
     ]
-    pvalue = _save_nstpar_pvalue   # 别名：DATA 初始化且被修改 → 模块级 SAVE 数组
+    pvalue = _save_nstpar_pvalue   # alias: DATA-initialized and modified -> module-level SAVE array
     # DATA BLNK/'                    '/,BLNK6/'      '/
     blnk = ' ' * 20
     blnk6 = ' ' * 6
 
     if not feq(finstd, blnk):      # IF(FINSTD.NE.BLNK)
-        # OPEN(UNIT=INPFI,FILE=FINSTD,STATUS='UNKNOWN')（用于读）
+        # OPEN(UNIT=INPFI,FILE=FINSTD,STATUS='UNKNOWN') (for reading)
         open_unit(INPFI, finstd, 'r')
 
     indv = -1
-    # K1/K2 是 GETWRD 的输出哑元，首次调用前 Fortran 中未定义；
-    # GETWRD 入口处即置 K1=K2=0，故此处初值不影响语义
+    # K1/K2 are output dummies of GETWRD, undefined in Fortran before the first call;
+    # GETWRD sets K1=K2=0 on entry, so the initial values here do not affect semantics
     k1 = 0
     k2 = 0
 
@@ -1502,7 +1539,7 @@ def nstpar(finstd):
     print(' INPUT KEYWORD PARAMETERS:')
     print(' -------------------------')
 
-    _label = 10                    # 对应 Fortran 标号 10
+    _label = 10                    # corresponds to Fortran label 10
     while True:
         if _label == 10:
             k0 = 1
@@ -1516,8 +1553,8 @@ def nstpar(finstd):
             _label = 20
             continue
         if _label == 20:
-            # CALL GETWRD(TEXT,K0,K1,K2)：GETWRD 给标量哑元 K1,K2 赋值，
-            # 按约定返回全部哑元并重新接收
+            # CALL GETWRD(TEXT,K0,K1,K2): GETWRD assigns the scalar dummies K1,K2,
+            # so it returns all dummies per convention and they are re-received
             text, k0, k1, k2 = getwrd(text, k0, k1, k2)
             if k1 == 0:
                 _label = 60        # GO TO 60
@@ -1537,7 +1574,7 @@ def nstpar(finstd):
                     text, k0, k1, k2 = getwrd(text, k0, k1, k2)
                     if k1 == 0:
                         k0 = 1
-                        # 标号 45：反复读下一行，直到取得一个词
+                        # label 45: repeatedly read the next line until a word is obtained
                         while True:
                             # READ(INPFI,500,END=70) TEXT ; 500 FORMAT(A)
                             try:
@@ -1558,8 +1595,8 @@ def nstpar(finstd):
                 ivar = i
             else:
                 pvalue[ivar] = blnk6
-                # PVALUE(IVAR)(6-K2+K1:6)=TEXT(K1:K2)：词右对齐写入 6 字符场
-                # （假定词长不超过 6，否则 Fortran 也会下标越界）
+                # PVALUE(IVAR)(6-K2+K1:6)=TEXT(K1:K2): the word is written right-justified into a 6-character field
+                # (assumes word length <= 6; otherwise Fortran would also go out of subscript bounds)
                 ist = 6 - k2 + k1
                 pvalue[ivar] = ' ' * (ist - 1) + text[k1 - 1:k2]
             continue               # GO TO 20
@@ -1569,14 +1606,14 @@ def nstpar(finstd):
         if _label == 70:
             break
 
-    # 把 44 个参数值写入临时单元 84。unit 84 未显式 OPEN，Fortran 隐式连接
-    # fort.84；为随后 CLOSE+REWIND 之后的表式 READ，先以 w+ 打开
+    # write the 44 parameter values to scratch unit 84. Unit 84 is never explicitly OPENed; Fortran implicitly
+    # connects fort.84; opened with w+ for the list-directed READ after the subsequent CLOSE+REWIND
     open_unit(84, 'fort.84', 'w+')
     for i in range(1, MVAR + 1):
         #  684    FORMAT(1X,A)
         write_line(84, ' ' + pvalue[i])
     close_unit(84)                 # CLOSE(UNIT=84)
-    # REWIND(84)：对已关闭的单元，Fortran 重新连接 fort.84 并定位到开头
+    # REWIND(84): for a closed unit, Fortran reconnects fort.84 and positions at the beginning
     open_unit(84, 'fort.84', 'r')
 
     # READ(84,*) IATREF,BERGFC,IHYDPR,NUNHHE,STHE,ND,NFREQS,IBFAC,INTRPL,
@@ -1584,21 +1621,21 @@ def nstpar(finstd):
     #            IOH2H2,IOH2HE,IOH2H1,IOHHE,IRSCT,IRSCH2,IRSCHE,TRAD,WDIL,
     #            VTB,IFMOL,TMOLIM,MOLTAB,IRWTAB,IIRWIN,IPFEXO,CUTLYM,CUTBAL,
     #            IHXENB,GSSTD,GWSTD,IHGOM,HGLIM,ERANGE,ISPICK,ILPICK,IPPICK
-    # 表式读：每个记录一个值（上面 WRITE 时每行写一个）
+    # list-directed read: one value per record (the WRITE above wrote one value per line)
     _recs = [read_line(84) for _ in range(MVAR)]
 
     def _tok(idx):
-        """取第 idx 个（1 基）记录中的第一个场。"""
+        """Return the first field of the idx-th (1-based) record."""
         t = _recs[idx - 1].split()
         return t[0] if t else ''
 
     def _pi(idx):
-        """按整数解析（兼容 Fortran D 指数写法）。"""
+        """Parse as integer (compatible with Fortran D-exponent notation)."""
         s = _tok(idx)
         return int(float(s.replace('D', 'e').replace('d', 'e'))) if s else 0
 
     def _pf(idx):
-        """按实数解析（兼容 Fortran D 指数写法）。"""
+        """Parse as real (compatible with Fortran D-exponent notation)."""
         s = _tok(idx)
         return float(s.replace('D', 'e').replace('d', 'e')) if s else 0.0
 
@@ -1626,9 +1663,9 @@ def nstpar(finstd):
     C.IRSCT = _pi(22)
     C.IRSCH2 = _pi(23)
     C.IRSCHE = _pi(24)
-    # TODO(port): TRAD/WDIL 在 NSTPAR 的三个 INCLUDE 中均未声明，
-    # 按 IMPLICIT REAL*8 它们是本例程的局部标量（与 WINCOM.FOR 中的
-    # C.TRAD/C.WDIL 数组无关），读入后未被使用
+    # TODO(port): TRAD/WDIL are not declared in any of NSTPAR's three INCLUDEs;
+    # by IMPLICIT REAL*8 they are local scalars of this routine (unrelated to the
+    # C.TRAD/C.WDIL arrays in WINCOM.FOR), and are unused after being read
     trad = _pf(25)
     wdil = _pf(26)
     C.VTB = _pf(27)
@@ -1662,11 +1699,11 @@ def count_words(cadena, n):
     """
     Counts the number of words separated by blanks in a string
 
-    对应 synspec54.f 行 1257–1272
+    corresponds to synspec54.f lines 1257-1272
 
-    标量哑元 n 被赋值，按约定返回全部哑元 (cadena, n)。
-    TODO(port): Fortran 按声明长度 LEN(cadena)=1000 循环，这里按实际
-    字符串长度；差异只涉及尾部空格，不影响词数统计。
+    The scalar dummy n is assigned; all dummies are returned per convention (cadena, n).
+    TODO(port): Fortran loops over the declared length LEN(cadena)=1000; here we loop over
+    the actual string length; the difference only involves trailing blanks and does not affect the word count.
     """
     # character*1000  cadena ; character*1 a,b
     n = 0
@@ -1690,9 +1727,9 @@ def getwrd(text, k0, k1, k2):
 
     TAKEN FROM MULTI - M. CARLSSON (1976)
 
-    对应 synspec54.f 行 1278–1324
+    corresponds to synspec54.f lines 1278-1324
 
-    标量哑元 K1,K2 被赋值，按约定返回全部哑元 (text, k0, k1, k2)。
+    The scalar dummies K1,K2 are assigned; all dummies are returned per convention (text, k0, k1, k2).
     """
     MSEPAR = 7                     # PARAMETER (MSEPAR=7)
     # DATA SEPAR/' ','(',')','=','*','/',','/
@@ -1703,22 +1740,22 @@ def getwrd(text, k0, k1, k2):
     found = False
     for i in range(k0, len(text) + 1):     # DO 400 I=K0,LEN(TEXT)
         if k1 == 0:
-            # 未在词内：若当前字符不是分隔符则 K1=I（词起点），
-            # 否则经 200 CONTINUE 继续扫描
+            # not inside a word: if the current character is not a delimiter, K1=I (word start);
+            # otherwise continue scanning via 200 CONTINUE
             if text[i - 1] not in separ:
                 k1 = i
             # 200 CONTINUE
         else:
-            # 词内：遇到分隔符 → GO TO 500
+            # inside a word: hitting a delimiter -> GO TO 500
             if text[i - 1] in separ:
-                k2 = i - 1         # 500：NEW WORD IN TEXT(K1:I-1)
+                k2 = i - 1         # 500:NEW WORD IN TEXT(K1:I-1)
                 found = True
                 break
         # 400 CONTINUE
     if not found:
-        # NO NEW WORD. RETURN K1=K2=0（GO TO 999）
-        # 注意：词一直延伸到 TEXT 末尾而无结束分隔符时，Fortran 原逻辑
-        # 同样返回 K1=K2=0，此处保持原样
+        # NO NEW WORD. RETURN K1=K2=0(GO TO 999)
+        # Note: when a word extends to the end of TEXT with no closing delimiter,
+        # the original Fortran logic likewise returns K1=K2=0; kept as-is here
         k1 = 0
         k2 = 0
     # 999 CONTINUE
@@ -1729,15 +1766,15 @@ def state0(modold):
     """
     Initialization of the basic parameters for the Saha equation
 
-    对应 synspec54.f 行 1330–1875
+    corresponds to synspec54.f lines 1330-1875
 
-    原 PARAMETER：parameter (enhe1=24.5799,enhe2=54.3999)
+    original PARAMETER: parameter (enhe1=24.5799,enhe2=54.3999)
     """
     enhe1 = 24.5799
     enhe2 = 54.3999
-    d = _save_state0_D   # 别名：DATA 初始化且被修改 → 模块级 SAVE 数组
+    d = _save_state0_D   # alias: DATA-initialized and modified -> module-level SAVE array
 
-    # DATA DYP —— 元素符号（character*4），只读
+    # DATA DYP - element symbols (character*4), read-only
     dyp = [''] + [
         ' H  ', ' He ', ' Li ', ' Be ', ' B  ',
         ' C  ', ' N  ', ' O  ', ' F  ', ' Ne ',
@@ -1768,9 +1805,9 @@ def state0(modold):
     #        Element Atomic  Solar    Std.
     #                weight abundance highest
     #                                 ionization stage
-    # （D 的 DATA 初值已提升为模块级 _save_state0_D）
+    # (the DATA initial values of D have been promoted to module-level _save_state0_D)
 
-    # data abun0 —— 只读
+    # data abun0 - read-only
     abun0 = np.zeros(MATOM + 1)
     abun0[1:MATOM + 1] = [
         12.0, 10.93, 1.05, 1.38, 2.7, 8.39,
@@ -1792,7 +1829,7 @@ def state0(modold):
         -9.99, -9.99, -9.99,
     ]
 
-    # data abun1 —— 只读
+    # data abun1 - read-only
     abun1 = np.zeros(MATOM + 1)
     abun1[1:MATOM + 1] = [
         12.0, 10.93, 3.26, 1.38, 2.79, 8.43,
@@ -1815,7 +1852,7 @@ def state0(modold):
     ]
 
     # Ionization potentials for first 99 species:
-    # DATA XI —— XI(8,MATOM)，列主序填充，只读
+    # DATA XI - XI(8,MATOM), filled in column-major order, read-only
     # Element Ionization potentials (eV)
     #          I     II      III     IV       V     VI     VII    VIII
     xi = np.zeros((9, MATOM + 1))
@@ -1955,18 +1992,18 @@ def state0(modold):
     ]).reshape((8, MATOM), order='F')
 
     def _read_vals(unit, n):
-        """表式（list-directed）读 n 个值；一个记录不够时自动续读下一记录。"""
+        """List-directed read of n values; continues to the next record if one record is not enough."""
         toks = []
         while len(toks) < n:
             toks.extend(read_line(unit).split())
         return toks[:n]
 
     def _fi(s):
-        """表式整数场解析（兼容 D 指数写法）。"""
+        """Parse a list-directed integer field (compatible with D-exponent notation)."""
         return int(float(s.replace('D', 'e').replace('d', 'e')))
 
     def _ff(s):
-        """表式实数场解析（兼容 D 指数写法）。"""
+        """Parse a list-directed real field (compatible with D-exponent notation)."""
         return float(s.replace('D', 'e').replace('d', 'e'))
 
     # An element (hydrogen through zinc) can be considered in one of
@@ -2022,7 +2059,7 @@ def state0(modold):
     iabset = 0
     # read(ibuff,'(a80)') dum
     dum = read_line(IBUFF).ljust(80)[:80]
-    # read(dum,*,iostat=kstat) natoms,iabset —— 内部文件表式读
+    # read(dum,*,iostat=kstat) natoms,iabset - internal-file list-directed read
     _toks = dum.split()
     kstat = 0
     try:
@@ -2050,8 +2087,8 @@ def state0(modold):
     iref = 0
     if C.NATOMS < 0:
         C.NATOMS = -C.NATOMS
-    # TODO(port): MODOLD/=0 时 NA0/NAK 不会被读入赋值，但后面
-    # WRITE(6,602) 仍引用它们（Fortran 中为未定义值）；这里先置 0
+    # TODO(port): when MODOLD/=0, NA0/NAK are not read or assigned, but the later
+    # WRITE(6,602) still references them (undefined values in Fortran); preset to 0 here
     na0 = 0
     nak = 0
 
@@ -2117,9 +2154,9 @@ def state0(modold):
                 C.ENEV[i, j] = xi[j, i]
                 enev_ij = C.ENEV[i, j]
             else:
-                # TODO(port): ENEV 只声明到 MI1=8，Fortran 中 ENEV(I,9)
-                # 越界；按 COMMON/ATOBLN/ 列主序布局 ENEV 之后紧跟
-                # AMAS(MATOM)，实际读到的是 AMAS(I)（此时已赋为 D(1,I)）
+                # TODO(port): ENEV is declared only up to MI1=8; in Fortran, ENEV(I,9)
+                # is out of bounds; by the COMMON/ATOBLN/ column-major layout, AMAS(MATOM)
+                # follows ENEV, so what is actually read is AMAS(I) (already set to D(1,I) here)
                 enev_ij = C.AMAS[i]
             if enev_ij >= enhe2:
                 C.INPOT[i, j] = 3
@@ -2186,9 +2223,9 @@ def state0(modold):
         C.WMM[id] = C.WMY[id]*HMASS/C.YTOT[id]
     for jj in range(1, C.NATOMS + 1):
         for id in range(1, C.ND + 1):
-            # TODO(port): NATOMS 可能因 NATOMS=MATOM(=99) 超过 RELAB 的
-            # 声明上界 MATEX(=30)，Fortran 中会越界写入 /ATOPAR/ 后继
-            # 存储；这里按声明上界截断
+            # TODO(port): NATOMS may exceed RELAB's declared upper bound MATEX(=30)
+            # because NATOMS=MATOM(=99); Fortran would write out of bounds into the
+            # storage following /ATOPAR/; here we truncate at the declared bound
             if jj <= MATEX:
                 C.RELAB[jj, id] = 1.
 
@@ -2215,7 +2252,7 @@ def state0(modold):
         try:
             nchang = _fi(read_line(56).split()[0])
         except (EOFError, IndexError, ValueError):
-            # 566 —— READ(56) 的 ERR/END 分支
+            # 566 - ERR/END branch of READ(56)
             #  656 FORMAT(//' CHEMICAL COMPOSITION COULD NOT BE READ FROM ',
             #     *       'UNIT 56'//' STOP.')
             print()
@@ -2318,9 +2355,9 @@ def inimod():
     SET UP COMMON/RRRVAL/  - VALUES OF  N(ION)/U(ION) FOR ALL THE ATOMS
     AND IONS CONSIDERED
 
-    对应 synspec54.f 行 1881–1948
+    corresponds to synspec54.f lines 1881-1948
 
-    原 COMMON 声明：
+    original COMMON declarations:
       COMMON/BLAPAR/RELOP,SPACE0,CUTOF0,TSTD,DSTD,ALAMC
       COMMON/HPOPST/HPOP
     """
@@ -2328,9 +2365,9 @@ def inimod():
     #    (using Hamburg partition functions)
     for id in range(1, C.ND + 1):          # DO 50 ID=1,ND
         if C.IFMOL == 0 or C.TEMP[id] >= C.TMOLIM:
-            # CALL STATE(ID,TEMP(ID),ELEC(ID),S1)：
-            # STATE 给标量哑元 Q 赋值，按约定返回全部哑元并重新接收
-            s1 = 0.0   # Fortran 中 S1 未初始化；STATE 内首先置 Q=0
+            # CALL STATE(ID,TEMP(ID),ELEC(ID),S1):
+            # STATE assigns the scalar dummy Q; returns all dummies per convention and they are re-received
+            s1 = 0.0   # S1 is uninitialized in Fortran; STATE first sets Q=0
             id, _te, _ane, s1 = state(id, C.TEMP[id], C.ELEC[id], s1)
             C.HPOP = C.DENS[id]/C.WMM[id]/C.YTOT[id]
             for j in range(1, MION0 + 1):
@@ -2380,7 +2417,7 @@ def inimod():
         print()
         for i in range(1, MATOM + 1):      # DO 60 I=1,MATOM
             #  605 FORMAT(1H ,A4,(1P8E9.2))
-            # FORMAT 回卷：每 8 个值换一条记录
+            # FORMAT rewind: start a new record every 8 values
             line = f" {C.TYPAT[i]:4s}"
             for j in range(1, MION + 1):
                 if j > 1 and (j - 1) % 8 == 0:
@@ -2398,15 +2435,15 @@ def state(id, te, ane, q):
     radiation temperatures after
     Schaerer and Schmutz AA 288, 321, 1994
 
-    对应 synspec54.f 行 1953–2047
+    corresponds to synspec54.f lines 1953-2047
 
-    原 COMMON 声明：
+    original COMMON declarations:
       common/moltst/pfmol(600,mdepth),anmol(600,mdepth),
                     pfato(100,mdepth),anato(100,mdepth),
                     pfion(100,mdepth),anion(100,mdepth)
       common/ioniz2/anion2(30,mdepth)
 
-    标量哑元 Q 被赋值，按约定返回全部哑元 (id, te, ane, q)。
+    The scalar dummy Q is assigned; all dummies are returned per convention (id, te, ane, q).
     """
     ffi = np.zeros(MION0 + 1)              # dimension FFI(MION0)
 
@@ -2422,14 +2459,14 @@ def state(id, te, ane, q):
             t = te
         x = math.sqrt(t/ane)
         xmx = 2.145e4*math.sqrt(x)
-        # CALL PARTF(I,1,T,ANE,XMX,UM)：PARTF 给标量哑元 U 赋值，
-        # 按约定返回全部哑元并重新接收；实参 1 是字面量，
-        # 用临时变量 _izi 接收对应返回值
-        um = 0.0   # Fortran 中 UM 首次调用前未赋初值
+        # CALL PARTF(I,1,T,ANE,XMX,UM): PARTF assigns the scalar dummy U,
+        # so it returns all dummies per convention and they are re-received; the actual
+        # argument 1 is a literal, so the temporary variable _izi receives its return value
+        um = 0.0   # UM has no initial value in Fortran before the first call
         i, _izi, t, ane, xmx, um = partf(i, 1, t, ane, xmx, um)
         C.PFSTD[1, i] = um
         jmax = 1
-        u = 0.0      # Fortran 中 U 首次传入 PARTF 前未赋初值
+        u = 0.0      # U has no initial value in Fortran before being first passed to PARTF
         for j in range(2, ion + 1):
             j1 = j - 1
             t = C.TRAD[C.INPOT[i, j], id]
@@ -2455,7 +2492,7 @@ def state(id, te, ane, q):
             um = u
         if jmax < ion:
             r = 1.
-            rq = float(jmax - 1)           # RQ=JMAX-1（整数→实数）
+            rq = float(jmax - 1)           # RQ=JMAX-1 (integer -> real)
             for j in range(jmax + 1, ion + 1):
                 r = r*ffi[j]
                 C.RR[i, j] = r/C.PFSTD[j, i]
@@ -2502,9 +2539,9 @@ def tint():
     LOGARITHMIC INTERPOLATION COEFFICIENTS FOR INTERPOLATION OF
     TEMP(ID) TO THE VALUES  5000,10000,20000,40000
 
-    对应 synspec54.f 行 2051–2072
+    corresponds to synspec54.f lines 2051-2072
     """
-    # DATA TT /3.699, 4.000, 4.301, 4.602/（只读）
+    # DATA TT /3.699, 4.000, 4.301, 4.602/ (read-only)
     tt = [0.0, 3.699, 4.000, 4.301, 4.602]
 
     for id in range(1, C.ND + 1):
@@ -2519,17 +2556,17 @@ def tint():
         C.TI2[id] = (t - tt[j - 1])*(t - tt[j])*(tt[j] - tt[j - 1])/x
     return
 # -*- coding: utf-8 -*-
-# chunk03: synspec54.f 行 2076–3461 的逐行直译
-# 子程序: INIBL0 / INIBL1 / RESOLV / RTE / OUTPRI
-# 按 CONVENTIONS.md: 分片内禁止 import; 直接用 np, math, C, params 常量, fortran 辅助函数
+# chunk03: line-by-line translation of synspec54.f lines 2076-3461
+# subroutines: INIBL0 / INIBL1 / RESOLV / RTE / OUTPRI
+# Per CONVENTIONS.md: no import inside a chunk; use np, math, C, params constants, fortran helpers directly
 
 
-# ---------------------------------------------------------------- 辅助(非 Fortran 原文)
+# ---------------------------------------------------------------- helpers (not from the Fortran original)
 
 def _ldtok(unit, n):
-    """辅助: list-directed READ(unit,*) —— 从单元读行并分词(逗号视为分隔符),
-    至少凑够 n 个 token(不足时续读下一行); EOF 时 read_line 抛 EOFError
-    (对应 Fortran 的 end= 分支)。多余的 token 丢弃(下一 READ 从新记录开始)。"""
+    """Helper: list-directed READ(unit,*) - read lines from the unit and tokenize (commas treated as delimiters),
+    collecting at least n tokens (continuing to the next line if short); at EOF, read_line raises EOFError
+    (corresponding to Fortran's end= branch). Extra tokens are discarded (the next READ starts a new record)."""
     toks = []
     while len(toks) < n:
         toks += read_line(unit).replace(',', ' ').split()
@@ -2537,12 +2574,12 @@ def _ldtok(unit, n):
 
 
 def _f8(s):
-    """辅助: 解析 Fortran 实数 token(允许 D/d 指数)。"""
+    """Helper: parse a Fortran real token (D/d exponents allowed)."""
     return float(s.replace('D', 'e').replace('d', 'e'))
 
 
-# OUTPRI 的 EQWT/EQWTP 是局部变量, 但跨调用累加(仅 IBLANK==1 时清零),
-# 依赖 Fortran 局部变量的静态存储语义 → 提升为模块级变量(隐含 SAVE)
+# OUTPRI's EQWT/EQWTP are local variables, but they accumulate across calls (reset only when IBLANK==1),
+# relying on the static storage semantics of Fortran local variables -> promoted to module-level (implicit SAVE)
 _save_outpri_eqwt = 0.0
 _save_outpri_eqwtp = 0.0
 
@@ -2597,11 +2634,11 @@ def inibl0():
                 (tables calculated by Barnard, Cooper, and Shamey)
     IHE2PR    - for the He II lines calculated by Schoening and Butler,
 
-    对应 synspec54.f 行 2076–2531
+    corresponds to synspec54.f lines 2076-2531
     """
     un = 1.                     # parameter (un=1.)
     # character*2 iu / character*6 ilab → Python str
-    # 局部数组(对应 DIMENSION 语句, 1 基索引)
+    # local arrays (corresponding to the DIMENSION statements, 1-based indexing)
     cross = np.zeros((MCROSS + 1, MFRQ + 1))
     abso = np.zeros(MFREQ + 1)
     emis = np.zeros(MFREQ + 1)
@@ -2609,8 +2646,8 @@ def inibl0():
     absoc = np.zeros(MFREQC + 1)
     emisc = np.zeros(MFREQC + 1)
     scatc = np.zeros(MFREQC + 1)
-    # TODO(port): IFEOS>0 时 alast/cutofs/space 未经 READ 赋值,
-    # Fortran 中依赖局部变量的静态残留值; 此处按 0 初始化
+    # TODO(port): when IFEOS>0, alast/cutofs/space are not assigned by a READ;
+    # Fortran relies on the static leftover values of local variables; initialized to 0 here
     alast = 0.
     cutofs = 0.
     space = 0.
@@ -2631,7 +2668,7 @@ def inibl0():
         C.IHE1PR = int(_t[1])
         C.IHE2PR = int(_t[2])
         # READ(55,*) ALAM0,ALAST,CUTOF0,CUTOFS,RELOP,SPACE
-        # (ALAST/CUTOFS/SPACE 是本子程序的局部变量, 不在任何 COMMON 中)
+        # (ALAST/CUTOFS/SPACE are local variables of this subroutine, not in any COMMON)
         _t = _ldtok(55, 6)
         C.ALAM0 = _f8(_t[0])
         alast = _f8(_t[1])
@@ -2642,12 +2679,12 @@ def inibl0():
 
     if C.IDSTD == 0:
         id1 = 5
-        C.NDSTEP = idiv(C.ND - 2*id1, 2)   # Fortran 整数除法
-        C.IDSTD = idiv(2*C.ND, 3)          # Fortran 整数除法
+        C.NDSTEP = idiv(C.ND - 2*id1, 2)   # Fortran integer division
+        C.IDSTD = idiv(2*C.ND, 3)          # Fortran integer division
     elif C.IDSTD < 0:
         id1 = 1
         C.NDSTEP = -C.IDSTD
-        C.IDSTD = idiv(2*C.ND, 3)          # Fortran 整数除法
+        C.IDSTD = idiv(2*C.ND, 3)          # Fortran integer division
     if C.IMODE <= -3:
         C.NDSTEP = 1
 
@@ -2685,7 +2722,7 @@ def inibl0():
         C.IBIN[ilist] = imod(C.INLIST, 10)
         C.IVDWLI[ilist] = 0
         iun = 19 + ilist
-        iu = f"{iun:2d}"            # write(iu,622) iun —— 内部写; 622 format(i2)
+        iu = f"{iun:2d}"            # write(iu,622) iun - internal write; 622 format(i2)
         C.AMLIST[ilist] = 'fort.' + iu
 
     if -3 <= C.IMODE <= 1:
@@ -2697,13 +2734,13 @@ def inibl0():
             _t = _ldtok(55, 1)
             C.NMLIST = int(_t[0])
             _t = _t[1:]
-            while len(_t) < C.NMLIST:   # 隐式 DO 列表, 不够时续读下一记录
+            while len(_t) < C.NMLIST:   # implied-DO list; continue to the next record if short
                 _t += read_line(55).replace(',', ' ').split()
             for ilist in range(1, C.NMLIST + 1):
                 C.IUNITM[ilist] = int(_t[ilist - 1])
         except (EOFError, ValueError, IndexError):
-            _rdok = False               # err=5 / end=5 → 跳到标号 5
-            # TODO(port): 读部分失败时 Fortran 会保留已赋值的部分, 此处整体放弃
+            _rdok = False               # err=5 / end=5 -> jump to label 5
+            # TODO(port): on a partial read failure Fortran keeps the already-assigned part; here the whole read is abandoned
         if _rdok:
             for ilist in range(1, C.NMLIST + 1):
                 iu = f"{C.IUNITM[ilist]:2d}"   # write(iu,622) iunitm(ilist); 622 format(i2)
@@ -2719,10 +2756,10 @@ def inibl0():
             C.AMLIST[0] = _t[0]
             C.IBIN[0] = int(_t[1])
         except (EOFError, ValueError, IndexError):
-            _goto20 = True              # err=20 / end=20 → 跳到标号 20
+            _goto20 = True              # err=20 / end=20 -> jump to label 20
         if not _goto20:
             ilist = 0
-            # 10 continue —— 循环读入各线列表, 直到文件结束(end=20)
+            # 10 continue - loop reading the line lists until end of file (end=20)
             while True:
                 ilist = ilist + 1
                 try:
@@ -2731,7 +2768,7 @@ def inibl0():
                     C.IBIN[ilist] = int(_t[1])
                     C.TMLIM[ilist] = _f8(_t[2])
                 except (EOFError, ValueError, IndexError):
-                    break               # end=20 → 出循环到标号 20
+                    break               # end=20 -> exit the loop to label 20
                 numlis = numlis + 1
                 # go to 10
         # 20 continue
@@ -2747,7 +2784,7 @@ def inibl0():
         #      *        ' LINE LISTS:'/
         #      *       /' ILIST',8x,'FILENAME  IBIN  TMLIM'/
         #      *        i4,2x,a6,2x,a,2x,i4,f11.1)
-        # (ilist=0 这条只给 4 个输出项, 格式尾部 f11.1 无对应项 → 不输出)
+        # (the ilist=0 entry supplies only 4 output items; the trailing f11.1 in the format has no corresponding item -> not printed)
         print()
         print('************************')
         print(' LINE LISTS:')
@@ -2766,7 +2803,7 @@ def inibl0():
     try:
         vtb = _f8(_ldtok(55, 1)[0])     # read(55,*,err=30,end=30) VTB
     except (EOFError, ValueError, IndexError):
-        _goto30 = True                  # err=30 / end=30 → 跳到标号 30
+        _goto30 = True                  # err=30 / end=30 -> jump to label 30
     if not _goto30:
         if C.IFWIN <= 0:
             if vtb >= 0.:
@@ -2804,7 +2841,7 @@ def inibl0():
     #                velocity field); specific intensities evaluated by
     #                a simple formal solution (RESOLV)
     C.NMU0 = 1
-    ang0 = 1.                   # ANG0 是局部变量(不在 COMMON 中)
+    ang0 = 1.                   # ANG0 is a local variable (not in any COMMON)
     C.ANGL[1] = 1.
     C.WANGL[1] = 0.
     C.IFLUX = 0
@@ -2823,7 +2860,7 @@ def inibl0():
             ang0 = _f8(_t[1])
             C.IFLUX = int(_t[2])
         except (EOFError, ValueError, IndexError):
-            _goto100 = True             # end=100 / err=100 → 跳到标号 100
+            _goto100 = True             # end=100 / err=100 -> jump to label 100
         if not _goto100:
             # determinantion of the angle points and weights
             if C.NMU0 < 0:
@@ -2852,7 +2889,7 @@ def inibl0():
                     for imu in range(1, C.NMU0 + 1):
                         C.ANGL[imu] = (imu - 1)*dmu
                         C.ANGL[imu] = math.sqrt(1. - C.ANGL[imu]**2)
-                        # 注意: Fortran 原文此处引用尚未算出的 ANGL(IMU+1), 按原文直译
+                        # Note: the Fortran original references ANGL(IMU+1) here before it is computed; translated as written
                         if imu > 1 and imu < C.NMU0:
                             C.WANGL[imu] = 0.5*(C.ANGL[imu - 1] + C.ANGL[imu + 1])
                     C.WANGL[1] = 0.5*(C.ANGL[1] - C.ANGL[2])
@@ -2867,7 +2904,7 @@ def inibl0():
                     C.WANGL[2*C.NMU0 - 2] = 2.*dmu
                     C.NMU0 = 2*C.NMU0 - 2
             if C.NMU0 > 0:
-                # (IF(NMU0.LE.0) GO TO 100 → 跳过此输出)
+                # (IF(NMU0.LE.0) GO TO 100 -> skip this output)
                 #  609 FORMAT(//' SPECIFIC INTENSITIES COMPUTED FOR',I3,
                 #      *         ' ANGLES  mu=cos(theta) ='/
                 #      *         ' ---------------------------------',
@@ -2894,18 +2931,18 @@ def inibl0():
             C.nltoff = int(_t[2])
             C.iemoff = int(_t[3])
         except (EOFError, ValueError, IndexError):
-            pass                        # end=110 / err=110 → 直接到标号 110
-        # 110 —— 标号在 WRITE 语句上, 无论读是否成功都执行
+            pass                        # end=110 / err=110 -> go directly to label 110
+        # 110 - the label is on the WRITE statement, executed whether the read succeeded or not
         #  602 format(//' velmax (velocity for line rejection)',
         #      *       ' itrad,nltoff,iemoff',f10.1,2i3)
-        # TODO(port): 输出 4 项但格式只有 f10.1,2i3, Fortran 发生格式回绕; 这里按 4 项输出
+        # TODO(port): 4 items are output but the format has only f10.1,2i3, so Fortran wraps the format; here all 4 items are printed
         print()
         print()
         print(f" velmax (velocity for line rejection) itrad,nltoff,iemoff"
               f"{C.velmax:10.1f}{C.itrad:3d}{C.nltoff:3d}{C.iemoff:3d}")
         if C.velmax < 0.:
             C.velmax = 3.e5
-            # go to 120 → 跳过下面的射线与权重设置
+            # go to 120 -> skip the ray and weight setup below
         else:
             # Set up rays and weights
             velset()
@@ -2939,7 +2976,7 @@ def inibl0():
             alast = 5.e7/C.TEMP[1]*20.
         if C.ALASTs < 0.:
             alast = -5.e7/C.TEMP[1]*C.ALASTs
-        # if(alast.gt.1.e5) alast=1.e5   (原文注释掉的语句, 保留)
+        # if(alast.gt.1.e5) alast=1.e5   (statement commented out in the original; kept)
         C.ALAMC = (C.ALAM0 + alast)*0.5
         if space == 0.:
             space = 4.3e-8*math.sqrt(C.TEMP[C.IDSTD])*C.ALAMC
@@ -2984,7 +3021,7 @@ def inibl0():
         if spacon == 0:
             spacon = 3.
         xfr = (alast - C.ALAM0)/spacon
-        C.NFREQC = int(xfr) + 1     # INT(XFR) 截断取整
+        C.NFREQC = int(xfr) + 1     # INT(XFR) truncating integer conversion
         C.NFREQC = min(C.NFREQC, MFREQC)
         C.NFREQC = max(C.NFREQC, 2)
         C.DLAMLO = math.log10(alast/C.ALAM0)/(C.NFREQC - 1)
@@ -2997,7 +3034,7 @@ def inibl0():
             C.FREQC[ij] = 2.997925e18/alam
         C.ALAMC = (C.ALAM0 + alast)*0.5
         spacf = 2.997925e18/C.ALAMC/C.ALAMC*space
-        # WRITE(6,601) —— 格式同上(行 2517–2526 的 601 FORMAT)
+        # WRITE(6,601) - same format as above (the 601 FORMAT at lines 2517-2526)
         print()
         print()
         print('----------------------------------------------')
@@ -3050,7 +3087,7 @@ def inibl0():
         else:
             # new procedure
             if C.IFWIN <= 0:
-                C.NFREQC = int(cutofs)      # ifix(real(cutofs,4)) 截断取整
+                C.NFREQC = int(cutofs)      # ifix(real(cutofs,4)) truncating integer conversion
                 if C.NFREQC == 0:
                     C.NFREQC = MFREQ
                 all0 = math.log(C.ALAM0)
@@ -3064,8 +3101,8 @@ def inibl0():
                     opacon(id, cross, absoc, emisc, scatc)
                     for ijc in range(1, C.NFREQC + 1):
                         C.ABSTDW[ijc, id] = absoc[ijc]
-                # write(*,*) 'abstdw(1,ij)',(abstdw(ij,1),ij=1,nfreqc)   (原文注释)
-                # write(*,*) 'abstdw(50,ij)',(abstdw(ij,50),ij=1,nfreqc) (原文注释)
+                # write(*,*) 'abstdw(1,ij)',(abstdw(ij,1),ij=1,nfreqc)   (commented out in the original)
+                # write(*,*) 'abstdw(50,ij)',(abstdw(ij,50),ij=1,nfreqc) (commented out in the original)
             else:
                 crosew(cross)
                 for id in range(1, C.ND + 1):
@@ -3087,7 +3124,7 @@ def inibl1(igrd):
 
     AUXILIARY INITIALIZATION PROCEDURE
 
-    对应 synspec54.f 行 2536–2652
+    corresponds to synspec54.f lines 2536-2652
     """
     # parameter (un=1.,bnc=1.4743e-2,hkc=4.79928e4,clc=2.997925e17)
     un = 1.
@@ -3121,9 +3158,9 @@ def inibl1(igrd):
             alast = 5.e7/C.TEMP[1]*20.
         if C.ALASTs < 0.:
             alast = -5.e7/C.TEMP[1]*C.ALASTs
-        # if(alast.gt.1.e5) alast=1.e5   (原文注释掉的语句, 保留)
+        # if(alast.gt.1.e5) alast=1.e5   (statement commented out in the original; kept)
         C.CUTOF0 = C.CUTOF0s
-        cutofs = C.CUTOFSs              # CUTOFS 是局部变量
+        cutofs = C.CUTOFSs              # CUTOFS is a local variable
         C.RELOP = C.RELOPs
         if C.RELOPs == 0:
             C.RELOP = 1.e-15
@@ -3133,13 +3170,13 @@ def inibl1(igrd):
                 C.RELOP = 1.e-5
             if C.TEMP[1] < 1.e5:
                 C.RELOP = 1.e-4
-        space = C.SPACEs                # SPACE 是局部变量
+        space = C.SPACEs                # SPACE is a local variable
         C.ALAMC = (C.ALAM0 + alast)*0.5
         if space == 0.:
             space = 4.3e-8*math.sqrt(C.TEMP[C.IDSTD])*C.ALAMC
         if space < 0.:
             space = -5.72e-8*math.sqrt(C.TEMP[C.IDSTD])*C.ALAMC*space
-        spacf = 2.997925e18/C.ALAMC/C.ALAMC*space   # 计算后未使用, 按原文保留
+        spacf = 2.997925e18/C.ALAMC/C.ALAMC*space   # computed but never used; kept as in the original
         C.CUTOF0 = 0.1*C.CUTOF0
         C.SPACE0 = space*0.1
         C.ALAM0 = 1.e-1*C.ALAM0
@@ -3148,7 +3185,7 @@ def inibl1(igrd):
         C.ALST00 = alast
         C.FRLAST = clc/alast
 
-        C.NFREQC = int(cutofs)          # ifix(real(cutofs,4)) 截断取整
+        C.NFREQC = int(cutofs)          # ifix(real(cutofs,4)) truncating integer conversion
         if C.NFREQC == 0:
             C.NFREQC = MFREQ
         all0 = math.log(C.ALAM0)
@@ -3158,16 +3195,16 @@ def inibl1(igrd):
         for ijc in range(1, C.NFREQC + 1):
             C.WLAMC[ijc] = math.exp(all0 + (ijc - 1)*dlc)
             C.FREQC[ijc] = clc/C.WLAMC[ijc]
-            # frc=freqc(ijc)*1.e-15                          (原文注释)
-            # plac(ijc)=bnc*frc**3/(exp(xcc0*frc)-un)        (原文注释)
+            # frc=freqc(ijc)*1.e-15                          (commented out in the original)
+            # plac(ijc)=bnc*frc**3/(exp(xcc0*frc)-un)        (commented out in the original)
         id = 1
         crosew(cross)
         opacon(id, cross, C.absoc, C.emisc, C.scatc)
-        wc0 = (C.FREQC[1] - C.FREQC[2])*0.5                 # 计算后未使用, 按原文保留
+        wc0 = (C.FREQC[1] - C.FREQC[2])*0.5                 # computed but never used; kept as in the original
         wc1 = (C.FREQC[C.NFREQC - 1] - C.FREQC[C.NFREQC])*0.5
         for ijc in range(2, C.NFREQC):  # DO IJC=2,NFREQC-1
             C.absoc[ijc] = min(C.absoc[ijc], 1.e30)
-            # 642 format(f11.3,1p5e13.5) —— 只输出 2 项
+            # 642 format(f11.3,1p5e13.5) - only 2 items are output
             write_line(26, f"{C.WLAMC[ijc]*10.:11.3f}"
                            f"{math.log(C.absoc[ijc]/C.DENS[1]):13.5e}")
 
@@ -3186,7 +3223,7 @@ def inibl1(igrd):
             for id in range(1, C.ND + 1):
                 opacw(id, cross, abso, emis, C.absoc, C.emisc, C.scatc, 0)
                 for ij in range(1, C.NFREQC + 1):
-                    C.DENSCON[id] = 1.      # 原文在 DO IJ 循环内反复赋值, 按原文保留
+                    C.DENSCON[id] = 1.      # the original assigns this repeatedly inside the DO IJ loop; kept as in the original
                     C.ABSTDW[ij, id] = C.absoc[ij]/C.DENSCON[id]
 
     return
@@ -3200,7 +3237,7 @@ def resolv():
     enter the solution of the radiative transfer equation
     (RTE or RTEDFE)
 
-    对应 synspec54.f 行 2657–2742
+    corresponds to synspec54.f lines 2657-2742
     """
     cross = np.zeros((MCROSS + 1, MFRQ + 1))
     abso = np.zeros(MFREQ + 1)
@@ -3209,7 +3246,7 @@ def resolv():
 
     C.IHYL = -1
 
-    # if(imode.le.-3) call abnchn(1)   (原文注释掉的语句, 保留)
+    # if(imode.le.-3) call abnchn(1)   (statement commented out in the original; kept)
 
     # set up the partial line list for the current interval
     iniset()
@@ -3274,9 +3311,14 @@ def rte():
     """
     solution of the radiative transfer equation by Feautrier method
 
-    对应 synspec54.f 行 2746–3339
+    corresponds to synspec54.f lines 2746-3339
+
+    Method: second-order Feautrier solution of the transfer equation for
+    the known source function, with variable Eddington factors; yields the
+    emergent flux (and, optionally, specific intensities).
+    References: Feautrier 1964, CR 258, 3189.
     """
-    # 局部数组(1 基索引; DIMENSION D(3,3,MDEPTH),ANU(3,MDEPTH),... RINT(MDEPTH,MMU))
+    # local arrays (1-based indexing; DIMENSION D(3,3,MDEPTH),ANU(3,MDEPTH),... RINT(MDEPTH,MMU))
     d = np.zeros((4, 4, MDEPTH + 1))
     anu = np.zeros((4, MDEPTH + 1))
     aanu = np.zeros(MDEPTH + 1)
@@ -3292,7 +3334,7 @@ def rte():
     st0 = np.zeros(MDEPTH + 1)
     ss0 = np.zeros(MDEPTH + 1)
     rint = np.zeros((MDEPTH + 1, MMU + 1))
-    # DATA AMU/.887298334620742D0,.5D0,.112701665379258D0/  (之后不再修改)
+    # DATA AMU/.887298334620742D0,.5D0,.112701665379258D0/  (never modified afterwards)
     amu = np.array([0., .887298334620742, .5, .112701665379258])
     # DATA WTMU/.277777777777778D0,.444444444444444D0,.277777777777778D0/
     wtmu = np.array([0., .277777777777778, .444444444444444, .277777777777778])
@@ -3308,7 +3350,7 @@ def rte():
     # PARAMETER (TAUREF = 0.6666666666667)
     tauref = 0.6666666666667
 
-    C.NMU = 3                   # NMU 在 COMMON/BASNUM/ 中
+    C.NMU = 3                   # NMU is in COMMON/BASNUM/
     nd1 = C.ND - 1
 
     # Overall loop over frequencies
@@ -3352,7 +3394,7 @@ def rte():
                 p0 = un - math.exp(-tamm)
             else:
                 p0 = tamm*(un - half*tamm*(un - tamm*third*(un - quart*tamm)))
-            ex = un - p0                # 计算后未使用, 按原文保留
+            ex = un - p0                # computed but never used; kept as in the original
             q0 = q0 + p0*amu[i]*wtmu[i]
 
             div = dtp1/amu[i]*third
@@ -3410,7 +3452,7 @@ def rte():
             al = un/dtm1/dt0
             ga = un/dtp1/dt0
             be = al + ga
-            # 原文标量 A/B/C; C 与 commons 别名冲突 → a_l/b_l/c_l
+            # original scalars A/B/C; C conflicts with the commons alias -> a_l/b_l/c_l
             a_l = (un - half*al*dtp1*dtp1)*sixth
             c_l = (un - half*ga*dtm1*dtm1)*sixth
             b_l = un - a_l - c_l
@@ -3579,7 +3621,7 @@ def rte():
             ah = ah + wtmu[i]*amu[i]*anu[i, 1]
         fh = ah/aj - half*alb1
 
-        # FKK(ND)=THIRD   (原文注释掉的语句, 保留)
+        # FKK(ND)=THIRD   (statement commented out in the original, kept)
 
         # +++++++++++++++++++++++++++++++++++++++++
         # SECOND PART  -  DETERMINATION OF THE MEAN INTENSITIES
@@ -3649,7 +3691,7 @@ def rte():
         # THIRD PART  -  DETERMINATION OF THE SPECIFIC INTENSITIES
         # RECALCULATION OF THE TRANSFER EQUATION WITH GIVEN SOURCE FUNCTION
         if C.IFLUX == 0:
-            return                  # if(iflux.eq.0) return —— 在频率循环内提前 RETURN
+            return                  # if(iflux.eq.0) return - early RETURN inside the frequency loop
         for imu in range(1, C.NMU0 + 1):
             anx = C.ANGL[imu]
             dtp1 = dt[1]
@@ -3710,7 +3752,7 @@ def rte():
             rint[1, imu] = rint[1, imu]/half
             flx = flx + C.ANGL[imu]*C.WANGL[imu]*rint[1, imu]
         flx = flx*half
-        # FLUX(IJ)=FLX   (原文注释掉的语句, 保留)
+        # FLUX(IJ)=FLX   (statement commented out in the original, kept)
 
         # output of emergent specific intensities to Unit 10
         # and 18 (continuum)
@@ -3769,7 +3811,7 @@ def rte():
                 alam = 2.997925e18/C.FREQ[ij]
                 il0 = C.IJCTR[ij]
                 il = C.INDLIN[il0]
-                iat = idiv(C.INDAT[il], 100)    # Fortran 整数除法
+                iat = idiv(C.INDAT[il], 100)    # Fortran integer division
                 ion = imod(C.INDAT[il], 100)
                 # 376 format(i5,f11.4,2x,2a4,i8,1pe12.4,0pf10.1)
                 write_line(97, f"{il:5d}{alam:11.4f}  {C.TYPAT[iat]:4s}{typion[ion]:4s}"
@@ -3801,16 +3843,16 @@ def outpri():
     ROTINS, which performs convolutions for the rotational and
     instrumental broadening, and plots the synthetic spectrum
 
-    对应 synspec54.f 行 3343–3458
+    corresponds to synspec54.f lines 3343-3458
     """
-    # EQWT/EQWTP 跨调用累加(隐含 SAVE) → 模块级变量
+    # EQWT/EQWTP accumulated across calls (implicit SAVE) → module-level variables
     global _save_outpri_eqwt, _save_outpri_eqwtp
     # PARAMETER (UN=1.,CAS=1./2.997925D18,EQWC=1.19917D22)
     un = 1.
     cas = 1./2.997925e18
     eqwc = 1.19917e22
     # PARAMETER (PI2=3.141592654/2.)
-    pi2 = 3.141592654/2.        # 定义后未使用, 按原文保留
+    pi2 = 3.141592654/2.        # defined but unused afterwards, kept as in the original
     # DIMENSION FLX(3),REL(3),ALX(3)
     flx = np.zeros(4)
     rel = np.zeros(4)
@@ -3894,9 +3936,9 @@ def outpri():
             if C.IPRIN > 0:
                 k1 = k1 + 1
                 flx[k1] = math.log10(flam)
-                alx[k1] = C.WLAM[ij]    # 原文此处用 WLAM(而非 WLOBS), 按原文直译
+                alx[k1] = C.WLAM[ij]    # original uses WLAM here (not WLOBS), translated verbatim
                 rel[k1] = re0
-                # TODO(port): 原文判断用 IJ.EQ.NFREQ(而非 NFROBS), 按原文直译
+                # TODO(port): original test uses IJ.EQ.NFREQ (not NFROBS), translated verbatim
                 if k1 == 3 or ij == C.NFREQ:
                     print(''.join(f"  {alx[i]:9.3f}{flx[i]:8.4f}{rel[i]:7.3f}"
                                   for i in range(1, k1 + 1)))
@@ -3923,7 +3965,7 @@ def outpri():
 def croset(cross):
     """
 C     SET UP ARRAY CROSS  - PHOTOIONIZATION CROSS-SECTIONS
-    对应 synspec54.f 行 3462–3496
+    corresponds to synspec54.f lines 3462-3496
     """
     ij0 = 2
     if C.NFREQ == 1:
@@ -3950,7 +3992,7 @@ C     SET UP ARRAY CROSS  - PHOTOIONIZATION CROSS-SECTIONS
 def crosew(cross):
     """
 C     SET UP COMMON/PHOPAR/  - PHOTOIONIZATION CROSS-SECTIONS
-    对应 synspec54.f 行 3500–3532
+    corresponds to synspec54.f lines 3500-3532
     """
     ij0 = C.NFREQC
     for ij in range(1, ij0 + 1):
@@ -3978,7 +4020,7 @@ C     Input: FR  -  frequency
 C            ITR -  index of the transition
 c            mode - =0 cross-section equal to zero longward of edge
 c            mode - >0 cross-section non-zero (extrapolated) longward of edge
-    对应 synspec54.f 行 3538–3708
+    corresponds to synspec54.f lines 3538-3708
     """
     # PARAMETER (SIH0=2.815D29, E10=2.3025851)
     SIH0 = 2.815e29
@@ -3987,14 +4029,14 @@ c            mode - >0 cross-section non-zero (extrapolated) longward of edge
     wi1 = 911.753878
     wi2 = 227.837832
     un = 1.0e0
-    # 语句函数（statement functions）
+    # statement functions
     # PEACH(X,S,A,B)  =A*X**S*(B+X*(1.-B))*1.E-18
     def peach(x, s, a, b):
         return a * x**s * (b + x * (1.0 - b)) * 1.0e-18
     # HENRY(X,S,A,B,C)=A*X**S*(C+X*(B-2.*C+X*(1.+C-B)))*1.E-18
     def henry(x, s, a, b, c):
         return a * x**s * (c + x * (b - 2.0 * c + x * (1.0 + c - b))) * 1.0e-18
-    # DIMENSION XFIT(MFIT), SFIT(MFIT)  — 局部数组，1 基索引
+    # DIMENSION XFIT(MFIT), SFIT(MFIT)  - local arrays, 1-based indexing
     xfit = np.zeros(MFIT + 1)
     sfit = np.zeros(MFIT + 1)
 
@@ -4118,7 +4160,7 @@ c            mode - >0 cross-section non-zero (extrapolated) longward of edge
         sigk_v = sigm
 
     elif ib < 0:
-        # CALL SPSIGK(ITR,IB,FR,SIGSP) — SPSIGK 给标量哑元 SIGSP 赋值，按约定解包接收
+        # CALL SPSIGK(ITR,IB,FR,SIGSP) - SPSIGK assigns scalar dummy SIGSP; unpacked per convention
         sigsp = 0.0
         itr, ib, fr, sigsp = spsigk(itr, ib, fr, sigsp)
         sigk_v = sigsp
@@ -4135,7 +4177,7 @@ def gaunt(i, fr):
     """
 C     Hydrogenic bound-free Gaunt factor for the principal quantum
 C     number I and frequency FR
-    对应 synspec54.f 行 3715–3756
+    corresponds to synspec54.f lines 3715-3756
     """
     x = fr / 2.99793e14
     gaunt_v = 1.0
@@ -4176,20 +4218,20 @@ def gntk(i, fr):
     """
 C     Hydrogenic bound-free Gaunt factor for the principal quantum
 C     number I and frequency FR (from Klaus Werner)
-    对应 synspec54.f 行 3763–3780
+    corresponds to synspec54.f lines 3763-3780
     """
     gntk_v = 1.0
     if i > 3:
         return gntk_v  # GO TO 16 → RETURN
     y = 1.0 / fr
-    # GO TO (1,2,3),I —— 计算 GO TO，重构为 if/elif
+    # GO TO (1,2,3),I - computed GO TO, restructured as if/elif
     if i == 1:
         gntk_v = 0.9916 + y * (2.71852e13 - y * 2.26846e30)
     elif i == 2:
         gntk_v = 1.1050 - y * (2.37490e14 - y * 4.07677e28)
     elif i == 3:
         gntk_v = 1.1010 - y * (0.98632e14 - y * 1.03540e28)
-    # 标号 16
+    # label 16
     return gntk_v
 
 
@@ -4197,9 +4239,9 @@ def spsigk(itr, ib, fr, sigsp):
     """
 C     Non-standard evaluation of the photoionization cross-sections
 C     Basically user-suppled procedure; here are some examples
-    对应 synspec54.f 行 3787–3820
+    corresponds to synspec54.f lines 3787-3820
 
-    给标量哑元 SIGSP 赋值 → 按约定返回全部标量哑元 (itr, ib, fr, sigsp)
+    assigns scalar dummy SIGSP → returns all scalar dummies per convention (itr, ib, fr, sigsp)
     """
     sigsp = 0.0
     if itr <= 0:
@@ -4215,7 +4257,7 @@ C     Basically user-suppled procedure; here are some examples
 
     #     Carbon ground configuration levels 2p2 1D and 1S
     if ib == -602 or ib == -603:
-        # CALL CARBON(IB,FR,SG) — CARBON 给标量哑元 SG 赋值，按约定解包接收
+        # CALL CARBON(IB,FR,SG) - CARBON assigns scalar dummy SG; unpacked per convention
         sg = 0.0
         ib, fr, sg = carbon(ib, fr, sg)
         sigsp = sg
@@ -4234,12 +4276,12 @@ def carbon(ib, fr, sg):
     """
 C     Photoionization cross-section for neutral carbon 2p1D and 2p1S
 C     levels (G.B.Taylor - private communication)
-    对应 synspec54.f 行 3828–3879
+    corresponds to synspec54.f lines 3828-3879
 
-    给标量哑元 SG 赋值 → 按约定返回全部标量哑元 (ib, fr, sg)
+    assigns scalar dummy SG → returns all scalar dummies per convention (ib, fr, sg)
     """
     # DIMENSION FR2(34),SG2(34),FR3(45),SG3(45)
-    # DATA 初始化且之后不再修改 —— 函数顶部直接赋值（1 基索引，索引 0 不用）
+    # DATA initialization, never modified afterwards - assigned directly at function top (1-based indexing, index 0 unused)
     fr2 = np.array([0.0,
         0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.80, 0.81, 0.82,
         0.83,       0.85, 0.86, 0.87, 0.88, 0.89, 0.90,
@@ -4274,17 +4316,17 @@ C     levels (G.B.Taylor - private communication)
     # IF(IB.NE.-602) GO TO 25
     if ib == -602:
         j = 2
-        # IF(F.LE.FR2(1)) GO TO 20 —— 直接用第一个间隔外推
+        # IF(F.LE.FR2(1)) GO TO 20 - extrapolate directly with the first interval
         if f > fr2[1]:
             for i in range(2, nc2 + 1):  # DO 10 I=2,NC2
                 j = i
                 if f > fr2[i - 1] and f <= fr2[i]:
                     break  # GO TO 20
-            # 循环正常结束时 j 保持最后赋值（=NC2），与 Fortran 一致
-        # 标号 20
+            # on normal loop exit j keeps its last assignment (=NC2), as in Fortran
+        # label 20
         sg = (f - fr2[j - 1]) / (fr2[j] - fr2[j - 1]) * (sg2[j] - sg2[j - 1]) + sg2[j - 1]
         sg = sg * 1.0e-18
-    # 标号 25；IF(IB.NE.-603) GO TO 50
+    # label 25; IF(IB.NE.-603) GO TO 50
     if ib == -603:
         j = 2
         # IF(F.LE.FR3(1)) GO TO 40
@@ -4293,10 +4335,10 @@ C     levels (G.B.Taylor - private communication)
                 j = i
                 if f > fr3[i - 1] and f <= fr3[i]:
                     break  # GO TO 40
-        # 标号 40
+        # label 40
         sg = (f - fr3[j - 1]) / (fr3[j] - fr3[j - 1]) * (sg3[j] - sg3[j - 1]) + sg3[j - 1]
         sg = sg * 1.0e-18
-    # 标号 50
+    # label 50
     return ib, fr, sg
 
 
@@ -4304,7 +4346,7 @@ def sghe12(fr):
     """
 C     Special formula for the photoionization cross-section from the
 C     averaged <n=2> level of He I
-    对应 synspec54.f 行 3885–3901
+    corresponds to synspec54.f lines 3885-3901
     """
     # DATA C1/3.E0/,C2/9.E0/,C3/1.6E1/,
     #  A1/6.45105E-18/,A2/3.02E-19/,A3/9.9847E-18/,A4/1.1763673E-17/,
@@ -4340,7 +4382,7 @@ C     from Hidalgo (1968, Ap. J., 153, 981) for the species indicated by IB
 C     (Hidalgo's number = INDEX = -IB-100).
 C     Compute linearly interpolated value of the cross-section
 C     at the frequency FR.
-    对应 synspec54.f 行 3907–3980
+    corresponds to synspec54.f lines 3907-3980
     """
     # DIMENSION WL1(20),WL2(20),WLI(20),SIG0(20,24),SIGS(20)
     # DATA WL1 /.../
@@ -4351,7 +4393,7 @@ C     at the frequency FR.
     wl2 = np.array([0.0,
         68.5, 80.9, 100.1, 120.9, 158.8, 165.7, 177.3, 190.6, 200.7, 206.2,
         211.9, 218.0, 224.5, 231.3, 246.3, 0.0, 0.0, 0.0, 0.0, 0.0])  # 5*0.
-    # DATA SIG0 /.../ —— 480 个值按 Fortran 列主序填充 (20,24)
+    # DATA SIG0 /.../ - 480 values filled in Fortran column-major order (20,24)
     _sig0_flat = (
         [0.0] * 120 +
         [.0460, .2400, .3500, .3700, .4000, .4300, .4400, .4600, .4700, .4900,
@@ -4380,8 +4422,8 @@ C     at the frequency FR.
     num = 20
     if index >= 13 and index <= 27:
         num = 15
-    # TODO(port): IB 在 [-137,-114] 时 INDEX∈[14,37]，超出 SIG0 声明的第二维 24；
-    # 原 Fortran 会越界读相邻存储，此处按声明维度直译，越界时 numpy 会报错。
+    # TODO(port): for IB in [-137,-114], INDEX lies in [14,37], exceeding SIG0's declared second dimension 24;
+    # the original Fortran would read adjacent storage out of bounds; here translated per the declared dimensions, so out-of-bounds access raises a numpy error.
     for i in range(1, num + 1):  # DO 10 I=1,NUM
         if index < 13:
             wli[i] = wl1[i]
@@ -4397,7 +4439,7 @@ C     at the frequency FR.
             il = i
             ir = i + 1
             break  # GO TO 60
-    # 标号 60：LINEAR INTERPOLATION:
+    # label 60: LINEAR INTERPOLATION:
     sigm = (sigs[ir] - sigs[il]) * (wlam - wli[il]) / (wli[ir] - wli[il]) + sigs[il]
 
     #     IF OUTSIDE WAVELENGTH RANGE SET TO FIRST(LAST) VALUE:
@@ -4423,7 +4465,7 @@ C     Compute linearly interpolated value of the cross-section
 C     at the frequency FR.
 C
 C     (At the moment, only a few transitions are considered)
-    对应 synspec54.f 行 3986–4052
+    corresponds to synspec54.f lines 3986-4052
     """
     # DIMENSION HEV(30),F0(30),SIG0(30,2),SIGS(30)
     # DATA HEV /.../
@@ -4431,7 +4473,7 @@ C     (At the moment, only a few transitions are considered)
         130., 160., 190., 210., 240., 270., 300., 330., 360., 390.,
         420., 450., 480., 510., 540., 570., 600., 630., 660., 690.,
         720., 750., 780., 810., 840., 870., 900., 930., 960., 990.])
-    # DATA SIG0 /.../ —— 60 个值按 Fortran 列主序填充 (30,2)
+    # DATA SIG0 /.../ - 60 values filled in Fortran column-major order (30,2)
     _sig0_flat = (
         [0.0] * 3 +
         [4.422e-1, 3.478e-1,
@@ -4455,8 +4497,8 @@ C     (At the moment, only a few transitions are considered)
 
     index = -ib - 300
     num = 30
-    # TODO(port): INDEX 只能为 1 或 2（IB=-301 或 -302），否则超出 SIG0 第二维；
-    # 原代码注释亦说明 "only a few transitions are considered"。
+    # TODO(port): INDEX can only be 1 or 2 (IB=-301 or -302), otherwise SIG0's second dimension is exceeded;
+    # the original comment also states "only a few transitions are considered".
     for i in range(1, num + 1):  # DO 10 I=1,NUM
         f0[i] = hev[i] * 2.418573e14
         sigs[i] = sig0[i, index]
@@ -4468,7 +4510,7 @@ C     (At the moment, only a few transitions are considered)
             il = i
             ir = i + 1
             break  # GO TO 60
-    # 标号 60：LINEAR INTERPOLATION:
+    # label 60: LINEAR INTERPOLATION:
     sigm = (sigs[ir] - sigs[il]) * (fr - f0[il]) / (f0[ir] - f0[il]) + sigs[il]
 
     #     IF OUTSIDE WAVELENGTH RANGE SET TO FIRST(LAST) VALUE:
@@ -4514,19 +4556,19 @@ C                     singlet state
 C            = 13  -  the given transition is from non-averaged
 C                     triplet state
 C      FR    - frequency
-    对应 synspec54.f 行 4059–4204
+    corresponds to synspec54.f lines 4059-4204
     """
     ni = C.NQUANT[ii]
     igi = int(C.G[ii] + 0.01)
-    is_l = ib - 10  # 原变量名 IS，与 Python 关键字冲突，改名 is_l
+    is_l = ib - 10  # original variable name IS, conflicts with a Python keyword, renamed is_l
     sbfhe1_v = 0.0
-    _goto10 = False  # GO TO 10 → 打印错误信息并 STOP
+    _goto10 = False  # GO TO 10 → print error message and STOP
 
     #     ----------------------------------------------------------------
     #     IB=11 or 13  - photoionization from an non-averaged (l,s) level
     #     ----------------------------------------------------------------
     if is_l == 1 or is_l == 3:
-        # IL=(IGI/IS-1)/2 —— Fortran 整数除法
+        # IL=(IGI/IS-1)/2 - Fortran integer division
         il = idiv(idiv(igi, is_l) - 1, 2)
         sbfhe1_v = hephot(is_l, il, ni, fr)
 
@@ -4565,7 +4607,7 @@ C      FR    - frequency
                             5.0 * hephot(1, 2, 3, fr) +
                             3.0 * hephot(3, 0, 3, fr) + 9.0 * hephot(3, 1, 3, fr) +
                             15.0 * hephot(3, 2, 3, fr)) / 3.6e0
-                # TODO(port): 原式除以 3.6D0（=3.6），疑似原代码笔误（应为 36），此处按原文直译
+                # TODO(port): original expression divides by 3.6D0 (=3.6), likely a typo in the original (should be 36); translated verbatim here
             else:
                 _goto10 = True  # GO TO 10
 
@@ -4597,7 +4639,7 @@ C      FR    - frequency
 
     if not _goto10:
         return sbfhe1_v
-    # 标号 10：输入不一致，打印错误并 STOP
+    # label 10: inconsistent input, print error and STOP
     #  601 FORMAT(1H0/' INCONSISTENT INPUT TO PROCEDURE SBFHE1'/
     #     * ' QUANTUM NUMBER =',I3,'  STATISTICAL WEIGHT',I4,'  S=',I3)
     print()
@@ -4627,13 +4669,13 @@ C                    for L > 2 - hydrogenic expresion
 C                FREQ = FREQUENCY
 C
 C           DGH JUNE 1988 JILA, slightly modified by I.H.
-    对应 synspec54.f 行 4211–4374
+    corresponds to synspec54.f lines 4211-4374
     """
     # INTEGER S,L,SS,LL
     # DIMENSION COEF(4,53),IST(3,2),N0(3,2),
     #           FL0(53),A(53),B(53),XFITM(53)
     #      DIMENSION XMAX(53)
-    # DATA IST/1,36,20,11,45,28/ —— 列主序填充 (3,2)
+    # DATA IST/1,36,20,11,45,28/ - filled in column-major order (3,2)
     ist = np.zeros((4, 3), dtype=np.int64)
     ist[1:4, 1:3] = np.array([1, 36, 20, 11, 45, 28]).reshape((3, 2), order='F')
     # DATA N0/1,2,3,2,2,3/
@@ -4687,7 +4729,7 @@ C           DGH JUNE 1988 JILA, slightly modified by I.H.
         -3.65991e+00, -3.64968e+00, -3.48666e+00, -3.23985e+00, -2.95758e+00,
         -3.07110e+00, -2.87157e+00, -2.83137e+00, -2.82132e+00, -2.91084e+00,
         -2.91159e+00, -2.91336e+00, -2.91296e+00])
-    # DATA ((COEF(I,J),I=1,4),J=1,53)/.../ —— 212 个值按列主序填充 (4,53)
+    # DATA ((COEF(I,J),I=1,4),J=1,53)/.../ - 212 values filled in column-major order (4,53)
     _coef_flat = [
         # J=1..10
         8.734e-01, -1.545e+00, -1.093e+00, 5.918e-01, 9.771e-01, -1.567e+00,
@@ -4737,14 +4779,14 @@ C           DGH JUNE 1988 JILA, slightly modified by I.H.
     coef[1:5, 1:54] = np.array(_coef_flat).reshape((4, 53), order='F')
 
     if l > 2:
-        # GO TO 20 —— Hydrogenic expression for L > 2
+        # GO TO 20 -- Hydrogenic expression for L > 2
         #      [multiplied by relative population of state (s,l,n), ie.
         #       by  stat.weight(s,l)/stat.weight(n)]
         gn = 2.0 * n * n
         return 2.815e29 / freq / freq / freq / n**5 * (2 * l + 1) * s / gn
 
     #          SELECT BEGINNING AND END OF COEFFICIENTS
-    # SS=(S+1)/2 —— Fortran 整数除法
+    # SS=(S+1)/2 - Fortran integer division
     ss = idiv(s + 1, 2)
     ll = l + 1
     nsl0 = n0[ll, ss]
@@ -4778,14 +4820,14 @@ C     [cm^2] at frequency FREQ. FREQ0 is the threshold frequency from
 C     level I of ion KI. Threshold cross-sections will be of the order
 C     of the numerical value of 10^-18.
 C     Opacity-Project (OP) interpolation fit formula
-    对应 synspec54.f 行 4381–4429
+    corresponds to synspec54.f lines 4381-4429
     """
     # PARAMETER (E10=2.3025851)
     E10 = 2.3025851
     # PARAMETER (MMAXOP = 200, MOP = 15)
     MMAXOP = 200  # maximum number of levels in OP data
     MOP = 15      # maximum number of fit points per level
-    # DIMENSION XFIT(MOP), SFIT(MOP) —— 局部数组，1 基索引
+    # DIMENSION XFIT(MOP), SFIT(MOP) - local arrays, 1-based indexing
     xfit = np.zeros(MOP + 1)
     sfit = np.zeros(MOP + 1)
 
@@ -4798,7 +4840,7 @@ C     Opacity-Project (OP) interpolation fit formula
         if feq(C.IDLVOP[iop], typlv):
             #           level has been detected in OP-data file
             if C.NOP[iop] <= 0:
-                # GO TO 20 —— Level is not found ,or no data for this level, in RBF.DAT
+                # GO TO 20 -- Level is not found ,or no data for this level, in RBF.DAT
                 #  100 FORMAT ('SIGMA.......: OP DATA NOT AVAILABLE FOR LEVEL ',A10)
                 write_line(61, f'SIGMA.......: OP DATA NOT AVAILABLE FOR LEVEL {typlv:<10s}')
                 return topbas_v
@@ -4809,7 +4851,7 @@ C     Opacity-Project (OP) interpolation fit formula
             sigm = 1.0e-18 * math.exp(E10 * sigm)
             topbas_v = sigm
             break  # GO TO 10 → RETURN
-    # 标号 10
+    # label 10
     return topbas_v
 
 
@@ -4825,7 +4867,7 @@ C        IDLVOP() = level identifyer of current level
 C        NOP()     = number of fit points for current level
 C        XOP(,)    = x     = alog10(nu/nu0)       of fit point
 C        SOP(,)    = sigma = alog10(sigma/10^-18) of fit point
-    对应 synspec54.f 行 4435–4499
+    corresponds to synspec54.f lines 4435-4499
     """
     # CHARACTER*4 IONID
     open_unit(40, 'RBF.DAT', mode='r')  # OPEN (UNIT=40,FILE='RBF.DAT',STATUS='OLD')
@@ -4835,8 +4877,8 @@ C        SOP(,)    = sigma = alog10(sigma/10^-18) of fit point
     iop = 0
     #         = initialize sequential level index op Opacity Project data
     #     Read number of elements in file
-    # TODO(port): 自由格式(list-directed) READ 按空白/逗号分隔解析；
-    # 若 RBF.DAT 的能级标识符内含空格需另行处理。
+    # TODO(port): list-directed READ parsed by splitting on whitespace/commas;
+    # level identifiers in RBF.DAT containing spaces would need separate handling.
     neop = int(read_line(40).split()[0])  # READ (40,*) NEOP
     for ieop in range(1, neop + 1):
         #        Skip element name header
@@ -4860,7 +4902,7 @@ C        SOP(,)    = sigma = alog10(sigma/10^-18) of fit point
                 C.IDLVOP[iop] = _tok[0]
                 C.NOP[iop] = int(_tok[1])
                 #              Read normalized log10 frequency and log10 cross section values
-                for is_l in range(1, C.NOP[iop] + 1):  # DO IS = 1, NOP(IOP)；IS 与关键字冲突改名 is_l
+                for is_l in range(1, C.NOP[iop] + 1):  # DO IS = 1, NOP(IOP); IS conflicts with a keyword, renamed is_l
                     _tok = read_line(40).split()  # READ (40,*) INDEX, XOP(IS,IOP), SOP(IS,IOP)
                     index = int(_tok[0])
                     C.XOP[is_l, iop] = float(_tok[1])
@@ -4876,14 +4918,14 @@ def ylintp(xint, x, y, n, ntot):
     """
 C     linear interpolation routine. Determines YINT = Y(XINT) from
 C     grid Y(X) with N points and dimension NTOT.
-    对应 synspec54.f 行 4506–4534
+    corresponds to synspec54.f lines 4506-4534
     """
     #     bisection (see Numerical Recipes par 3.4 page 90)
     jl = 0
     ju = n + 1
-    # 标号 10 + GO TO 10 → while 循环
+    # label 10 + GO TO 10 → while loop
     while ju - jl > 1:
-        jm = idiv(ju + jl, 2)  # Fortran 整数除法
+        jm = idiv(ju + jl, 2)  # Fortran integer division
         if (x[n] > x[1]) == (xint > x[jm]):  # .EQV.
             jl = jm
         else:
@@ -4897,21 +4939,21 @@ C     grid Y(X) with N points and dimension NTOT.
     ylintp_v = rc * (xint - x[j]) + y[j]
     return ylintp_v
 # ======================================================================
-# chunk05: synspec54.f 行 4541-5424 的逐行直译
-# 含 OPAC / OPACW / OPACON / SGMERG / GFREE / SFFHMI_old /
+# chunk05: line-by-line translation of synspec54.f lines 4541-5424
+# contains OPAC / OPACW / OPACON / SGMERG / GFREE / SFFHMI_old /
 #     LYMLIN / FEAUTR / HYLSET / HYLSEW
 # ======================================================================
 
 
-# ===== LYMLIN 的 SAVE 变量(Fortran 局部变量隐含 SAVE, 跨调用保留)=====
-_save_lymlin_icomp = 0      # DATA icomp/0/, 首次调用时置 1
-_save_lymlin_ifstrk = 0     # 由 unit 4 读入或取默认值, 之后跨调用保留
+# ===== SAVE variables of LYMLIN (Fortran locals with implicit SAVE, preserved across calls) =====
+_save_lymlin_icomp = 0      # DATA icomp/0/, set to 1 on first call
+_save_lymlin_ifstrk = 0     # read from unit 4 or defaults; preserved across calls afterwards
 _save_lymlin_ifnat = 0
 _save_lymlin_ifres = 0
 _save_lymlin_ifprd = 0
 _save_lymlin_ifsti = 0
-# DATA SN / SR, 且在循环体内可能被置 0(ifnat/ifres 为 0 时), 隐含 SAVE;
-# 1 基索引, 下标 0 不用
+# DATA SN / SR; may be set to 0 inside the loop body (when ifnat/ifres is 0); implicit SAVE;
+# 1-based indexing, index 0 unused
 _save_lymlin_sn = np.array([0.0, 1.308e5, 5.280e3, 5.847e2, 1.078e2])
 _save_lymlin_sr = np.array([0.0, 1.218e-16, 9.196e-17, 1.058e-16, 1.296e-16])
 
@@ -4928,7 +4970,7 @@ def opac(id, cross, abso, emis, scat):
             SCAT - array of scattering coefficient (all scattering
                    mechanisms except electron scattering)
 
-    对应 synspec54.f 行 4541–4763 (SUBROUTINE OPAC)
+    corresponds to synspec54.f lines 4541-4763 (SUBROUTINE OPAC)
     """
     # DIMENSION ABSO(MFREQ),EMIS(MFREQ),SCAT(MFREQ),
     #  *          ABLIN(MFREQ),EMLIN(MFREQ)
@@ -4966,7 +5008,7 @@ def opac(id, cross, abso, emis, scat):
     # Opacity and emissivity in continuum
     # **** calculated only in the first and the last frequency *****
 
-    ABLY1 = 0.0     # 仅在下面 IJ==1 时赋值, 预先初始化避免未定义
+    ABLY1 = 0.0     # only assigned below when IJ==1; pre-initialized to avoid an undefined value
     EMLY1 = 0.0
     SCLY1 = 0.0
     for IJ in range(1, IJ0 + 1):        # DO 200 IJ=1,IJ0
@@ -4995,7 +5037,7 @@ def opac(id, cross, abso, emis, scat):
                     if C.indexp[II] == 5:
                         IZZ = C.IZ[C.IEL[II]]
                         FR0 = C.ENION[II] / 6.6256e-27
-                        DW1 = 0.0   # 临时变量; DWNFR1 修改标量哑元 DW1
+                        DW1 = 0.0   # temporary variable; DWNFR1 modifies scalar dummy DW1
                         FR, FR0, id, IZZ, DW1 = dwnfr1(FR, FR0, id, IZZ, DW1)
                         SG = SG * DW1
                 if SG <= 0.0:
@@ -5036,10 +5078,10 @@ def opac(id, cross, abso, emis, scat):
 
         # Additional opacities
 
-        _mode = 0   # 字面量 0 作为 MODE 实参; OPADD 修改标量哑元, 用临时变量接收
+        _mode = 0   # literal 0 as MODE argument; OPADD modifies the scalar dummy, received via a temporary variable
         _mode, id, FR, ABAD, EMAD, SCAD = opadd(_mode, id, FR, 0.0, 0.0, 0.0)
         if C.IOPHLI != 0:
-            # LYMLIN 修改标量哑元 ABLY/EMLY/SCLY, 解包接收
+            # LYMLIN modifies scalar dummies ABLY/EMLY/SCLY, unpacked on return
             id, FR, ABLY, EMLY, SCLY = lymlin(id, FR, ABLY, EMLY, SCLY)
 
         # Total opacity and emissivity
@@ -5151,7 +5193,7 @@ def opacw(id, cross, abso, emis, absoc, emisc, scatc, modc):
             SCAT - array of scattering coefficient (all scattering
                    mechanisms except electron scattering)
 
-    对应 synspec54.f 行 4770–4968 (SUBROUTINE OPACW)
+    corresponds to synspec54.f lines 4770-4968 (SUBROUTINE OPACW)
     """
     # DIMENSION ABSO(MFREQ),EMIS(MFREQ),SCAT(MFREQ),
     #  *          ABSOC(MFREQC),EMISC(MFREQC),SCATC(MFREQC),
@@ -5162,7 +5204,7 @@ def opacw(id, cross, abso, emis, absoc, emisc, scatc, modc):
     abl1 = np.zeros(MFREQC + 1)
     eml1 = np.zeros(MFREQC + 1)
     scl1 = np.zeros(MFREQC + 1)
-    # common/lasers/lasdel  (声明了但本例程未使用)
+    # common/lasers/lasdel  (declared but unused in this routine)
     UN = 1.0
     TEN15 = 1.0e-15
     CSB = 2.0706e-16
@@ -5218,7 +5260,7 @@ def opacw(id, cross, abso, emis, absoc, emisc, scatc, modc):
                     if C.indexp[II] == 5:
                         IZZ = C.IZ[C.IEL[II]]
                         FR0 = C.ENION[II] / 6.6256e-27
-                        DW1 = 0.0   # 临时变量; DWNFR1 修改标量哑元 DW1
+                        DW1 = 0.0   # temporary variable; DWNFR1 modifies scalar dummy DW1
                         FR, FR0, id, IZZ, DW1 = dwnfr1(FR, FR0, id, IZZ, DW1)
                         SG = SG * DW1
                 ABF = ABF + SG * C.POPUL[II, id]
@@ -5256,10 +5298,10 @@ def opacw(id, cross, abso, emis, absoc, emisc, scatc, modc):
 
         # Additional opacities
 
-        _mode = 0   # 字面量 0 作为 MODE 实参; OPADD 修改标量哑元, 用临时变量接收
+        _mode = 0   # literal 0 as MODE argument; OPADD modifies the scalar dummy, received via a temporary variable
         _mode, id, FR, ABAD, EMAD, SCAD = opadd(_mode, id, FR, 0.0, 0.0, 0.0)
         if C.IOPHLI != 0:
-            # LYMLIN 修改标量哑元 ABLY/EMLY/SCLY, 解包接收
+            # LYMLIN modifies scalar dummies ABLY/EMLY/SCLY, unpacked on return
             id, FR, ABLY, EMLY, SCLY = lymlin(id, FR, ABLY, EMLY, SCLY)
 
         # Total opacity and emissivity
@@ -5301,7 +5343,7 @@ def opacw(id, cross, abso, emis, absoc, emisc, scatc, modc):
         # **** Opacity and emissivity in molecular lines ****
 
         if C.IFMOL > 0:
-            avab = 0.0  # TODO(port): OPACW 中 AVAB 未赋值即传给 MOLOP(Fortran 依赖未定义值), 此处取 0.0
+            avab = 0.0  # TODO(port): in OPACW, AVAB is passed to MOLOP unassigned (Fortran relies on an undefined value); 0.0 used here
             for ilist in range(1, C.NMLIST + 1):
                 molop(id, ablin, emlin, avab, ilist)
                 for IJ in range(1, C.NFREQ + 1):
@@ -5353,7 +5395,7 @@ def opacon(id, cross, absoc, emisc, scatc):
             EMIS - array of emission coefficient
             SCAT - array of scattering coefficient
 
-    对应 synspec54.f 行 4975–5100 (SUBROUTINE OPACON)
+    corresponds to synspec54.f lines 4975-5100 (SUBROUTINE OPACON)
     """
     UN = 1.0
     TEN15 = 1.0e-15
@@ -5372,7 +5414,7 @@ def opacon(id, cross, absoc, emisc, scatc):
     EMLY = 0.0
     SCLY = 0.0
     sce = ANE * SIGE
-    SF2 = 0.0   # TODO(port): 原代码中 SF2 未初始化即在 IT==2 分支累加(依赖跨迭代残留值), 此处初始化为 0.0
+    SF2 = 0.0   # TODO(port): in the original, SF2 is accumulated in the IT==2 branch without initialization (relying on a value left over from a previous iteration); initialized to 0.0 here
 
     # Opacity and emissivity in continuum
     # **** calculated only for the continuum frequencies *****
@@ -5405,14 +5447,14 @@ def opacon(id, cross, absoc, emisc, scatc):
                     if C.indexp[II] == 5:
                         IZZ = C.IZ[C.IEL[II]]
                         FR0 = C.ENION[II] / 6.6256e-27
-                        DW1 = 0.0   # 临时变量; DWNFR1 修改标量哑元 DW1
+                        DW1 = 0.0   # temporary variable; DWNFR1 modifies scalar dummy DW1
                         FR, FR0, id, IZZ, DW1 = dwnfr1(FR, FR0, id, IZZ, DW1)
                         SG = SG * DW1
                 if C.POPUL[II, id] < 1.0e-20 or XN < 1.0e-20:
                     continue        # if(popul(ii,id).lt.1.e-20.or.xn.lt.1.e-20) go to 10
                 ABF = ABF + SG * C.POPUL[II, id]
                 XX = SG * XN * math.exp(C.ENION[II] * TK - HKF) * C.WOP[II, id]
-                ee = math.exp(C.ENION[II] * TK - HKF)   # 原代码计算后未使用
+                ee = math.exp(C.ENION[II] * TK - HKF)   # computed but unused in the original
                 EBF = EBF + XX * CON * C.G[II] / C.G[NKE]
                 # if(id.eq.1.or.id.eq.50) write(*,*)'opacon',id,ij,ii,
                 #  popul(ii,id),sg,abf
@@ -5444,10 +5486,10 @@ def opacon(id, cross, absoc, emisc, scatc):
 
         # Additional opacities
 
-        _mode = 0   # 字面量 0 作为 MODE 实参; OPADD 修改标量哑元, 用临时变量接收
+        _mode = 0   # literal 0 as MODE argument; OPADD modifies the scalar dummy, received via a temporary variable
         _mode, id, FR, ABAD, EMAD, SCAD = opadd(_mode, id, FR, 0.0, 0.0, 0.0)
         if C.IOPHLI != 0:
-            # LYMLIN 修改标量哑元 ABLY/EMLY/SCLY, 解包接收
+            # LYMLIN modifies scalar dummies ABLY/EMLY/SCLY, unpacked on return
             id, FR, ABLY, EMLY, SCLY = lymlin(id, FR, ABLY, EMLY, SCLY)
 
         # Total opacity and emissivity
@@ -5471,7 +5513,7 @@ def opacon(id, cross, absoc, emisc, scatc):
 def sgmerg(ii, id, fr):
     """formal routine - taken from TLUSTY, but not used here
 
-    对应 synspec54.f 行 5106–5139 (FUNCTION SGMERG)
+    corresponds to synspec54.f lines 5106-5139 (FUNCTION SGMERG)
     """
     FRH = 3.28805e15
     PH2 = 2.815e29 * 2.0
@@ -5487,7 +5529,7 @@ def sgmerg(ii, id, fr):
     II0 = C.NQUANT[ii - 1] + 1
     SUM = 0.0
     SUD = 0.0
-    for I in range(II0, NLMX + 1):     # DO 10 I=II0,NLMX（NLMX 为 PARAMETER 常量）
+    for I in range(II0, NLMX + 1):     # DO 10 I=II0,NLMX (NLMX is a PARAMETER constant)
         X = float(I)
         XI = 1.0 / (X * X)
         FREDG = FRH * CH * XI
@@ -5508,7 +5550,7 @@ def gfree(t, fr):
     """Hydrogenic free-free Gaunt factor, for temperature T and
     frequency FR
 
-    对应 synspec54.f 行 5144–5164 (FUNCTION GFREE)
+    corresponds to synspec54.f lines 5144-5164 (FUNCTION GFREE)
     """
     THET = 5040.4 / t
     if THET < 4.0e-2:
@@ -5531,7 +5573,7 @@ def gfree(t, fr):
 def sffhmi_old(popi, fr, t):
     """Free-free cross section for H- (After Kurucz,1970,SAO 309, P.80)
 
-    对应 synspec54.f 行 5169–5177 (FUNCTION SFFHMI_old)
+    corresponds to synspec54.f lines 5169-5177 (FUNCTION SFFHMI_old)
     """
     SFFHMI_old = (1.3727e-25 + (4.3748e-10 - 2.5993e-7 / t) / fr) * popi / fr
     return SFFHMI_old
@@ -5541,8 +5583,8 @@ def lymlin(id, freq, ably, emly, scly):
     """OPACITY OF THE LYMAN LINES WINGS (ALPHA - DELTA)
     WITH APPROXIMATE PARTIAL REDISTRIBUTION
 
-    对应 synspec54.f 行 5183–5250 (SUBROUTINE LYMLIN)
-    修改标量哑元 ABLY/EMLY/SCLY, 返回全部标量哑元 (id, freq, ably, emly, scly)
+    corresponds to synspec54.f lines 5183-5250 (SUBROUTINE LYMLIN)
+    modifies scalar dummies ABLY/EMLY/SCLY; returns all scalar dummies (id, freq, ably, emly, scly)
     """
     global _save_lymlin_icomp, _save_lymlin_ifstrk, _save_lymlin_ifnat
     global _save_lymlin_ifres, _save_lymlin_ifprd, _save_lymlin_ifsti
@@ -5554,7 +5596,7 @@ def lymlin(id, freq, ably, emly, scly):
     #  *     SS   / 9.478E-3,     1.600E-2,     1.441E-2,     1.547E-2  /,
     #  *     GS   / 7.237E-8,     5.432E-6,     5.821E-5,     4.027E-4  /,
     #  *     GA   / 1.000,        1.791,        2.362,        2.801 /
-    # 以下 DATA 数组不再修改, 直接局部赋值; SN/SR 会被修改, 见模块级 _save_lymlin_sn/sr
+    # the following DATA arrays are never modified, assigned locally; SN/SR are modified, see module-level _save_lymlin_sn/sr
     FRLY = [0.0, 2.4660375e15, 2.9227111e15, 3.0825469e15, 3.156528e15]
     BNLY = [0.0, 5.527e-2, 4.090e-2, 2.699e-2, 1.855e-2]
     SS = [0.0, 9.478e-3, 1.600e-2, 1.441e-2, 1.547e-2]
@@ -5575,7 +5617,7 @@ def lymlin(id, freq, ably, emly, scly):
             _save_lymlin_ifprd = int(float(_parts[3]))
             _save_lymlin_ifsti = int(float(_parts[4]))
         except Exception:
-            # 10 CONTINUE: err=/end= 分支, 取默认值
+            # 10 CONTINUE: err=/end= branch, use defaults
             _save_lymlin_ifstrk = 0
             _save_lymlin_ifnat = 1
             _save_lymlin_ifres = 1
@@ -5630,10 +5672,10 @@ def lymlin(id, freq, ably, emly, scly):
 def feautr(freq, id):
     """LYMAN-ALPHA STARK BROADENING AFTER N.FEAUTRIER
 
-    对应 synspec54.f 行 5254–5293 (FUNCTION FEAUTR)
+    corresponds to synspec54.f lines 5254-5293 (FUNCTION FEAUTR)
     """
     # DIMENSION DL(20),F05(20),F10(20),F20(20),F40(20),X(4)
-    # DATA 数组不修改, 直接赋值(1 基索引, 下标 0 不用)
+    # DATA arrays not modified, assigned directly (1-based indexing, index 0 unused)
     F05 = [0.0, 0.0537, 0.0964, 0.1330, 0.3105, 0.4585, 0.6772, 0.8229,
            0.8556, 0.9250, 0.9618, 0.9733, 1.1076, 1.0644, 1.0525,
            0.8841, 0.8282, 0.7541, 0.7091, 0.7164, 0.7672]
@@ -5654,10 +5696,10 @@ def feautr(freq, id):
         if DLAM <= DL[I]:
             break                   # IF(DLAM.LE.DL(I)) GO TO 20
     else:
-        I = 20                      # 循环正常结束后显式 I=20
+        I = 20                      # explicit I=20 after normal loop exit
     # 20
     J = I - 1
-    C_l = DL[J] - DL[I]             # 源码局部变量名 C, 与 commons 别名冲突, 加后缀 _l
+    C_l = DL[J] - DL[I]             # local variable named C in the source, conflicts with the commons alias, suffixed _l
     A = (DLAM - DL[I]) / C_l
     B = (DL[J] - DLAM) / C_l
     X[1] = F05[J] * A + F05[I] * B
@@ -5673,9 +5715,9 @@ def feautr(freq, id):
 def hylset():
     """Initialization procedure for treating the hydrogen line opacity
 
-    对应 synspec54.f 行 5297–5360 (SUBROUTINE HYLSET)
+    corresponds to synspec54.f lines 5297-5360 (SUBROUTINE HYLSET)
     """
-    # DIMENSION ALB(15), DATA 数组不修改(1 基索引, 下标 0 不用)
+    # DIMENSION ALB(15), DATA array not modified (1-based indexing, index 0 unused)
     ALB = [0.0, 656.28, 486.13, 434.05, 410.17, 397.01,
            388.91, 383.54, 379.79, 377.06, 375.02,
            373.44, 372.19, 371.20, 370.39, 369.72]
@@ -5702,7 +5744,7 @@ def hylset():
     C.M20 = 40
     if AL1 < 364.6:
         C.ILOWH = 1
-        FRION = 3.28805e15      # FRION 不在 commons.py, 按局部变量处理
+        FRION = 3.28805e15      # FRION not in commons.py, treated as a local variable
         C.M10 = int(math.sqrt(3.28805e15 / abs(FRION - C.FREQ[2])))
         if FRION > C.FREQ[1]:
             C.M20 = int(math.sqrt(3.28805e15 / (FRION - C.FREQ[1])))
@@ -5747,7 +5789,7 @@ def hylsew(ij):
     """Initialization procedure for treating the hydrogen line opacity
     (variant for winds, per frequency IJ)
 
-    对应 synspec54.f 行 5364–5421 (SUBROUTINE HYLSEW)
+    corresponds to synspec54.f lines 5364-5421 (SUBROUTINE HYLSEW)
     """
     # IHYL=-1  -  hydrogen lines are excluded a priori
 
@@ -5778,7 +5820,7 @@ def hylsew(ij):
     C.M20W[ij] = 40
     if AL1 < 364.6:
         C.ILOWHW[ij] = 1
-        FRION = 3.28805e15      # FRION 不在 commons.py, 按局部变量处理
+        FRION = 3.28805e15      # FRION not in commons.py, treated as a local variable
     elif AL1 < 820.0:
         C.ILOWHW[ij] = 2
         FRION = 8.2225e14
@@ -5799,19 +5841,19 @@ def hylsew(ij):
         FRION = 6.7120228e13
     if FRION > FR:
         C.M10W[ij] = int(math.sqrt(3.289017e15 / abs(FRION - FR)))
-    # 以下输出语句在原代码中被注释掉:
+    # the following output statements are commented out in the original:
     # c     WRITE(6,601) ILOWH,M20+1
     # c 601 FORMAT(1H0/ ' *** HYDROGEN LINES CONTRIBUTE'/
     # c    * '     THE NEAREST LINE ON THE SHORT-WAVELENGTH SIDE IS',
     # c    * I3,'  TO ',I3/)
     return
 # ============================================================================
-# chunk06: synspec54.f 行 5425–6876 的逐行直译
-# 包含: HYDLIN, HYDLIW, HE2SET, HE2SEW, HE2LIN, HE2LIW,
+# chunk06: line-by-line translation of synspec54.f lines 5425-6876
+# contains: HYDLIN, HYDLIW, HE2SET, HE2SEW, HE2LIN, HE2LIW,
 #       STARK0, STARKA, STARKIR, DIVSTR
 # ============================================================================
 
-# DATA 初始化且之后被修改的局部量（Fortran 隐含 SAVE）→ 提升为模块级
+# locals initialized by DATA and modified afterwards (implicit SAVE in Fortran) → promoted to module level
 _save_hydlin_init = 0            # HYDLIN: DATA INIT /0/
 _save_hydlin_frh = 3.289017e15   # HYDLIN: DATA FRH /3.289017E15/
 _save_hydliw_init = 0            # HYDLIW: DATA INIT /0/
@@ -5821,7 +5863,7 @@ _save_hydliw_frh = 3.289017e15   # HYDLIW: DATA FRH /3.289017E15/
 def hydlin(id, i0, i1, absoh, emish):
     """
 C     opacity and emissivity of hydrogen lines
-    对应 synspec54.f 行 5425–5797
+    corresponds to synspec54.f lines 5425-5797
     """
     global _save_hydlin_init, _save_hydlin_frh
     # PARAMETER (FRH1=3.28805E15,FRH2=FRH1/4.,UN=1.,SIXTH=1./6.)
@@ -5847,16 +5889,16 @@ C     opacity and emissivity of hydrogen lines
     # common/hhebrd/sthe,nunhhe
     # common/gompar/hglim,ihgom
     # DIMENSION PJ(40),PRF0(54),OSCH(4,22),ABSO(MFREQ),EMIS(MFREQ),ABSOH(MFREQ),EMISH(MFREQ)
-    # TODO(port): Fortran 中 PJ 维数为 40，但下面 DO IL=1,50 会越界写到 50；
-    #             这里按 50 分配以保持可运行
+    # TODO(port): in Fortran PJ is dimensioned 40, but the DO IL=1,50 loop below writes out of bounds up to 50;
+    #             allocated with 50 here to keep it runnable
     pj = np.zeros(51)
     prf0 = np.zeros(55)
     osch = np.zeros((5, 23))
     abso = np.zeros(MFREQ + 1)
     emis = np.zeros(MFREQ + 1)
     # dimension wlir(15),irlow(15),irupp(15)
-    # DATA FRH    /3.289017E15/  → 模块级 _save_hydlin_frh
-    # data wlir/.../（之后不再修改，直接函数顶部赋值）
+    # DATA FRH    /3.289017E15/  → module-level _save_hydlin_frh
+    # data wlir/.../ (never modified afterwards, assigned at function top)
     wlir = np.zeros(16)
     wlir[1:] = [123680.0, 75005.0, 59066.0, 51273.0, 190570.0, 113060.0,
                 87577.0, 75061.0, 277960.0, 162050.0, 123840.0, 105010.0,
@@ -5870,7 +5912,7 @@ C     opacity and emissivity of hydrogen lines
     # data nlinir/15/
     nlinir = 15
     #
-    # DATA INIT /0/  → 模块级 _save_hydlin_init
+    # DATA INIT /0/  → module-level _save_hydlin_init
     #
     for ij in range(i0, i1 + 1):
         absoh[ij] = 0.0
@@ -5883,7 +5925,7 @@ C     opacity and emissivity of hydrogen lines
     if _save_hydlin_init == 0:
         for i in range(1, 5):
             for j in range(i + 1, 23):
-                # STARK0 修改标量哑元 → 按约定解包接收全部标量哑元
+                # STARK0 modifies scalar dummies → unpack all scalar dummies per convention
                 i, j, izz, xk, wl0, fij, fij0 = stark0(i, j, izz, 0.0, 0.0, 0.0, 0.0)
                 C.WLINE[i, j] = wl0
                 osch[i, j] = fij + fij0
@@ -5952,7 +5994,7 @@ C     opacity and emissivity of hydrogen lines
     # loop over spectral series
     # ========================
     #
-    _goto200 = False  # GO TO 200 标志：跳出谱系循环并跳过远红外块
+    _goto200 = False  # GO TO 200 flag: exit the series loop and skip the far-infrared block
     for i in range(iserl, iseru + 1):
         #
         # skip the following calculations if one uses the Gomez tables
@@ -6022,7 +6064,7 @@ C     opacity and emissivity of hydrogen lines
             lalhhe = i == 1 and j == 2 and C.nunhhe > 0
             if lquasi:
                 for ij in range(i0, i1 + 1):
-                    # ALLARD 仅给标量哑元 PROF(SG) 赋值；按约定解包全部标量哑元
+                    # ALLARD only assigns scalar dummy PROF(SG); unpack all scalar dummies per convention
                     _xl, popi, anp, sg, i, j = allard(C.WLAM[ij], popi, anp, 0.0, i, j)
                     abso[ij] = abso[ij] + sg * abtra
                     emis[ij] = emis[ij] + sg * emtra
@@ -6032,7 +6074,7 @@ C     opacity and emissivity of hydrogen lines
             if lalhhe and ahe > 0.0:
                 rel = 1.0 / 6.2831855
                 for ij in range(i0, i1 + 1):
-                    # LYAHHE 仅给标量哑元 PROF(SG0) 赋值；按约定解包全部标量哑元
+                    # LYAHHE only assigns scalar dummy PROF(SG0); unpack all scalar dummies per convention
                     _xl, ahe, sg0 = lyahhe(C.WLAM[ij], ahe, 0.0)
                     sg = sg0 * rel
                     abso[ij] = abso[ij] + sg * abtra
@@ -6064,7 +6106,7 @@ C     opacity and emissivity of hydrogen lines
                             iw0 = iwl
                             if al <= C.WLHYD[iline, iwl + 1]:
                                 break  # GO TO 40
-                        # 标号 40
+                        # label 40
                         iw1 = iw0 + 1
                         prff = (prf0[iw0] * (C.WLHYD[iline, iw1] - al) + prf0[iw1] *
                                 (al - C.WLHYD[iline, iw0])) / \
@@ -6086,13 +6128,13 @@ C     opacity and emissivity of hydrogen lines
                         al = (C.FREQ[ij] - fr0l) / f00
                         if abs(al) < 1.0e-4:
                             al = 1.0e-4
-                        all = math.log10(abs(al))  # 原变量名 ALL
+                        all = math.log10(abs(al))  # original variable name ALL
                         # do 51 iwl=1,nwl-1 ... go to 52
                         for iwl in range(1, nwl):
                             iw0 = iwl
                             if all <= C.ALXEN[ixn, iwl + 1]:
                                 break  # GO TO 52
-                        # 标号 52
+                        # label 52
                         iw1 = iw0 + 1
                         if al > 0.0:
                             prff = (C.PRFB[ixn, id, iw0] * (C.ALXEN[ixn, iw1] - all) +
@@ -6109,7 +6151,7 @@ C     opacity and emissivity of hydrogen lines
             # lines without special Stark broadening tables
             #
             else:
-                # STARK0 修改标量哑元 → 按约定解包接收全部标量哑元
+                # STARK0 modifies scalar dummies → unpack all scalar dummies per convention
                 i, j, izz, xkij, wl0, fij, fij0 = stark0(i, j, izz, 0.0, 0.0, 0.0, 0.0)
                 if (wl0 <= C.WLAM[i1] and 1.25 * wl0 > C.WLAM[i0]) or \
                    (wl0 >= C.WLAM[i0] and 0.75 * wl0 < C.WLAM[i1]):
@@ -6117,13 +6159,13 @@ C     opacity and emissivity of hydrogen lines
                     fxk1 = un / fxk
                     dop = dop0 / wl0
                     dbeta = wl0 * wl0 * cinv * fxk1
-                    C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                    C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                     betad = dop * dbeta
-                    C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                    C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                     fid = cid * fij * dbeta
                     # FID0=CID1*FIJ0/DOP
-                    # TODO(port): DIVSTR 在 BETAD<BL 时提前返回且不赋 DIV
-                    # （Fortran 中此时 DIV 为未定义值，但该分支 STARKA 不会用到 DIV）
+                    # TODO(port): DIVSTR returns early without assigning DIV when BETAD<BL
+                    # (in Fortran DIV is then undefined, but that STARKA branch never uses DIV)
                     ad, div = divstr(0.0, 0.0)
                     fac = two
                     if lquasi:
@@ -6139,8 +6181,8 @@ C     opacity and emissivity of hydrogen lines
                             sg = starkir(ii, jj, t, ane, beta) * fid
                         abso[ij] = abso[ij] + sg * abtra
                         emis[ij] = emis[ij] + sg * emtra
-        # END DO (J 循环)
-    # END DO (I 循环)
+        # END DO (J loop)
+    # END DO (I loop)
     #
     # far infrared hydrogen lines
     #
@@ -6158,9 +6200,9 @@ C     opacity and emissivity of hydrogen lines
                     fxk1 = un / fxk
                     dop = dop0 / wl0
                     dbeta = wl0 * wl0 * cinv * fxk1
-                    C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                    C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                     betad = dop * dbeta
-                    C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                    C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                     fid = cid * fij * dbeta
                     ad, div = divstr(0.0, 0.0)
                     fac = two
@@ -6170,7 +6212,7 @@ C     opacity and emissivity of hydrogen lines
                         sg = starkir(ii, jj, t, ane, beta) * fid
                         abso[ij] = abso[ij] + sg * abtra
                         emis[ij] = emis[ij] + sg * emtra
-    # 标号 200
+    # label 200
     #
     if C.WLAM[i1] > 5.0e5:
         for ij in range(i0, i1 + 1):
@@ -6191,9 +6233,9 @@ C     opacity and emissivity of hydrogen lines
                     fxk1 = un / fxk
                     dop = dop0 / wl0
                     dbeta = wl0 * wl0 * cinv * fxk1
-                    C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                    C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                     betad = dop * dbeta
-                    C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                    C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                     fid = cid * fij * dbeta
                     ad, div = divstr(0.0, 0.0)
                     fac = two
@@ -6219,7 +6261,7 @@ C     opacity and emissivity of hydrogen lines
 def hydliw(id, absoh, emish):
     """
 C     opacity and emissivity of hydrogen lines
-    对应 synspec54.f 行 5798–6060
+    corresponds to synspec54.f lines 5798-6060
     """
     global _save_hydliw_init, _save_hydliw_frh
     # PARAMETER (FRH1=3.28805E15,FRH2=FRH1/4.,UN=1.,SIXTH=1./6.)
@@ -6249,8 +6291,8 @@ C     opacity and emissivity of hydrogen lines
     osch = np.zeros((5, 23))
     abso = np.zeros(MFREQ + 1)
     emis = np.zeros(MFREQ + 1)
-    # DATA FRH    /3.289017E15/  → 模块级 _save_hydliw_frh
-    # DATA INIT /0/              → 模块级 _save_hydliw_init
+    # DATA FRH    /3.289017E15/  → module-level _save_hydliw_frh
+    # DATA INIT /0/              → module-level _save_hydliw_init
     #
     if C.IATH <= 0:
         return
@@ -6358,7 +6400,7 @@ C     opacity and emissivity of hydrogen lines
             m2 = m1 + 1
             if m1 < i + 1:
                 m1 = i + 1
-            # IF(grav.lt.3..and.M1.LE.16.AND.I.EQ.7) GO TO 10（及以下一串）的逆分支
+            # IF(grav.lt.3..and.M1.LE.16.AND.I.EQ.7) GO TO 10 (and the following chain) - inverse branch
             _goto10 = C.GRAV < 3.0 and (
                 (m1 <= 16 and i == 7) or (m1 <= 14 and i == 6) or
                 (m1 <= 12 and i == 5) or (m1 <= 10 and i == 4) or
@@ -6369,7 +6411,7 @@ C     opacity and emissivity of hydrogen lines
                 m2 = C.M20W[ij] + 3
                 if m1 < i + 1:
                     m1 = i + 1
-            # 标号 10
+            # label 10
             if C.GRAV > 3.0:
                 m2 = m2 + 5
                 m1 = m1 - 3
@@ -6425,14 +6467,14 @@ C     opacity and emissivity of hydrogen lines
                     fxk1 = un / fxk
                     dop = dop0 / wl0
                     dbeta = wl0 * wl0 * cinv * fxk1
-                    C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                    C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                     betad = dop * dbeta
-                    C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                    C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                     fid = cid * fij * dbeta
                     ad, div = divstr(0.0, 0.0)
                     fr = C.FREQ[ij]
                     beta = abs(C.WLAM[ij] - wl0) * fxk1
-                    # ALLARD 仅给标量哑元 PROF(SG) 赋值；按约定解包全部标量哑元
+                    # ALLARD only assigns scalar dummy PROF(SG); unpack all scalar dummies per convention
                     _xl, popi, anp, sg, i, j = allard(C.WLAM[ij], popi, anp, 0.0, i, j)
                     sg = sg + starka(beta, ad, div, un) * fid
                     abso[ij] = abso[ij] + sg * abtra
@@ -6457,7 +6499,7 @@ C     opacity and emissivity of hydrogen lines
                         iw0 = iwl
                         if al <= C.WLHYD[iline, iwl + 1]:
                             break  # GO TO 40
-                    # 标号 40
+                    # label 40
                     iw1 = iw0 + 1
                     prff = (prf0[iw0] * (C.WLHYD[iline, iw1] - al) + prf0[iw1] *
                             (al - C.WLHYD[iline, iw0])) / \
@@ -6476,9 +6518,9 @@ C     opacity and emissivity of hydrogen lines
                     fxk1 = un / fxk
                     dop = dop0 / wl0
                     dbeta = wl0 * wl0 * cinv * fxk1
-                    C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                    C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                     betad = dop * dbeta
-                    C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                    C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                     fid = cid * fij * dbeta
                     ad, div = divstr(0.0, 0.0)
                     fr = C.FREQ[ij]
@@ -6511,10 +6553,10 @@ C     opacity and emissivity of hydrogen lines
 def he2set():
     """
 C     Initialization procedure for treating the He II line opacity
-    对应 synspec54.f 行 6061–6157
+    corresponds to synspec54.f lines 6061-6157
     """
     # dimension frhe(12)
-    # DATA FRHE /.../（之后不再修改）
+    # DATA FRHE /.../ (never modified afterwards)
     frhe = np.zeros(13)
     frhe[1:] = [1.3158153e16, 3.2895381e15, 1.4624854e15,
                 8.2261878e14, 5.2647201e14, 3.6560459e14,
@@ -6636,10 +6678,10 @@ C     Initialization procedure for treating the He II line opacity
 def he2sew(ij):
     """
 C     Initialization procedure for treating the He II line opacity
-    对应 synspec54.f 行 6158–6246
+    corresponds to synspec54.f lines 6158-6246
     """
     # dimension frhe(12)
-    # DATA FRHE /.../（之后不再修改）
+    # DATA FRHE /.../ (never modified afterwards)
     frhe = np.zeros(13)
     frhe[1:] = [1.3158153e16, 3.2895381e15, 1.4624854e15,
                 8.2261878e14, 5.2647201e14, 3.6560459e14,
@@ -6750,7 +6792,7 @@ def he2lin(id, i0, i1, absoh, emish):
     """
 C     opacity and emissivity of He II lines  (these which are not considered
 C     explicitly)
-    对应 synspec54.f 行 6247–6450
+    corresponds to synspec54.f lines 6247-6450
     """
     # PARAMETER (UN=1.,SIXTH=1./6.)
     un = 1.0
@@ -6771,13 +6813,13 @@ C     explicitly)
     cid1 = 0.01497
     # DIMENSION PJ(80),FRHE(12),OSCHE2(19),PRF0(36),ABSO(MFREQ),EMIS(MFREQ),ABSOH(MFREQ),EMISH(MFREQ)
     pj = np.zeros(81)
-    # DATA FRHE /.../（之后不再修改）
+    # DATA FRHE /.../ (never modified afterwards)
     frhe = np.zeros(13)
     frhe[1:] = [1.3158153e16, 3.2895381e15, 1.4624854e15,
                 8.2261878e14, 5.2647201e14, 3.6560459e14,
                 2.6860713e14, 2.0565220e14, 1.6249055e14,
                 1.3161730e14, 1.0877460e14, 9.1400851e13]
-    # DATA OSCHE2/.../（之后不再修改）
+    # DATA OSCHE2/.../ (never modified afterwards)
     osche2 = np.zeros(20)
     osche2[1:] = [6.407e-1, 1.506e-1, 5.584e-2, 2.768e-2,
                   1.604e-2, 1.023e-2, 6.980e-3,
@@ -6863,14 +6905,14 @@ C     explicitly)
         m2 = m1 + 1
         if m1 < i + 1:
             m1 = i + 1
-        # IF(grav.lt.6..and.M1.LE.6.AND.I.EQ.2) GO TO 10（及下一条）的逆分支
+        # IF(grav.lt.6..and.M1.LE.6.AND.I.EQ.2) GO TO 10 (and the next statement) - inverse branch
         _goto10 = C.GRAV < 6.0 and ((m1 <= 6 and i == 2) or (m1 <= 4 and i == 1))
         if not _goto10:
             m1 = m1 - 1
             m2 = C.MHE20 + 3
             if m2 > 60:
                 m2 = 60
-        # 标号 10
+        # label 10
         if C.GRAV > 6.0:
             m2 = m2 + 5
             m1 = m1 - 3
@@ -6925,7 +6967,7 @@ C     explicitly)
                         iw0 = iwl
                         if al <= C.WLHE2[iline, iwl + 1]:
                             break  # GO TO 40
-                    # 标号 40
+                    # label 40
                     iw1 = iw0 + 1
                     prff = (prf0[iw0] * (C.WLHE2[iline, iw1] - al) + prf0[iw1] *
                             (al - C.WLHE2[iline, iw0])) / \
@@ -6940,12 +6982,12 @@ C     explicitly)
                 fxk1 = un / fxk
                 dop = dop0 / wl0
                 dbeta = wl0 * wl0 * cinv * fxk1
-                C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                 betad = dop * dbeta
-                C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                 fid = cid * fij * dbeta
                 #           FID0=CID1*FIJ0/DOP
-                ad, div = divhe2(0.0, 0.0)  # DIVHE2 修改标量哑元 A、DIV → 解包接收
+                ad, div = divhe2(0.0, 0.0)  # DIVHE2 modifies scalar dummies A, DIV → unpacked on return
                 for ij in range(i0, i1 + 1):
                     beta = abs(C.WLAM[ij] - wl0) * fxk1
                     sg = starka(beta, ad, div, un) * fid
@@ -6976,7 +7018,7 @@ def he2liw(id, absoh, emish):
     """
 C     opacity and emissivity of He II lines  (these which are not considered
 C     explicitly)
-    对应 synspec54.f 行 6451–6649
+    corresponds to synspec54.f lines 6451-6649
     """
     # PARAMETER (UN=1.,SIXTH=1./6.)
     un = 1.0
@@ -6997,13 +7039,13 @@ C     explicitly)
     cid1 = 0.01497
     # DIMENSION PJ(80),FRHE(12),OSCHE2(19),PRF0(36),ABSO(MFREQ),EMIS(MFREQ),ABSOH(MFREQ),EMISH(MFREQ)
     pj = np.zeros(81)
-    # DATA FRHE /.../（之后不再修改）
+    # DATA FRHE /.../ (never modified afterwards)
     frhe = np.zeros(13)
     frhe[1:] = [1.3158153e16, 3.2895381e15, 1.4624854e15,
                 8.2261878e14, 5.2647201e14, 3.6560459e14,
                 2.6860713e14, 2.0565220e14, 1.6249055e14,
                 1.3161730e14, 1.0877460e14, 9.1400851e13]
-    # DATA OSCHE2/.../（之后不再修改）
+    # DATA OSCHE2/.../ (not modified afterwards)
     osche2 = np.zeros(20)
     osche2[1:] = [6.407e-1, 1.506e-1, 5.584e-2, 2.768e-2,
                   1.604e-2, 1.023e-2, 6.980e-3,
@@ -7098,14 +7140,14 @@ C     explicitly)
             m2 = m1 + 1
             if m1 < i + 1:
                 m1 = i + 1
-            # IF(grav.lt.6..and.M1.LE.6.AND.I.EQ.2) GO TO 10（及下一条）的逆分支
+            # IF(grav.lt.6..and.M1.LE.6.AND.I.EQ.2) GO TO 10 (and the following statement) - negated branch
             _goto10 = C.GRAV < 6.0 and ((m1 <= 6 and i == 2) or (m1 <= 4 and i == 1))
             if not _goto10:
                 m1 = m1 - 1
                 m2 = C.MHE20W[ij] + 3
                 if m2 > 60:
                     m2 = 60
-            # 标号 10
+            # label 10
             if C.GRAV > 6.0:
                 m2 = m2 + 5
                 m1 = m1 - 3
@@ -7156,7 +7198,7 @@ C     explicitly)
                         iw0 = iwl
                         if al <= C.WLHE2[iline, iwl + 1]:
                             break  # GO TO 40
-                    # 标号 40
+                    # label 40
                     iw1 = iw0 + 1
                     prff = (prf0[iw0] * (C.WLHE2[iline, iw1] - al) + prf0[iw1] *
                             (al - C.WLHE2[iline, iw0])) / \
@@ -7170,11 +7212,11 @@ C     explicitly)
                     fxk1 = un / fxk
                     dop = dop0 / wl0
                     dbeta = wl0 * wl0 * cinv * fxk1
-                    C.DBETA = dbeta   # DBETA 属 COMMON /AUXHYD/（STARKIR 经 COMMON 读取）
+                    C.DBETA = dbeta   # DBETA belongs to COMMON /AUXHYD/ (STARKIR reads it via COMMON)
                     betad = dop * dbeta
-                    C.BETAD = betad   # BETAD 属 COMMON /AUXHYD/（DIVSTR/STARKA 经 COMMON 读取）
+                    C.BETAD = betad   # BETAD belongs to COMMON /AUXHYD/ (DIVSTR/STARKA read it via COMMON)
                     fid = cid * fij * dbeta
-                    ad, div = divhe2(0.0, 0.0)  # DIVHE2 修改标量哑元 A、DIV → 解包接收
+                    ad, div = divhe2(0.0, 0.0)  # DIVHE2 modifies scalar dummies A, DIV -> receive them unpacked
                     beta = abs(C.WLAM[ij] - wl0) * fxk1
                     sg = starka(beta, ad, div, un) * fid
                     abso[ij] = abso[ij] + sg * abtra
@@ -7210,9 +7252,9 @@ C                     exact up to j=6, asymptotic for higher j
 C             WL0   - wavelength of the line i-j
 C             FIJ   - Stark f-value for the line i-j
 C             FIJ0  - f-value for the undisplaced component of the line
-    对应 synspec54.f 行 6650–6742
+    Corresponds to synspec54.f lines 6650-6742
 
-    修改标量哑元 XKIJ/WL0/FIJ/FIJ0 → 按约定返回全部标量哑元
+    Modifies scalar dummies XKIJ/WL0/FIJ/FIJ0 -> by convention returns all scalar dummies
     """
     # PARAMETER (RYD1=911.763811,RYD2=911.495745,CXKIJ=5.5E-5)
     ryd1 = 911.763811
@@ -7227,7 +7269,7 @@ C             FIJ0  - f-value for the undisplaced component of the line
     twen = 20.0
     hund = 100.0
     # DIMENSION FSTARK(10,4),XKIJT(5,4),FOSC0(10,4),FADD(5,5)
-    # DATA XKIJT/.../（Fortran 按列填充；之后不再修改）
+    # DATA XKIJT/.../ (Fortran fills column-wise; not modified afterwards)
     xkijt = np.zeros((6, 5))
     xkijt[1:6, 1] = [3.56e-4, 5.23e-4, 1.09e-3, 1.49e-3, 2.25e-3]
     xkijt[1:6, 2] = [0.0125, 0.0177, 0.028, 0.0348, 0.0493]
@@ -7324,9 +7366,9 @@ C            FAC   - factor by which the Holtsmark profile is to be
 C                    multiplied to get total Stark Profile
 C                    FAC should be taken to 2 for hydrogen, (and =1
 C                    for He II)
-    对应 synspec54.f 行 6743–6800
+    Corresponds to synspec54.f lines 6743-6800
 
-    注：BETAD 不是哑元，而是 COMMON 变量（C.BETAD）。
+    Note: BETAD is not a dummy argument but a COMMON variable (C.BETAD).
     """
     # PARAMETER (F0=-0.5758228,F1=0.4796232,F2=0.07209481/2.,AL=1.26)
     f0 = -0.5758228
@@ -7368,8 +7410,8 @@ C                    for He II)
 
 def starkir(ii, jj, t, ane, beta):
     """
-    （无原 Fortran 头注释）
-    对应 synspec54.f 行 6801–6839
+    (No original Fortran header comment)
+    Corresponds to synspec54.f lines 6801-6839
     """
     # PARAMETER (PI=3.14159265,PI2=2.*PI,OS0=0.026564,RYD=3.28805E15,
     #            Y2CON=PI*PI*0.5/OS0/CL)
@@ -7379,7 +7421,7 @@ def starkir(ii, jj, t, ane, beta):
     ryd = 3.28805e15
     y2con = pi * pi * 0.5 / os0 / CL
     #
-    del_l = beta / C.DBETA  # 原变量名 DEL；避免与内建 del 混淆加 _l
+    del_l = beta / C.DBETA  # original variable name DEL; _l appended to avoid clashing with built-in del
     hkt = HK / t
     xii = ii
     xjj = jj
@@ -7389,14 +7431,14 @@ def starkir(ii, jj, t, ane, beta):
     y2 = y2con * del_l ** 2 / ane
     qstat = 1.5 + 0.5 * (y1 ** 2 - 1.384) / (y1 ** 2 + 1.384)
     qimpa = 0.0
-    # IF(Y1.GT.8..OR.Y1.GE.Y2) GO TO 10 的逆分支
+    # IF(Y1.GT.8..OR.Y1.GE.Y2) GO TO 10 - negated branch
     if not (y1 > 8.0 or y1 >= y2):
         exy2 = 0.0
         if y2 <= 8.0:
             exy2 = expint(y2)
         qimpa = 1.438 * math.sqrt(y1 * (1.0 - xx)) * (0.4 * math.exp(-y1) + expint(y1) - 0.5 * exy2)
-    # 标号 10
-    # TODO(port): QIMPT 在 Fortran 中从未赋值（隐式 REAL*8 未定义局部量），此处按 0.0 处理
+    # label 10
+    # TODO(port): QIMPT is never assigned in Fortran (implicit REAL*8 undefined local); treated as 0.0 here
     qimpt = 0.0
     if beta > 20.0:
         # GO TO 20
@@ -7407,7 +7449,7 @@ def starkir(ii, jj, t, ane, beta):
     else:
         prof = 8.0 / (80.0 + beta ** 3)
         ratio = qstat + qimpa
-    # 标号 30
+    # label 30
     starkir_v = prof * ratio
     return starkir_v
 
@@ -7425,10 +7467,10 @@ C                     and asymptotic Stark wing, expressed in units
 C                     of betad.
 C                     DIV = solution of equation
 C                     exp(-(beta/betad)**2)/betad/sqrt(pi)=3*beta**-5/2
-    对应 synspec54.f 行 6840–6876
+    Corresponds to synspec54.f lines 6840-6876
 
-    修改标量哑元 A、DIV → 按约定返回全部标量哑元
-    注：BETAD 不是哑元，而是 COMMON 变量（C.BETAD）。
+    Modifies scalar dummies A, DIV -> by convention returns all scalar dummies
+    Note: BETAD is not a dummy argument but a COMMON variable (C.BETAD).
     """
     # PARAMETER (UN=1.,TWO=2.,UNQ=1.25,UNH=1.5,TWH=2.5,FO=4.,FI=5.)
     un = 1.0
@@ -7456,17 +7498,17 @@ C                     exp(-(beta/betad)**2)/betad/sqrt(pi)=3*beta**-5/2
     for i in range(1, 6):
         xn = x * (un - (x * x - twh * math.log(x) - a) / (two * x * x - twh))
         if abs(xn - x) <= dx:
-            break  # GO TO 20（注意：跳出前不执行 X=XN，DIV 取旧 X）
+            break  # GO TO 20 (note: X=XN is not executed before breaking; DIV takes the old X)
         x = xn
-    # 标号 20
+    # label 20
     div = x
     return a, div
 # -*- coding: utf-8 -*-
-# chunk07: synspec54.f 第 6877–8073 行的逐行直译
-# 包含: HYDINI, HYDTAB, INTHYD, YINT, HE1INI, WTOT, EXTPRF, PHE1,
+# chunk07: line-by-line literal translation of synspec54.f lines 6877-8073
+# Contains: HYDINI, HYDTAB, INTHYD, YINT, HE1INI, WTOT, EXTPRF, PHE1,
 #       HE2INI, INTHE2, DIVHE2, PHE2, ISPEC, HESET
 
-# DATA INIT /0/，之后被修改为 1（Fortran 隐含 SAVE）→ 提升为模块级变量
+# DATA INIT /0/, later modified to 1 (Fortran implicit SAVE) -> promoted to a module-level variable
 _save_hydini_init = 0
 
 
@@ -7474,33 +7516,33 @@ def hydini():
     """Initializes necessary arrays for evaluating hydrogen line profiles
     from the Lemke, Tremblay-Bergeron, or Schoening-Butler tables
 
-    对应 synspec54.f 行 6877–7067
+    Corresponds to synspec54.f lines 6877-7067
     """
     global _save_hydini_init
     # DIMENSION IILW(100),IIUP(100)
     iilw = np.zeros(101, dtype=np.int64)
     iiup = np.zeros(101, dtype=np.int64)
     # CHARACTER*1 CHAR
-    # DATA INIT /0/  → 模块级 _save_hydini_init
-    iline = 0  # TODO(port): Lemke 分支首次执行时 Fortran 中 ILINE 未初始化
-               # （依赖静态存储残值，实际为 0）；这里显式初始化为 0
-    ilne = 0   # 同上，NLIHYD=ILNE 依赖其残值
+    # DATA INIT /0/  -> module-level _save_hydini_init
+    iline = 0  # TODO(port): on first entry to the Lemke branch, Fortran ILINE is uninitialized
+               # (relies on static storage residue, actually 0); explicitly initialized to 0 here
+    ilne = 0   # same as above; NLIHYD=ILNE relies on its residue
 
     if _save_hydini_init == 0:
         for i in range(1, 5):
             for j in range(i + 1, 23):
-                # TODO(port): IZZ/XK/WL0/FIJ/FIJ0 在调用前未初始化
-                # （Fortran 中为未定义值，实际静态存储为 0）
+                # TODO(port): IZZ/XK/WL0/FIJ/FIJ0 uninitialized before the call
+                # (undefined values in Fortran; static storage is actually 0)
                 izz = 0
                 wl0 = 0.0
                 fij = 0.0
                 fij0 = 0.0
-                # STARK0 给标量哑元 XKIJ,WL0,FIJ,FIJ0 赋值 → 全部解包接收
-                # （XK 即 COMMON /AUXHYD/ 的 C.XK）
+                # STARK0 assigns scalar dummies XKIJ,WL0,FIJ,FIJ0 -> receive all unpacked
+                # (XK is C.XK of COMMON /AUXHYD/)
                 i, j, izz, C.XK, wl0, fij, fij0 = \
                     stark0(i, j, izz, C.XK, wl0, fij, fij0)
                 C.WLINE[i, j] = wl0
-                # OSCH(I,J)=FIJ+FIJ0  （原代码中已注释掉）
+                # OSCH(I,J)=FIJ+FIJ0  (commented out in the original code)
         _save_hydini_init = 1
     for i in range(1, 5):
         for j in range(1, 23):
@@ -7533,9 +7575,9 @@ def hydini():
             wl0 = C.WLINE[i, j]
             C.ILIN0[i, j] = iline
             # READ(IHYDPR,*) CHAR,NWL,(WL(I,ILINE),I=1,NWL)
-            # 自由格式读，值可跨多条记录（按 token 累计，记录剩余部分丢弃）
+            # list-directed read; values may span multiple records (accumulated by token, remainder of record discarded)
             _tok = read_line(C.IHYDPR).split()
-            char = _tok[0].strip("'\"")  # CHARACTER*1，数据中带引号
+            char = _tok[0].strip("'\"")  # CHARACTER*1, quoted in the data
             nwl = int(_tok[1])
             while len(_tok) < 2 + nwl:
                 _tok.extend(read_line(C.IHYDPR).split())
@@ -7607,8 +7649,8 @@ def hydini():
                 # ID - depth index
                 # IWL - wavelength index
                 for iwl in range(1, nwl + 1):
-                    # INTHYD 给标量哑元 W0 赋值 → 全部解包接收
-                    prof = 0.0  # Fortran 中 PROF 未初始化；INTHYD 总会对其赋值
+                    # INTHYD assigns scalar dummy W0 -> receive all unpacked
+                    prof = 0.0  # PROF uninitialized in Fortran; INTHYD always assigns it
                     prof, tl, anel, iwl, iline = \
                         inthyd(prof, tl, anel, iwl, iline)
                     C.PRFHYD[iline, id, iwl] = prof
@@ -7659,7 +7701,7 @@ def hydini():
         for ili in range(1, nlly + 1):
             iline = iline + 1
             # READ(IHYDPR,*) I,J,ALMIN,ANEMIN,TMIN,DLA,DLE,DLT,NWL,NE,NT
-            # 自由格式，11 个值可跨多条记录
+            # list-directed; the 11 values may span multiple records
             _tok = read_line(C.IHYDPR).split()
             while len(_tok) < 11:
                 _tok.extend(read_line(C.IHYDPR).split())
@@ -7701,14 +7743,14 @@ def hydini():
                     _tok = read_line(C.IHYDPR).split()
                     while len(_tok) < 1 + nwl:
                         _tok.extend(read_line(C.IHYDPR).split())
-                    qlt = float(_tok[0])  # QLT 读出后未再使用
+                    qlt = float(_tok[0])  # QLT is not used after being read
                     for iwl in range(1, nwl + 1):
                         C.PRF[iwl, it, ine, ilne] = float(_tok[iwl])
 
             i = iilw[ilne]
             j = iiup[ilne]
             for id in range(1, C.ND + 1):
-                hydtab(i, j, id)  # HYDTAB 不修改标量哑元
+                hydtab(i, j, id)  # HYDTAB does not modify scalar dummies
     C.NLIHYD = ilne
     close_unit(C.IHYDPR)  # CLOSE(IHYDPR)
 
@@ -7719,7 +7761,7 @@ def hydtab(i, j, id):
     """interpolated hydrogen line broadening table for line I->J and
     for parameters (TEMP, ELEC) at depth ID
 
-    对应 synspec54.f 行 7074–7121
+    Corresponds to synspec54.f lines 7074-7121
     """
     iline = C.ILIN0[i, j]
     if iline == 0:
@@ -7752,8 +7794,8 @@ def hydtab(i, j, id):
     #   ID    - depth index
     #   IWL   - wavelength index
     for iwl in range(1, nwl + 1):
-        # INTHYD 给标量哑元 W0 赋值 → 全部解包接收
-        prof = 0.0  # Fortran 中 PROF 未初始化；INTHYD 总会对其赋值
+        # INTHYD assigns scalar dummy W0 -> receive all unpacked
+        prof = 0.0  # PROF uninitialized in Fortran; INTHYD always assigns it
         prof, tl, anel, iwl, iline = inthyd(prof, tl, anel, iwl, iline)
         C.PRFHYD[iline, id, iwl] = prof
 
@@ -7765,7 +7807,7 @@ def inthyd(w0, x0, z0, iwl, iline):
     hydrogen odening tables to the actual valus of
     temperature and electron density
 
-    对应 synspec54.f 行 7125–7216
+    Corresponds to synspec54.f lines 7125-7216
     """
     # PARAMETER (TWO=2.)
     two = 2.0
@@ -7792,8 +7834,8 @@ def inthyd(w0, x0, z0, iwl, iline):
     # (see STARKA); not by an extrapolation in the HYD tables which may
     # be very inaccurate
     if z0 < C.XNE[1, iline] * 0.99 or z0 > C.XNE[ne, iline] * 1.01:
-        # DIVSTR 给标量哑元 A,DIV 赋值 → 全部解包接收
-        # TODO(port): A,DIV 传入前未初始化（Fortran 未定义值，实际为 0）
+        # DIVSTR assigns scalar dummies A,DIV -> receive all unpacked
+        # TODO(port): A,DIV uninitialized before being passed (undefined in Fortran, actually 0)
         a, div = divstr(0.0, 0.0)
         w0 = starka(beta, a, div, two) * C.DBETA
         w0 = math.log10(w0)
@@ -7802,13 +7844,13 @@ def inthyd(w0, x0, z0, iwl, iline):
     # Otherwise, one interpolates (or extrapolates for higher than the
     # highes grid value of electron density) in the HYD tables
     if not _goto500:
-        ipz = ne - 1  # 循环正常结束时 IPZ 保留最后一次迭代值
+        ipz = ne - 1  # on normal loop exit, IPZ keeps the last iteration value
         for izz in range(1, ne):  # DO IZZ=1,NE-1
             ipz = izz
             if z0 <= C.XNE[izz + 1, iline]:
                 break  # GO TO 20
-        # 标号 20
-        n0z = ipz - idiv(nz, 2) + 1  # Fortran 整数除法 NZ/2
+        # label 20
+        n0z = ipz - idiv(nz, 2) + 1  # Fortran integer division NZ/2
         if n0z < 1:
             n0z = 1
         if n0z > ne - nz + 1:
@@ -7834,13 +7876,13 @@ def inthyd(w0, x0, z0, iwl, iline):
             #
             # Both interpolations (in T as well as in electron density) are
             # by default the quadratic interpolations in logarithms
-            ipx = nt - 1  # 循环正常结束时 IPX 保留最后一次迭代值
+            ipx = nt - 1  # on normal loop exit, IPX keeps the last iteration value
             for ix in range(1, nt):  # DO IX=1,NT-1
                 ipx = ix
                 if x0 <= C.XT[ix + 1, iline]:
                     break  # GO TO 40
-            # 标号 40
-            n0x = ipx - idiv(nx, 2) + 1  # Fortran 整数除法 NX/2
+            # label 40
+            n0x = ipx - idiv(nx, 2) + 1  # Fortran integer division NX/2
             if n0x < 1:
                 n0x = 1
             if n0x > nt - nx + 1:
@@ -7850,8 +7892,8 @@ def inthyd(w0, x0, z0, iwl, iline):
                 i0 = ix - n0x + 1
                 xx[i0] = C.XT[ix, iline]
                 wx[i0] = C.PRF[iwl, ix, izz, iline]
-            # TODO(port): NX=2(LEMKE) 时 WX(3) 从未赋值，Fortran 中为
-            # 未定义残值；这里为 0.0
+            # TODO(port): for NX=2 (LEMKE), WX(3) is never assigned; in Fortran it is
+            # an undefined residue; here it is 0.0
             if wx[1] < -99.0 or wx[2] < -99.0 or wx[3] < -99.0:
                 a, div = divstr(0.0, 0.0)
                 w0 = starka(beta, a, div, two) * C.DBETA
@@ -7863,7 +7905,7 @@ def inthyd(w0, x0, z0, iwl, iline):
         # 300 CONTINUE
         if not _goto500:
             w0 = yint(zz, wz, z0)
-    # 标号 500
+    # label 500
     # 500 CONTINUE
     return w0, x0, z0, iwl, iline
 
@@ -7875,7 +7917,7 @@ def yint(xl, yl, xl0):
             YL - array of f(x)
             XL0 - the point x(0) to which one interpolates
 
-    对应 synspec54.f 行 7220–7236
+    Corresponds to synspec54.f lines 7220-7236
     """
     # DIMENSION XL(3),YL(3)
     a0 = (xl[2] - xl[1]) * (xl[3] - xl[2]) * (xl[3] - xl[1])
@@ -7893,7 +7935,7 @@ def he1ini():
 
     This procedure is quite analogous to HYDINI for hydrogen lines
 
-    对应 synspec54.f 行 7242–7296
+    Corresponds to synspec54.f lines 7242-7296
     """
     # COMMON/PROHE1/PRFHE1(50,4,8,3),DLMHE1(50,8,3),XNEHE1(8),NWLAM(8,4)
     # COMMON/PRO447/PRF447(80,4,7),DLM447(80,7),XNE447(7)
@@ -7909,14 +7951,14 @@ def he1ini():
     for ie in range(1, ne + 1):
         # READ(IH,501) IL,WL0,IE1,XXNE,NWL
         #  501 FORMAT(/9X,I2,7X,F10.3,13X,I2,6X,E8.1,7X,I3/)
-        read_line(ih)            # 开头的 '/'：跳过一条记录
+        read_line(ih)            # leading '/': skip one record
         _l = read_line(ih)
         il = int(_l[9:11])       # 9X,I2
         wl0 = float(_l[18:28])   # 7X,F10.3
         ie1 = int(_l[41:43])     # 13X,I2
         xxne = float(_l[49:57])  # 6X,E8.1
         nwl = int(_l[64:67])     # 7X,I3
-        read_line(ih)            # 末尾的 '/'：跳过一条记录
+        read_line(ih)            # trailing '/': skip one record
         C.NWLAM[ie, 1] = nwl
         C.XNE447[ie] = math.log10(xxne)
         for i in range(1, nwl + 1):
@@ -7940,12 +7982,12 @@ def he1ini():
             ie1 = int(_l[41:43])
             xxne = float(_l[49:57])
             nwl = int(_l[64:67])
-            read_line(ih)            # 末尾 '/'
+            read_line(ih)            # trailing '/'
             C.NWLAM[ie, iln + 1] = nwl
             C.XNEHE1[ie] = math.log10(xxne)
             for i in range(1, nwl + 1):
                 # READ(IH,*) DLMHE1(I,IE,ILN),(PRFHE1(I,IT,IE,ILN),IT=1,NT)
-                # 自由格式，1+NT 个值
+                # list-directed, 1+NT values
                 _tok = read_line(ih).split()
                 while len(_tok) < 1 + nt:
                     _tok.extend(read_line(ih).split())
@@ -7974,10 +8016,10 @@ def wtot(t, ane, id, iline):
                                        = 4  for 4922)
     Output: WTOT - Stark width in Angstroms
 
-    对应 synspec54.f 行 7301–7340
+    Corresponds to synspec54.f lines 7301-7340
     """
     # DIMENSION ALPH0(4,4),W0(4,4),ALAM0(4)
-    # DATA（只读，未修改）→ 函数顶部赋值；Fortran DATA 按列优先填充
+    # DATA (read-only, unmodified) -> assigned at top of function; Fortran DATA fills column-major
     # DATA ALPH0 / 0.107, 0.119, 0.134, 0.154,
     # *            0.206, 0.235, 0.272, 0.317,
     # *            0.172, 0.193, 0.218, 0.249,
@@ -8017,10 +8059,10 @@ def extprf(dlam, it, iline, anel, dlast, plast):
     Smith tables
     Special formula suggested by Cooper
 
-    对应 synspec54.f 行 7346–7366
+    Corresponds to synspec54.f lines 7346-7366
     """
     # DIMENSION W0(4,4)
-    # DATA W0（只读，列优先填充）
+    # DATA W0 (read-only, column-major fill)
     w0 = np.zeros((5, 5))
     w0[1:, 1:] = np.array([
         1.460, 1.269, 1.079, 0.898,
@@ -8050,7 +8092,7 @@ def phe1(id, freq, iline):
     Output: PHE1 - profile coefficient in frequency units,
                    normalized to sqrt(pi) [not unity]
 
-    对应 synspec54.f 行 7372–7529
+    Corresponds to synspec54.f lines 7372-7529
     """
     nt = 4  # PARAMETER (NT=4)
     # COMMON/PROHE1/PRFHE1(50,NT,8,3),DLMHE1(50,8,3),XNEHE1(8),NWLAM(8,NT)
@@ -8085,7 +8127,7 @@ def phe1(id, freq, iline):
     if not (tl <= xt0[nt] + 0.1
             and ((iline == 1 and anel >= C.XNE447[1])
                  or (iline != 1 and anel >= C.XNEHE1[1]))):
-        # 标号 5: isolated line approximation for low electron densities
+        # label 5: isolated line approximation for low electron densities
         a = wtot(t, ane, id, iline) / dopl
         v = abs(dlam) / dopl
         v1 = abs(alam - 4471.682) / dopl
@@ -8094,7 +8136,7 @@ def phe1(id, freq, iline):
             phe1 = (8.0 * phe1 + voigtk(a, v1)) / 9.0
         return phe1
 
-    # 标号 10: otherwise, interpolation (or extrapolation) in tables
+    # label 10: otherwise, interpolation (or extrapolation) in tables
     nx = 3
     nz = 3
     ny = 2
@@ -8104,15 +8146,15 @@ def phe1(id, freq, iline):
         ne = 7
 
     # Interpolation in electron density
-    ipz = ne - 1  # 循环正常结束时 IPZ 保留最后一次迭代值
+    ipz = ne - 1  # on normal loop exit, IPZ keeps the last iteration value
     for jz in range(1, ne):  # DO JZ=1,NE-1
         ipz = jz
         if iline == 1 and anel <= C.XNE447[jz + 1]:
             break  # GO TO 30
         if iline != 1 and anel <= C.XNEHE1[jz + 1]:
             break  # GO TO 30
-    # 标号 30
-    n0z = ipz - idiv(nz, 2) + 1  # Fortran 整数除法 NZ/2
+    # label 30
+    n0z = ipz - idiv(nz, 2) + 1  # Fortran integer division NZ/2
     if n0z < 1:
         n0z = 1
     if n0z > ne - nz + 1:
@@ -8126,13 +8168,13 @@ def phe1(id, freq, iline):
             zz[i0z] = C.XNEHE1[jz]
 
         # Interpolation in temperature
-        ipx = nt - 1  # 循环正常结束时 IPX 保留最后一次迭代值
+        ipx = nt - 1  # on normal loop exit, IPX keeps the last iteration value
         for ix in range(1, nt):  # DO IX=1,NT-1
             ipx = ix
             if tl <= xt0[ix + 1]:
                 break  # GO TO 50
-        # 标号 50
-        n0x = ipx - idiv(nx, 2) + 1  # Fortran 整数除法 NX/2
+        # label 50
+        n0x = ipx - idiv(nx, 2) + 1  # Fortran integer division NX/2
         if n0x < 1:
             n0x = 1
         if n0x > nt - nx + 1:
@@ -8147,7 +8189,7 @@ def phe1(id, freq, iline):
             # 1. For delta lambda beyond tabulated values - special
             #    extrapolation (Cooper's suggestion)
             nlst = C.NWLAM[jz, iline]
-            prf0 = None  # None 表示未走 GO TO 150 的外推分支
+            prf0 = None  # None means the GO TO 150 extrapolation branch was not taken
             if iline == 1:
                 d1 = C.DLM447[1, jz]
                 d2 = C.DLM447[nlst, jz]
@@ -8174,15 +8216,15 @@ def phe1(id, freq, iline):
             if prf0 is None:
                 # normal linear interpolation in wavelength
                 # (for 4471, linear interpolation in logarithms)
-                ipy = nlst - 1  # 循环正常结束时 IPY 保留最后一次迭代值
+                ipy = nlst - 1  # on normal loop exit, IPY keeps the last iteration value
                 for iy in range(1, nlst):  # DO IY=1,NLST-1
                     ipy = iy
                     if iline == 1 and dlam <= C.DLM447[iy + 1, jz]:
                         break  # GO TO 70
                     if iline != 1 and dlam <= C.DLMHE1[iy + 1, jz, ilne]:
                         break  # GO TO 70
-                # 标号 70
-                n0y = ipy - idiv(ny, 2) + 1  # Fortran 整数除法 NY/2
+                # label 70
+                n0y = ipy - idiv(ny, 2) + 1  # Fortran integer division NY/2
                 if n0y < 1:
                     n0y = 1
                 if n0y > nlst - ny + 1:
@@ -8207,7 +8249,7 @@ def phe1(id, freq, iline):
                     wx[i0x] = math.exp(wx[i0x])
                 # GO TO 200
             else:
-                # 标号 150
+                # label 150
                 wx[i0x] = prf0
             # 200 CONTINUE
         wz[i0z] = yint(xx, wx, tl)
@@ -8224,7 +8266,7 @@ def he2ini():
 
     This procedure is quite analogous to HYDINI for hydrogen lines
 
-    对应 synspec54.f 行 7535–7625
+    Corresponds to synspec54.f lines 7535-7625
     """
     # COMMON/HE2PRF/PRFHE2(19,MDEPTH,36),WLHE2(19,36),NWLHE2(19),
     # *             ILHE2(19),IUHE2(19)
@@ -8246,13 +8288,13 @@ def he2ini():
         _l = read_line(ih)
         C.ILHE2[iline] = int(_l[14:16])  # 14X,I2
         C.IUHE2[iline] = int(_l[25:27])  # 9X,I2
-        read_line(ih)   # 末尾 '/'
+        read_line(ih)   # trailing '/'
         if C.ILHE2[iline] <= 2:
             wl00 = 227.838
         else:
             wl00 = 227.7776
         wl0 = wl00 / (1.0 / C.ILHE2[iline] ** 2 - 1.0 / C.IUHE2[iline] ** 2)
-        # READ(IH,*) NWL2,(WL2(I,ILINE),I=1,NWL2)  自由格式，可跨记录
+        # READ(IH,*) NWL2,(WL2(I,ILINE),I=1,NWL2)  list-directed, may span records
         _tok = read_line(ih).split()
         while not _tok:
             _tok = read_line(ih).split()
@@ -8263,8 +8305,8 @@ def he2ini():
             C.WL2[i, iline] = float(_tok[i])
         # READ(IH,503) NT2,(XT2(I),I=1,NT2)
         #  503 FORMAT(2X,I4,F10.3,5F12.3)
-        # TODO(port): 若 NT2>6 会发生格式回转（新记录重新从 2X,I4 开始），
-        # 这里只翻译了单记录情形（实际数据 NT2=6）
+        # TODO(port): if NT2>6 the format would rewind (a new record restarts at 2X,I4);
+        # only the single-record case is translated here (actual data has NT2=6)
         _l = read_line(ih)
         C.NT2 = int(_l[2:6])
         C.XT2[1] = float(_l[6:16])  # F10.3
@@ -8272,15 +8314,15 @@ def he2ini():
             C.XT2[i] = float(_l[16 + (i - 2) * 12:28 + (i - 2) * 12])
         # READ(IH,504) NE2,(XNE2(I,ILINE),I=1,NE2)
         #  504 FORMAT(2X,I4,F10.2,5F12.2/4X,5F12.2)
-        # TODO(port): 若 NE2>11 会发生格式回转，这里只翻译两条记录的情形
-        # （实际数据 NE2=11）
+        # TODO(port): if NE2>11 the format would rewind; only the two-record case
+        # is translated here (actual data has NE2=11)
         _l = read_line(ih)
         C.NE2 = int(_l[2:6])
         C.XNE2[1, iline] = float(_l[6:16])  # F10.2
         for i in range(2, min(C.NE2, 6) + 1):  # 5F12.2
             C.XNE2[i, iline] = float(_l[16 + (i - 2) * 12:28 + (i - 2) * 12])
         if C.NE2 > 6:
-            _l = read_line(ih)  # '/' 换记录，4X,5F12.2
+            _l = read_line(ih)  # '/' advances to a new record, 4X,5F12.2
             for i in range(7, C.NE2 + 1):
                 C.XNE2[i, iline] = float(_l[4 + (i - 7) * 12:16 + (i - 7) * 12])
         read_line(ih)  # READ(IH,500)  500 FORMAT(1X)
@@ -8295,7 +8337,7 @@ def he2ini():
             for it in range(1, C.NT2 + 1):
                 read_line(ih)  # READ(IH,500)
                 # READ(IH,505) (PRF2(IWL,IT,IE),IWL=1,NWL2)
-                #  505 FORMAT(10F8.3)  —— 每记录 10 个定宽字段，可回转多记录
+                #  505 FORMAT(10F8.3)  - 10 fixed-width fields per record, may rewind across records
                 iwl = 1
                 while iwl <= C.NWL2:
                     _l = read_line(ih)
@@ -8330,8 +8372,8 @@ def he2ini():
             # IWL    - wavelength index (notice that the wavelength grid may
             #          generally be different for different lines
             for iwl in range(1, C.NWL2 + 1):
-                # INTHE2 给标量哑元 W0 赋值 → 全部解包接收
-                prof = 0.0  # Fortran 中 PROF 未初始化；INTHE2 总会对其赋值
+                # INTHE2 assigns scalar dummy W0 -> receive all unpacked
+                prof = 0.0  # PROF uninitialized in Fortran; INTHE2 always assigns it
                 prof, tl, anel, iwl, iline = \
                     inthe2(prof, tl, anel, iwl, iline)
                 C.PRFHE2[iline, id, iwl] = prof
@@ -8353,7 +8395,7 @@ def inthe2(w0, x0, z0, iwl, iline):
 
     This procedure is quite analogous to INTHYD for hydrogen lines
 
-    对应 synspec54.f 行 7631–7712
+    Corresponds to synspec54.f lines 7631-7712
     """
     # PARAMETER (UN=1.)
     un = 1.0
@@ -8367,9 +8409,9 @@ def inthe2(w0, x0, z0, iwl, iline):
     nx = 3
     nz = 3
 
-    # TODO(port): A,DIV 是未初始化局部量（Fortran 未定义值，实际为 0）；
-    # 高温分支（GO TO 500 前）直接用 A,DIV 调 STARKA 而未先 CALL DIVHE2，
-    # 与 INTHYD 不同，疑为原代码 bug，按字面直译
+    # TODO(port): A,DIV are uninitialized locals (undefined in Fortran, actually 0);
+    # the high-temperature branch (before GO TO 500) calls STARKA with A,DIV without
+    # a prior CALL DIVHE2 - unlike INTHYD; suspected original-code bug, translated literally
     a = 0.0
     div = 0.0
 
@@ -8380,7 +8422,7 @@ def inthe2(w0, x0, z0, iwl, iline):
     # (see STARKA); not by an extrapolation in the tables which may
     # be very inaccurate
     if z0 < C.XNE2[1, iline] * 0.99 or z0 > C.XNE2[C.NE2, iline] * 1.01:
-        # DIVHE2 给标量哑元 A,DIV 赋值 → 全部解包接收
+        # DIVHE2 assigns scalar dummies A,DIV -> receive all unpacked
         a, div = divhe2(a, div)
         w0 = starka(C.WL2[iwl, iline] / C.FXK, a, div, un) * C.DBETA
         w0 = math.log10(w0)
@@ -8390,14 +8432,14 @@ def inthe2(w0, x0, z0, iwl, iline):
     # highes grid value of electron density) in the Schoening and
     # Butler tables
     if not _goto500:
-        ipz = C.NE2 - 1  # 循环正常结束时 IPZ 保留最后一次迭代值
+        ipz = C.NE2 - 1  # on normal loop exit, IPZ keeps the last iteration value
         for izz in range(1, C.NE2):  # DO 10 IZZ=1,NE2-1
             ipz = izz
             if z0 <= C.XNE2[izz + 1, iline]:
                 break  # GO TO 20
         #  10 CONTINUE
-        # 标号 20
-        n0z = ipz - idiv(nz, 2) + 1  # Fortran 整数除法 NZ/2
+        # label 20
+        n0z = ipz - idiv(nz, 2) + 1  # Fortran integer division NZ/2
         if n0z < 1:
             n0z = 1
         if n0z > C.NE2 - nz + 1:
@@ -8422,14 +8464,14 @@ def inthe2(w0, x0, z0, iwl, iline):
             #
             # Both interpolations (in T as well as in electron density) are
             # by default the quadratic interpolations in logarithms
-            ipx = C.NT2 - 1  # 循环正常结束时 IPX 保留最后一次迭代值
+            ipx = C.NT2 - 1  # on normal loop exit, IPX keeps the last iteration value
             for ix in range(1, C.NT2):  # DO 30 IX=1,NT2-1
                 ipx = ix
                 if x0 <= C.XT2[ix + 1]:
                     break  # GO TO 40
             #  30 CONTINUE
-            # 标号 40
-            n0x = ipx - idiv(nx, 2) + 1  # Fortran 整数除法 NX/2
+            # label 40
+            n0x = ipx - idiv(nx, 2) + 1  # Fortran integer division NX/2
             if n0x < 1:
                 n0x = 1
             if n0x > C.NT2 - nx + 1:
@@ -8444,7 +8486,7 @@ def inthe2(w0, x0, z0, iwl, iline):
         # 300 CONTINUE
         if not _goto500:
             w0 = yint(zz, wz, z0)
-    # 标号 500
+    # label 500
     # 500 CONTINUE
     return w0, x0, z0, iwl, iline
 
@@ -8457,7 +8499,7 @@ def divhe2(a, div):
     of the parameter A ,ie. A for He II is equal to A for hydrogen
     minus ln(2)
 
-    对应 synspec54.f 行 7718–7746
+    Corresponds to synspec54.f lines 7718-7746
     """
     # PARAMETER (UN=1.,TWO=2.,UNQ=1.25,UNH=1.5,TWH=2.5,FO=4.,FI=5.)
     un = 1.0
@@ -8476,7 +8518,7 @@ def divhe2(a, div):
 
     a = unh * math.log(C.BETAD) - ca
     if C.BETAD < bl:
-        return a, div  # IF(BETAD.LT.BL) RETURN —— DIV 保持调用方原值
+        return a, div  # IF(BETAD.LT.BL) RETURN - DIV keeps the caller's original value
     if a >= al:
         x = math.sqrt(a) * (un + unq * math.log(a) / (fo * a - fi))
     else:
@@ -8484,10 +8526,10 @@ def divhe2(a, div):
     for i in range(1, 6):  # DO 10 I=1,5
         xn = x * (un - (x * x - twh * math.log(x) - a) / (two * x * x - twh))
         if abs(xn - x) <= dx:
-            break  # GO TO 20（X 保持旧值）
+            break  # GO TO 20 (X keeps its old value)
         x = xn
     #  10 CONTINUE
-    # 标号 20
+    # label 20
     div = x
     return a, div
 
@@ -8501,13 +8543,13 @@ def phe2(ispec, id, ablin, emlin):
     Output: ABLIN - absorption coefficient
             EMLIN - emission coefficient
 
-    对应 synspec54.f 行 7752–7849
+    Corresponds to synspec54.f lines 7752-7849
     """
     # DIMENSION ABLIN(1),EMLIN(1),OSCHE2(19),PRF0(40),WLL(40)
     prf0 = np.zeros(41)
     wll = np.zeros(41)
     # COMMON/HE2PRF/...  common/lasers/lasdel
-    # DATA OSCHE2/.../（只读）
+    # DATA OSCHE2/.../ (read-only)
     osche2 = np.zeros(20)
     osche2[1:] = [6.407e-1, 1.506e-1, 5.584e-2, 2.768e-2,
                   1.604e-2, 1.023e-2, 6.980e-3,
@@ -8566,13 +8608,13 @@ def phe2(ispec, id, ablin, emlin):
         if al < 1.0e-4:
             al = 1.0e-4
         al = math.log10(al)
-        iw0 = C.NWLHE2[iline] - 1  # 循环正常结束时 IW0 保留最后一次迭代值
+        iw0 = C.NWLHE2[iline] - 1  # on normal loop exit, IW0 keeps the last iteration value
         for iwl in range(1, C.NWLHE2[iline]):  # DO 20 IWL=1,NWLHE2(ILINE)-1
             iw0 = iwl
             if al <= wll[iwl + 1]:
                 break  # GO TO 30
         #  20 CONTINUE
-        # 标号 30
+        # label 30
         iw1 = iw0 + 1
         prh = (prf0[iw0] * (wll[iw1] - al) + prf0[iw1] * (al - wll[iw0])) \
             / (wll[iw1] - wll[iw0])
@@ -8598,7 +8640,7 @@ def ispec(iat, ion, alam):
                   = 0  - profile is taken as an ordinary Voigt profile
                   > 0  - special profile
 
-    对应 synspec54.f 行 7855–7913
+    Corresponds to synspec54.f lines 7855-7913
     """
     ispec = 0
     if iat > 2:
@@ -8680,10 +8722,10 @@ def heset(il, alm, excl, excu, ion, iprf0, ilwn, iupn):
            EXCU - excitation potential of the upper level (in cm**-1)
            ION  - ionisation degree (1=neutrals, 2=once ionized, etc.)
 
-    对应 synspec54.f 行 7920–8069
+    Corresponds to synspec54.f lines 7920-8069
     """
     # DIMENSION JU(24),NU(24),IT(24)
-    # DATA（只读）
+    # DATA (read-only)
     it = np.zeros(25, dtype=np.int64)
     it[1:] = [1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0,
               0, 0, 0, 0]
@@ -8695,9 +8737,9 @@ def heset(il, alm, excl, excu, ion, iprf0, ilwn, iupn):
               5, 1, 1, 1, 9]
 
     # ******* He I  ***********
-    if ion == 1:  # IF(ION.NE.1) GO TO 20 → else 分支即 He I 部分
+    if ion == 1:  # IF(ION.NE.1) GO TO 20 -> the else branch is the He I part
         # switch IPRF0 - see GAMHE
-        il1 = il  # IL1 赋值后未再使用
+        il1 = il  # IL1 is not used after being assigned
         alam = alm * 10.0
         iprf = 0
         if abs(alam - 3819.60) < 1.0:
@@ -8753,29 +8795,29 @@ def heset(il, alm, excl, excu, ion, iprf0, ilwn, iupn):
 
         # Indices of NLTE levels associated with the given line
         # IF(INLTE.gt.5.OR.IELHE1.EQ.0) RETURN
-        # （条件成立时直接 RETURN；此处等价地用 if not 包裹后续代码——
-        #  因为 ion==1 时标号 20 处的 He II 分支本来也会立即 RETURN）
+        # (returns immediately when the condition holds; equivalently wrapped in if not
+        #  here - for ion==1 the He II branch at label 20 would RETURN immediately anyway)
         if not (C.INLTE > 5 or C.IELHE1 == 0):
             n0i = C.NFIRST[C.IELHE1]
             n1i = C.NLAST[C.IELHE1]
-            hc = CL * H  # CL, H 为 params.py 常量
+            hc = CL * H  # CL, H are params.py constants
             eion = C.ENION[n0i] / hc
             ilw = 0
             iun = 0
             nql = 0
             if iprf > 0:
                 nql = nu[iprf]
-            igl = 0  # TODO(port): 若 EX 条件从未满足，Fortran 中 IGL 未定义
+            igl = 0  # TODO(port): if the EX condition is never met, IGL is undefined in Fortran
             for i in range(n0i, n1i + 1):  # DO 10 I=N0I,N1I
                 nq = C.NQUANT[i]
                 ex = eion - C.ENION[i] / hc
                 if abs(excl - ex) < 100.0:
                     ilw = i
-                    igl = int(C.G[i] + 0.001)  # INT 截断取整
+                    igl = int(C.G[i] + 0.001)  # INT truncation
                 if nq == nql:
                     ig = int(C.G[i] + 0.001)
-                    # TODO(port): IPRF=0 时 Fortran 读 IT(0)（越界残值）；
-                    # 这里 it[0]=0 走 EQ.0 分支
+                    # TODO(port): for IPRF=0 Fortran reads IT(0) (out-of-bounds residue);
+                    # here it[0]=0 takes the EQ.0 branch
                     if it[iprf] == 0:
                         if nq == 2 and ig == ju[iprf]:
                             iun = i
@@ -8847,18 +8889,18 @@ def heset(il, alm, excl, excu, ion, iprf0, ilwn, iupn):
                     if nq == 10 and ig == 400:
                         iun = i
             #  10 CONTINUE
-            # print *, 'il,iprof,ilw,iupn',il,iprf,ilw,iun （原代码中已注释掉）
+            # print *, 'il,iprof,ilw,iupn',il,iprf,ilw,iun (commented out in the original code)
             ilwn = ilw
             iupn = iun
 
     # ******* He II ***********
-    # 标号 20
+    # label 20
     if ion != 2 or C.IELHE2 <= 0:
         return il, alm, excl, excu, ion, iprf0, ilwn, iupn
     n0i = C.NFIRST[C.IELHE2]
     nlhe2 = C.NLAST[C.IELHE2] - n0i + 1
     xl = math.sqrt(1.0 / (1.0 - excl / 438916.146))
-    ilw = int(xl)  # INT 截断取整
+    ilw = int(xl)  # INT truncation
     if float(ilw) - xl < 0.0:
         ilw = ilw + 1
     xu = math.sqrt(1.0 / (1.0 - excu / 438916.146))
@@ -8871,39 +8913,39 @@ def heset(il, alm, excl, excu, ion, iprf0, ilwn, iupn):
         iupn = iun + n0i - 1
     return il, alm, excl, excu, ion, iprf0, ilwn, iupn
 # -*- coding: utf-8 -*-
-"""chunk08: synspec54.f 行 8074–9866 的逐行直译。
+"""chunk08: line-by-line literal translation of synspec54.f lines 8074-9866.
 
-包含子程序:
-    INISET      (8074–8427)
-    READPH      (8432–8581)
-    INILIN      (8586–9192)
-    INILIN_grid (9197–9579)
-    INIBLA      (9586–9631)
-    IDTAB       (9636–9732)
-    INIBLH      (9737–9861)
+Contains subroutines:
+    INISET      (8074-8427)
+    READPH      (8432-8581)
+    INILIN      (8586-9192)
+    INILIN_grid (9197-9579)
+    INIBLA      (9586-9631)
+    IDTAB       (9636-9732)
+    INIBLH      (9737-9861)
 
-模块级 _save_* 变量对应 Fortran 的 SAVE / DATA（隐含 SAVE）语义；
-_chunk08_* 是本分片自带的 I/O 辅助（BACKSPACE 与无格式记录读）。
+Module-level _save_* variables implement Fortran SAVE / DATA (implicit SAVE) semantics;
+_chunk08_* are this chunk's own I/O helpers (BACKSPACE and unformatted record reads).
 """
 
-# ===== DATA / SAVE 提升（Fortran 77 局部变量静态存活语义）=====
+# ===== DATA / SAVE promotion (Fortran 77 static-lifetime semantics for locals) =====
 _save_iniset_illast = 0    # INISET: SAVE ILLAST
-_save_iniset_aprev = 0.0   # INISET: APREV 需跨调用保留（原代码无 SAVE，但实际静态存活）
-_save_inilin_inlset = 0    # INILIN: DATA INLSET /0/，随后置 1（隐含 SAVE）
+_save_iniset_aprev = 0.0   # INISET: APREV must persist across calls (no SAVE in original, but static in practice)
+_save_inilin_inlset = 0    # INILIN: DATA INLSET /0/, later set to 1 (implicit SAVE)
 _save_readph_numfil = 0                        # READPH: SAVE NUMFIL
 _save_readph_ipht = np.zeros(MPHOT + 1, dtype=np.int64)          # READPH: SAVE IPHT
 _save_readph_iend = np.zeros(MPHOT + 1, dtype=np.int64)          # READPH: SAVE IEND
 _save_readph_nelem = np.zeros(MPHOT + 1, dtype=np.int64)         # READPH: SAVE NELEM
 _save_readph_index = np.zeros((MPHOT + 1, MPHOT + 1), dtype=np.int64)  # READPH: SAVE INDEX
 
-# 无格式（二进制）文件的记录起始位置栈，供 BACKSPACE 回退用
+# stack of record start positions for unformatted (binary) files, used by BACKSPACE
 _chunk08_urec_pos = {}
 
 
 def _chunk08_backspace(unit):
-    """BACKSPACE(unit)：回退一个记录。
+    """BACKSPACE(unit): step back one record.
 
-    文本文件回退一行；二进制无格式文件回退一条记录（靠记录位置栈）。
+    Text files step back one line; binary unformatted files step back one record (via the record-position stack).
     """
     fh = funits[unit]
     if "b" in getattr(fh, "mode", ""):
@@ -8927,12 +8969,12 @@ def _chunk08_backspace(unit):
 
 
 def _chunk08_read_urec(unit):
-    """无格式顺序 READ：读取一条完整记录，返回记录载荷 bytes。
+    """Unformatted sequential READ: reads one complete record and returns its payload bytes.
 
-    TODO(port): 假定 gfortran 约定（4 字节 little-endian 记录首尾标记），
-    记录内部布局参照 linelist/list2bin.f：先写全部 REAL*8，再写全部 INTEGER*4。
-    调用方按需要从载荷中切片解析；读完整条记录后剩余未解析部分即被跳过
-    （与 Fortran 无格式 READ 只取前几个量的语义一致）。
+    TODO(port): assumes the gfortran convention (4-byte little-endian record length markers
+    at both ends); record layout follows linelist/list2bin.f: all REAL*8, then all INTEGER*4.
+    The caller slices the payload as needed; any unparsed remainder of the record is skipped
+    once the full record is read (matching Fortran unformatted READ semantics).
     """
     fh = funits[unit]
     pos = fh.tell()
@@ -8941,15 +8983,15 @@ def _chunk08_read_urec(unit):
         raise EOFError("unit %d: end of unformatted file" % unit)
     nbytes = int.from_bytes(hdr, "little", signed=True)
     if nbytes < 0:
-        # 记录长度标记为负：文件不是 gfortran 无格式顺序格式（例如误当二进制
-        # 打开的文本文件）。Fortran 中为错误条件：有 ERR= 走 ERR 分支。
+        # negative record-length marker: not gfortran unformatted sequential format (e.g. a
+        # text file opened as binary). Fortran error condition: take the ERR branch if present.
         raise ValueError("unit %d: bad record length %d" % (unit, nbytes))
     payload = fh.read(nbytes)
     if len(payload) < nbytes:
-        # 记录被截断：Fortran 错误条件（区别于干净 EOF 的 END 分支）。
-        # 用 ValueError 而非 EOFError，使无 ERR= 的调用点按错误终止语义传播。
+        # truncated record: Fortran error condition (unlike clean EOF's END branch). ValueError
+        # instead of EOFError, so call sites without ERR= get error-termination semantics.
         raise ValueError("unit %d: truncated unformatted record" % unit)
-    fh.read(4)  # 记录尾部长度标记
+    fh.read(4)  # trailing record-length marker
     _chunk08_urec_pos.setdefault(unit, []).append(pos)
     return payload
 
@@ -8959,24 +9001,28 @@ def iniset():
     SET UP AUXILIARY FIELDS CONTAINING LINE PARAMETERS,
     SET UP THE SET OF FREQUENCY POINTS
 
-    对应 synspec54.f 行 8074–8427
+    Corresponds to synspec54.f lines 8074-8427
+
+    Method: selects from the input line list the lines that may contribute
+    opacity in the current wavelength interval and sets up the frequency
+    grid for the transfer solution.
     """
     global _save_iniset_illast, _save_iniset_aprev
     # DATA CNM,CAS /2.997925D17,2.997925D18/
     cnm = 2.997925e17
     cas = 2.997925e18
-    # DATA C1,C2,C3 /2.3025851, 4.2014672, 1.4387886/（原代码已注释）
-    # 局部变量显式初始化（Fortran 静态存储；带 TODO 的原代码可能先于赋值引用）
+    # DATA C1,C2,C3 /2.3025851, 4.2014672, 1.4387886/ (commented out in the original)
+    # locals explicitly initialized (Fortran static storage; TODO-flagged originals may be referenced before assignment)
     alact = 0.0
-    frmax = 0.0     # TODO(port): FRMAX 首次经过标号 130 前理论上未定义
+    frmax = 0.0     # TODO(port): FRMAX theoretically undefined before first reaching label 130
     ext = 0.0
     spac = 0.0
     dista0 = 0.0
-    distan = 0.0    # TODO(port): IMODE=2 直接 GO TO 105 时 DISTAN 未初始化
+    distan = 0.0    # TODO(port): DISTAN uninitialized when IMODE=2 goes directly to 105
     alamcu = 0.0
-    cutoff = 0.0    # TODO(port): ifwin>0 时在标号 20 循环内才赋值
+    cutoff = 0.0    # TODO(port): for ifwin>0 only assigned inside the label 20 loop
     dopstd = 0.0
-    istr = 0        # TODO(port): IMODE=2 跳过 8126-8139 的初始化（Fortran 静态残值）
+    istr = 0        # TODO(port): IMODE=2 skips the initialization at 8126-8139 (Fortran static residue)
     ijmax = 0
     imod1l = 0
 
@@ -9028,9 +9074,9 @@ def iniset():
             il0 = _save_iniset_illast
         _label = 20
 
-    # GO TO 密集，按约定用 _label 状态机直译，保留原标号
+    # GO TO-heavy; translated by convention with a _label state machine, keeping original labels
     while True:
-        # ---------------- 标号 20：取下一根谱线 ----------------
+        # ---------------- label 20: take the next line ----------------
         if _label == 20:
             # set up indices of lines
             # IL0 - is the current index of line in the numbering of all lines
@@ -9109,14 +9155,14 @@ def iniset():
             _label = 100
             continue
 
-        # ---------------- 标号 100：该谱线的频率点 ----------------
+        # ---------------- label 100: frequency points of this line ----------------
         if _label == 100:
             delt = abs(frm - fr0)
             if delt < dista0 and C.IMODE != 1:
                 _label = 20                 # GO TO 20
                 continue
             dfrel = cnm * (1.0 / fr0 - 1.0 / frm) / space
-            nfrp = int(dfrel) + 1           # Fortran INT 截断
+            nfrp = int(dfrel) + 1           # Fortran INT truncation
             if nfrp <= 2:
                 nfrp = 2
             w0 = cnm * (1.0 / fr0 - 1.0 / frm) / nfrp
@@ -9124,7 +9170,7 @@ def iniset():
             _label = 105
             continue
 
-        # ---------------- 标号 105 ----------------
+        # ---------------- label 105 ----------------
         if _label == 105:
             fract = C.FREQ[ij]
             alact = cnm / fract
@@ -9132,9 +9178,9 @@ def iniset():
             for k in range(1, nfrp + 1):    # DO 110 K=1,NFRP
                 fract = fract - w0
                 alact = alact + w0
-                if not (C.IMODE >= 1 or nfrp == 2):     # 否则 GO TO 107
+                if not (C.IMODE >= 1 or nfrp == 2):     # otherwise GO TO 107
                     if fract < C.FRLIM and fract > fr0 + ext + spac:
-                        continue            # GO TO 110（继续循环）
+                        continue            # GO TO 110 (continue loop)
                 # 107
                 ij = ij + 1
                 if ij > C.NFREQS:
@@ -9143,7 +9189,7 @@ def iniset():
                 C.FREQ[ij] = cnm / alact
                 C.W[ij] = C.W[ij] + (C.FREQ[ij - 1] - C.FREQ[ij]) * 0.5
                 C.W[ij - 1] = C.W[ij - 1] + (C.FREQ[ij - 1] - C.FREQ[ij]) * 0.5
-                # IF(FREQ(IJ).LT.FRLAST) GO TO 220（原代码已注释）
+                # IF(FREQ(IJ).LT.FRLAST) GO TO 220 (commented out in the original)
                 if C.IMODE == 1 and alact > alamcu:
                     _next = 140             # GO TO 140
                     break
@@ -9159,7 +9205,7 @@ def iniset():
             _label = 20                     # GO TO 20
             continue
 
-        # ---------------- 标号 130 ----------------
+        # ---------------- label 130 ----------------
         if _label == 130:
             frmax = C.FREQ[C.NFREQS]
             C.ALAM1 = cnm / frmax
@@ -9173,7 +9219,7 @@ def iniset():
             _label = 20                     # GO TO 20
             continue
 
-        # ---------------- 标号 140 ----------------
+        # ---------------- label 140 ----------------
         if _label == 140:
             ijmax = ij
             ijmax = min(ijmax, C.NFREQS)
@@ -9185,7 +9231,7 @@ def iniset():
             _label = 240                    # GO TO 240
             continue
 
-        # ---------------- 标号 210 ----------------
+        # ---------------- label 210 ----------------
         if _label == 210:
             C.NBLANK = C.IBLANK + 1
             if ij >= C.NFREQS + 1:
@@ -9200,21 +9246,21 @@ def iniset():
             if imod1l == 1:
                 _label = 240                # GO TO 240
                 continue
-            # FR0=MAX(CNM/(ALAM+CUTOFF),FRLAST*0.99999999D0)（原代码已注释）
+            # FR0=MAX(CNM/(ALAM+CUTOFF),FRLAST*0.99999999D0) (commented out in the original)
             fr0 = C.FRLAST * 0.99999999
             alam = cnm / fr0
             imod1l = 1
             _label = 100                    # GO TO 100
             continue
 
-        # ---------------- 标号 230 ----------------
+        # ---------------- label 230 ----------------
         if _label == 230:
             ijmax = C.NFREQS
             C.NFREQ = C.NFREQS
             _label = 240
             continue
 
-        # ---------------- 标号 240：收尾 ----------------
+        # ---------------- label 240: finalization ----------------
         if _label == 240:
             if C.FREQ[ijmax] <= C.FRLAST:
                 C.NBLANK = C.IBLANK
@@ -9229,7 +9275,7 @@ def iniset():
                         C.NBLANK = C.IBLANK
                         C.IRLIST = 1
                         # write(*,*) 'iniset mol',ilist,alastm(ilist),alam
-                        # （原代码已注释）
+                        # (commented out in the original)
             if C.IFWIN <= 0:
                 C.FREQ[1] = C.FREQ[3]
                 C.FREQ[2] = C.FREQ[ijmax]
@@ -9275,7 +9321,7 @@ def iniset():
                             if C.WLAM[ij] <= C.WLAMC[ijci]:
                                 break       # GO TO 248
                         else:
-                            # 循环正常结束：Fortran 循环变量保留为 终值+步长
+                            # normal loop exit: Fortran loop variable keeps final value + step
                             ijci = C.NFREQC
                         # 248 CONTINUE
                         ijc = ijci
@@ -9288,18 +9334,18 @@ def iniset():
                 # frequency indices of the line centers
                 C.DFRCON = C.NFREQ - ij0
                 C.DFRCON = -C.DFRCON / xx
-                ifrcon = int(C.DFRCON)      # Fortran INT 截断
+                ifrcon = int(C.DFRCON)      # Fortran INT truncation
                 for il in range(1, C.NLIN + 1):     # DO 255 IL=1,NLIN
                     fr0 = C.FREQ0[C.INDLIN[il]]
                     xjc = 3.0 + C.DFRCON * (C.FREQ[1] - fr0)
-                    ijc = int(xjc)                  # Fortran INT 截断
+                    ijc = int(xjc)                  # Fortran INT truncation
                     C.IJCNTR[il] = ijc
                     if ijc <= ij0 or ijc >= C.NFREQ:
                         continue                    # GO TO 255
                     if fr0 < C.FREQ[ijc]:
                         ijc0 = ijc
                         dfr0 = C.FREQ[ijc0] - fr0
-                        while True:                 # 标号 252
+                        while True:                 # label 252
                             ijc0 = ijc0 + 1
                             dfr = abs(C.FREQ[ijc0] - fr0)
                             if dfr < dfr0:
@@ -9312,7 +9358,7 @@ def iniset():
                     elif fr0 > C.FREQ[ijc]:
                         ijc0 = ijc
                         dfr0 = fr0 - C.FREQ[ijc0]
-                        while True:                 # 标号 254
+                        while True:                 # label 254
                             ijc0 = ijc0 - 1
                             dfr = abs(C.FREQ[ijc0] - fr0)
                             if dfr < dfr0:
@@ -9327,8 +9373,8 @@ def iniset():
             if C.IFWIN > 0:
                 # set up switches for hydrogen and He II line opacity
                 for ij in range(1, C.NFREQ + 1):    # DO IJ=1,NFREQ
-                    hylsew(ij)              # CALL HYLSEW(IJ)，不改标量哑元
-                    he2sew(ij)              # CALL HE2SEW(IJ)，不改标量哑元
+                    hylsew(ij)              # CALL HYLSEW(IJ), does not modify scalar dummies
+                    he2sew(ij)              # CALL HE2SEW(IJ), does not modify scalar dummies
             nsp = 0
             for il in range(1, C.NLIN + 1):         # DO 260 IL=1,NLIN
                 il0 = C.INDLIN[il]
@@ -9350,8 +9396,8 @@ def iniset():
             _save_iniset_aprev = C.ALAM0
             C.ALAM0 = C.ALAM1
             C.ALM00 = cnm / C.FREQ[C.NFREQ]
-            # write(6,611) iblank,nblank,irlist,aprev*10.,alam0*10.（原代码已注释）
-            # 611  format('inis ',2i6,i3,3f10.3)（原代码已注释）
+            # write(6,611) iblank,nblank,irlist,aprev*10.,alam0*10. (commented out in the original)
+            # 611  format('inis ',2i6,i3,3f10.3) (commented out in the original)
             return
 
 
@@ -9360,12 +9406,12 @@ def readph():
     photoinization cross-section from unit IPHT1,
     and interpolate to the set of current wavelengths (WLAM)
 
-    对应 synspec54.f 行 8432–8581
+    Corresponds to synspec54.f lines 8432-8581
     """
     global _save_readph_numfil
     # PARAMETER (IPHT0=57)
     ipht0 = 57
-    # SAVE IPHT,IEND,NELEM,INDEX,NUMFIL → 模块级 _save_readph_*
+    # SAVE IPHT,IEND,NELEM,INDEX,NUMFIL -> module-level _save_readph_*
     # DIMENSION PHT0(MPHOT),PHT1(MPHOT),IPHT(MPHOT),IEND(MPHOT),
     #           IFILE(MPHOT),NELEM(MPHOT),INDEX(MPHOT,MPHOT)
     pht0 = np.zeros(MPHOT + 1)
@@ -9374,8 +9420,8 @@ def readph():
     indx = 0
 
     def _read_vals(unit, n):
-        # 列表定向 READ：连续读行直到凑足 n 个值（Fortran 允许一个 READ 跨行，
-        # 读满后本记录剩余部分被跳过）
+        # list-directed READ: keep reading lines until n values are collected (Fortran
+        # allows one READ to span lines; the remainder of the record is discarded)
         vals = []
         while len(vals) < n:
             vals.extend(read_line(unit).replace(',', ' ').split())
@@ -9396,7 +9442,7 @@ def readph():
             # READ(IPHT0,*,END=50,err=50) NPHT
             C.NPHT = int(float(read_line(ipht0).replace(',', ' ').split()[0]))
         except (EOFError, ValueError, IndexError):
-            pass                            # END=50 / err=50 → 标号 50
+            pass                            # END=50 / err=50 -> label 50
         else:
             if C.NPHT <= 0:
                 return
@@ -9416,9 +9462,9 @@ def readph():
                     C.GPHT[i] = float(_v[i - 1])
                 _v = _read_vals(ipht0, C.NPHT)  # (JPHT(I),I=1,NPHT)
                 for i in range(1, C.NPHT + 1):
-                    C.JPHT[i] = int(float(_v[i - 1]))  # JPHT 为 INTEGER 数组
+                    C.JPHT[i] = int(float(_v[i - 1]))  # JPHT is an INTEGER array
             except EOFError:
-                pass                        # END=50 → 标号 50
+                pass                        # END=50 -> label 50
             else:
                 # determination of the number of files (NFILE) and the
                 # partitioning of the individual cross-section to the
@@ -9493,7 +9539,7 @@ def readph():
                     for i in range(1, npht1 + 1):
                         pht1[i] = float(_v[i])
             except EOFError:
-                _to200 = True               # END=200 → 标号 200
+                _to200 = True               # END=200 -> label 200
         if not _to200:
             dw = C.WPHT1 - C.WPHT0
             a1 = (C.WPHT1 - C.WLAM[3]) / dw
@@ -9656,10 +9702,10 @@ def inilin():
     The only differences between NEW and OLD is the occurence of
     GS and GW in NEW, and slightly different format of reading.
 
-    对应 synspec54.f 行 8586–9192
+    Corresponds to synspec54.f lines 8586-9192
     """
     global _save_inilin_inlset
-    # PARAMETER 局部常量
+    # PARAMETER local constants
     c1 = 2.3025851
     c2 = 4.2014672
     c3 = 1.4387886
@@ -9684,14 +9730,14 @@ def inilin():
     enhe1 = 198310.76
     enhe2 = 438908.85
     # CHARACTER*1000 CADENA
-    # DATA INLSET /0/ → 模块级 _save_inilin_inlset（随后被修改，隐含 SAVE）
+    # DATA INLSET /0/ -> module-level _save_inilin_inlset (modified later, implicit SAVE)
     wgr1 = 0.0
     wgr2 = 0.0
     wgr3 = 0.0
     wgr4 = 0.0
     ab0 = 0.0
-    # TODO(port): 量子数标志在读表前未定义时 Fortran 取静态残值，这里取 -1
-    # （按 INILIN 头注释 -1 表示 unknown）
+    # TODO(port): when the quantum-number flags are undefined before reading the table,
+    # Fortran takes a static residue; here set to -1 (-1 means unknown per the INILIN header)
     isql = -1
     ilql = -1
     ipql = -1
@@ -9746,15 +9792,15 @@ def inilin():
     doplam = C.ALAM0 * C.ALAM0 / cnm * dopstd
     avab = C.ABSTD[C.IDSTD] * C.RELOP
     astd = 1.0
-    # IF(GRAV.GT.6.) ASTD=0.1（原代码已注释）
+    # IF(GRAV.GT.6.) ASTD=0.1 (commented out in the original)
     cutoff = C.CUTOF0
     alast = cnm / C.FRLAST
-    iat = 0     # TODO(port): 下方 afac 计算引用 IAT，此处先于赋值（Fortran 静态残值）
+    iat = 0     # TODO(port): IAT referenced by the afac computation below before any assignment (Fortran static residue)
     ion = 0
     if C.INLTE >= 1 and _save_inilin_inlset == 0:
-        # CALL NLTSET(0,...)：NLTSET 会改写 ILMATCH、INNLT0 等标量哑元，
-        # 按约定返回全部标量哑元并逐个接收
-        # TODO(port): 初始化调用时 EXCL..IPQU 等实参在原代码中未定义
+        # CALL NLTSET(0,...): NLTSET rewrites scalar dummies ILMATCH, INNLT0, etc.;
+        # by convention returns all scalar dummies, received one by one
+        # TODO(port): actual arguments EXCL..IPQU are undefined in the original for this init call
         (_mode, il, iat, ion, C.ALAM0, excl, excu, ql, qu,
          isql, ilql, ipql, isqu, ilqu, ipqu, ieven, innlt0,
          ilmatch) = nltset(0, il, iat, ion, C.ALAM0, 0.0, 0.0, 0.0, 0.0,
@@ -9782,7 +9828,7 @@ def inilin():
         cadena = ' '
         cadena = read_line(19)              # READ(19,'(1000a)')CADENA
         _chunk08_backspace(19)              # BACKSPACE(19)
-        # CALL COUNT_WORDS(CADENA,NOW)：COUNT_WORDS 给 N 赋值 → 返回全部标量哑元
+        # CALL COUNT_WORDS(CADENA,NOW): COUNT_WORDS assigns N -> return all scalar dummies
         cadena, now = count_words(cadena, 0)
         if now < 12:
             write_line(11, 'INILIN: NO quantum numbers given in linelist')
@@ -9791,11 +9837,11 @@ def inilin():
         if C.INLIST >= 10:
             write_line(11, 'INILIN: if present, quant. num. limits are ignored')
     else:
-        # 二进制线列表：试探性读取（read(19,err=4) ...）
-        # TODO(port): 无格式记录布局假定与 linelist/list2bin.f 一致：
-        # 10 个 REAL*8 后跟 1 或 7 个 INTEGER*4；记录太短视为 err=4。
-        # 该 READ 无 END=：Fortran 中 EOF 也属错误条件 → 同样走 err=4 分支，
-        # 故此处同时捕获 EOFError
+        # binary line list: trial read (read(19,err=4) ...)
+        # TODO(port): unformatted record layout assumed to match linelist/list2bin.f:
+        # 10 REAL*8 followed by 1 or 7 INTEGER*4; a too-short record counts as err=4.
+        # This READ has no END=: in Fortran EOF is also an error condition -> same err=4
+        # branch, so EOFError is caught here as well
         try:
             _payload = _chunk08_read_urec(19)
             if len(_payload) < 10 * 8 + 7 * 4:
@@ -9819,14 +9865,14 @@ def inilin():
             isqu = int(_ii[4])
             ilqu = int(_ii[5])
             ipqu = int(_ii[6])
-            # BACKSPACE(19)（原代码已注释 —— 成功试探后不回退，首条记录被跳过）
+            # BACKSPACE(19) (commented out in the original - no backspace after a successful trial; the first record is skipped)
             iadqn = 1
             # GO TO 5
         except (ValueError, EOFError):
             # 4 CONTINUE
             _chunk08_backspace(19)          # backspace(19)
             # read(19) ALAM,ANUM,GF,EXCL,QL,EXCU,QU,AGAM,GS,GW,INEXT
-            # （无 ERR=/END=：此读再失败对应 Fortran 报错终止，异常向上传播）
+            # (no ERR=/END=: if this read fails again, Fortran aborts with an error; the exception propagates)
             _payload = _chunk08_read_urec(19)
             _r = np.frombuffer(_payload[:80], dtype=np.float64)
             alam = float(_r[0])
@@ -9859,13 +9905,13 @@ def inilin():
     # skip all lines with wavelength below ALAM0-CUTOFF
     alam = 0.0
     ijc = 2
-    while True:                             # 标号 7
+    while True:                             # label 7
         if C.IBIN[0] == 0:
             # READ(19,510) ALAM
             # 510 FORMAT(F10.4)
             alam = float(read_line(19)[:10])
         else:
-            # read(19) alam（无格式：整条记录读出，只取第一量）
+            # read(19) alam (unformatted: read the whole record, take only the first quantity)
             _payload = _chunk08_read_urec(19)
             alam = float(np.frombuffer(_payload[:8], dtype=np.float64)[0])
         if alam >= C.ALAM0 - cutoff:
@@ -9875,8 +9921,8 @@ def inilin():
     # GO TO 10
 
     # read the line list
-    while True:                             # 标号 10：主循环
-        # 8 CONTINUE（err=8 重新进入点，直接落入 10）
+    while True:                             # label 10: main loop
+        # 8 CONTINUE (err=8 re-entry point, falls directly into 10)
         ilwn = 0
         iun = 0
         iprf = 0
@@ -9899,9 +9945,9 @@ def inilin():
                     gw = float(_tok[9])
                     inext = int(float(_tok[10]))
                 except EOFError:
-                    break                   # END=100 → 标号 100
+                    break                   # END=100 -> label 100
                 except (ValueError, IndexError):
-                    continue                # err=8 → 标号 8
+                    continue                # err=8 -> label 8
                 if inext != 0:
                     # READ(19,*) WGR1,WGR2,WGR3,WGR4,ILWN,IUN,IPRF
                     _tok = read_line(19).replace(',', ' ').split()
@@ -9938,7 +9984,7 @@ def inilin():
                 except (ValueError, IndexError):
                     continue                # err=8
         else:
-            # 二进制（无格式）读
+            # binary (unformatted) read
             try:
                 _payload = _chunk08_read_urec(19)
             except EOFError:
@@ -9976,7 +10022,7 @@ def inilin():
                 ipqu = -1
             if inext != 0:
                 # READ(19,*) WGR1,WGR2,WGR3,WGR4,ILWN,IUN,IPRF
-                # TODO(port): 原代码在 IADQN=0 时可能重复读此记录，直译保留
+                # TODO(port): the original may read this record twice when IADQN=0; kept as a literal translation
                 _tok = read_line(19).replace(',', ' ').split()
                 wgr1 = float(_tok[0])
                 wgr2 = float(_tok[1])
@@ -10004,7 +10050,7 @@ def inilin():
 
         # second selection : for line strenghts
         fr0 = cnm / alam
-        iat = int(anum)                     # INT 截断
+        iat = int(anum)                     # INT truncation
         fra = (anum - float(iat) + tenm4) * hund
         ion = int(fra) + 1
         if ion > C.IONIZ[iat]:
@@ -10050,7 +10096,7 @@ def inilin():
                 if fr0 >= C.FREQC[ijcn]:
                     break                   # GO TO 12
             else:
-                # 循环正常结束：Fortran 循环变量保留为 终值+步长
+                # normal loop exit: Fortran loop variable keeps final value + step
                 ijcn = C.NFREQC + 1
             # 12 CONTINUE
             ijc = ijcn
@@ -10145,7 +10191,7 @@ def inilin():
 
         # evaluation of EXTIN0 - the distance (in delta frequency) where
         # the line is supposed to contribute to the total opacity
-        # CALL PROFIL(IL,IAT,IDSTD,AGAM)：PROFIL 改写 AGAM → 返回全部标量哑元
+        # CALL PROFIL(IL,IAT,IDSTD,AGAM): PROFIL rewrites AGAM -> return all scalar dummies
         il, iat, C.IDSTD, agam = profil(il, iat, C.IDSTD, agam)
         if iat <= 2:
             ext = math.sqrt(10.0 * ab0)
@@ -10168,7 +10214,7 @@ def inilin():
         if iat <= 2:
             isprff = ispec(iat, ion, alam)  # FUNCTION ISPEC
         if iat == 2:
-            # CALL HESET(...)：HESET 改写 IPRF0、ILWN、IUPN → 返回全部标量哑元
+            # CALL HESET(...): HESET rewrites IPRF0, ILWN, IUPN -> return all scalar dummies
             il, alam, excl, excu, ion, iprf, ilwn, iun = heset(
                 il, alam, excl, excu, ion, iprf, ilwn, iun)
         C.ISPRF[il] = isprff
@@ -10184,7 +10230,7 @@ def inilin():
                 print(" **** MORE LINES WITH GRIEM PROFILES THAN MGRIEM\n"
                       "       FOR LINES WITH LAMBDA GREATER THAN%15.4f  NM\n"
                       % alam)
-                # GO TO 20（跳过 WGR0 存储）
+                # GO TO 20 (skip WGR0 storage)
             else:
                 C.WGR0[1, igrie0] = float(wgr1)
                 C.WGR0[2, igrie0] = float(wgr2)
@@ -10220,14 +10266,14 @@ def inilin():
                 break                       # GO TO 100
             gi = 2.0 * ql + un
             gj = 2.0 * qu + un
-            nlte(il, ilwn, iun, gi, gj)     # CALL NLTE，不改标量哑元
+            nlte(il, ilwn, iun, gi, gj)     # CALL NLTE, does not modify scalar dummies
             C.ILOWN[il] = ilwn
             C.IUPN[il] = iun
         if ilwn > 0 and C.INLTE != 0:
             innlt0 = innlt0 + 1
             C.INDNLT[il] = innlt0
             if innlt0 > MNLT:
-                # 604 FORMAT（同上）
+                # 604 FORMAT (as above)
                 print(" **** MORE LINES IN NLTE OPTION THAN MNLT\n"
                       "       FOR LINES WITH LAMBDA GREATER THAN%15.4f  NM\n"
                       % alam)
@@ -10239,7 +10285,7 @@ def inilin():
             C.IUPN[il] = iun
         if ilwn == 0 and C.INLTE >= 1:
             ilmatch = -1
-            # CALL NLTSET(1,...)：改写标量哑元 → 返回全部并逐个接收
+            # CALL NLTSET(1,...): rewrites scalar dummies -> return all, received one by one
             (_mode, il, iat, ion, alam, excl, excu, ql, qu,
              isql, ilql, ipql, isqu, ilqu, ipqu, ieven, innlt0,
              ilmatch) = nltset(1, il, iat, ion, alam, excl, excu, ql, qu,
@@ -10264,7 +10310,7 @@ def inilin():
 
             if C.INDNLT[il] > 0:
                 if C.INDNLT[il] > MNLT:
-                    # 604 FORMAT（同上）
+                    # 604 FORMAT (as above)
                     print(" **** MORE LINES IN NLTE OPTION THAN MNLT\n"
                           "       FOR LINES WITH LAMBDA GREATER THAN%15.4f  NM\n"
                           % alam)
@@ -10300,7 +10346,7 @@ def inilin():
         C.FRLAST = cnm / alast
     C.IBLANK = 0
 
-    # WRITE(11,*) 列表定向输出：原输出带前导空格，这里近似
+    # WRITE(11,*) list-directed output: original output has a leading space; approximated here
     write_line(11, 'INILIN: NLTE matches using Energies and SLP limits --')
     write_line(11, '%d lines searched' % ilsearch)
     write_line(11, '%d lines unmatched -- set to LTE' % ilfail)
@@ -10313,9 +10359,9 @@ def inilin():
     #       /' LINES - NLTE         :',I10/)
     print("\n LINES - TOTAL        :%10d\n LINES - NLTE         :%10d\n"
           % (C.NLIN0, C.NNLT))
-    # 601 FORMAT（见上）
-    # 603 FORMAT（见上）
-    # 604 FORMAT（见上）
+    # 601 FORMAT (see above)
+    # 603 FORMAT (see above)
+    # 604 FORMAT (see above)
     return
 
 
@@ -10371,9 +10417,9 @@ def inilin_grid():
     The only differences between NEW and OLD is the occurence of
     GS and GW in NEW, and slightly different format of reading.
 
-    对应 synspec54.f 行 9197–9579
+    Corresponds to synspec54.f lines 9197-9579
     """
-    # PARAMETER 局部常量
+    # PARAMETER local constants
     c1 = 2.3025851
     c2 = 4.2014672
     c3 = 1.4387886
@@ -10399,7 +10445,7 @@ def inilin_grid():
     hkc = 4.79928e-11
     enhe1 = 198310.76
     enhe2 = 438908.85
-    # DATA INLSET /0/ —— 本子程序中未再引用，仅保留注释
+    # DATA INLSET /0/ - not referenced again in this subroutine; comment kept only
     wgr1 = 0.0
     wgr2 = 0.0
     wgr3 = 0.0
@@ -10435,7 +10481,7 @@ def inilin_grid():
     id_ = C.IDSTD
     dstdid = math.sqrt(1.4e7 * C.TEMP[C.IDSTD])
     astd = 1.0
-    # IF(GRAV.GT.6.) ASTD=0.1（原代码已注释）
+    # IF(GRAV.GT.6.) ASTD=0.1 (commented out in the original)
     cutoff = C.CUTOF0
     alast = cnm / C.FRLAST
     absta = C.absoc[1]
@@ -10443,11 +10489,11 @@ def inilin_grid():
     print("\n read line list with alam0, alast%10.3f%10.3f%11.3e%11.3e\n"
           % (C.ALAM0, alast, C.ABSTD[C.IDSTD], absta))
 
-    # TODO(port): afac 计算中 IAT 先于任何赋值被引用（Fortran 静态残值），取 0
+    # TODO(port): IAT is referenced in the afac computation before any assignment (Fortran static residue); set to 0
     iat = 0
-    ion = 0     # TODO(port): inlist<0 分支中 ION 先于赋值被引用，取 0
-    gfp = 0.0   # TODO(port): 同上
-    epp = 0.0   # TODO(port): 同上
+    ion = 0     # TODO(port): ION referenced before assignment in the inlist<0 branch; set to 0
+    gfp = 0.0   # TODO(port): same as above
+    epp = 0.0   # TODO(port): same as above
     rstd = 1.0e4
     if C.RELOP > 0.0:
         rstd = 1.0 / C.RELOP
@@ -10456,7 +10502,7 @@ def inilin_grid():
         afac = 1.0
     afac = afac * rstd * astd
 
-    afac = afac * rstd * astd               # 原代码重复执行一次，直译保留
+    afac = afac * rstd * astd               # executed twice in the original; kept as a literal translation
     afilin = alast
 
     # first part of reading line list - read only lambda, and
@@ -10468,7 +10514,7 @@ def inilin_grid():
             # 510 FORMAT(F10.4)
             alam = float(read_line(19)[:10])
         else:
-            # read(19) alam（无格式：整条记录读出，只取第一量）
+            # read(19) alam (unformatted: read the whole record, take only the first quantity)
             _payload = _chunk08_read_urec(19)
             alam = float(np.frombuffer(_payload[:8], dtype=np.float64)[0])
         if alam >= C.ALAM0 - cutoff:
@@ -10477,8 +10523,8 @@ def inilin_grid():
     _chunk08_backspace(19)                  # BACKSPACE(19)
     # GO TO 10
 
-    while True:                             # 标号 10：主循环
-        # 8 CONTINUE（err=8 重新进入点）
+    while True:                             # label 10: main loop
+        # 8 CONTINUE (err=8 re-entry point)
         ilwn = 0
         iun = 0
         iprf = 0
@@ -10499,9 +10545,9 @@ def inilin_grid():
                 gs = float(_tok[8])
                 gw = float(_tok[9])
             except EOFError:
-                break                       # END=100 → 标号 100
+                break                       # END=100 → label 100
             except (ValueError, IndexError):
-                continue                    # err=8 → 标号 8
+                continue                    # err=8 → label 8
         else:
             try:
                 # read(19,end=100) ALAM,...,GS,GW
@@ -10568,7 +10614,7 @@ def inilin_grid():
         abid = abct / dop / absta
         ext = math.sqrt(abid * afac) * dop
 
-        # line part of the Planck mean opacity（原代码整段已注释）
+        # line part of the Planck mean opacity (entire block commented out in the original code)
         #      if(alam.ge.alam0.and.alam.le.alast) then
         #      if(abid.ge.relop) then
         #        xx=exp(-hkc*fr0/temp(id))
@@ -10580,7 +10626,7 @@ def inilin_grid():
         #     end if
 
         alax0 = 12.0
-        # alax0=0（原代码已注释）
+        # alax0=0 (commented out in the original code)
 
         if C.IMODE == -6:
             continue                        # GO TO 10
@@ -10600,11 +10646,11 @@ def inilin_grid():
             if abid < C.RELOP * 1.0e-19:
                 continue                    # GO TO 10
 
-        # if(abid.lt.relop.and.alam.gt.alax0) go to 10（原代码已注释）
-        # if(abid.lt.1.e-10*relop.and.alam.lt.alax0) go to 10（原代码已注释）
+        # if(abid.lt.relop.and.alam.gt.alax0) go to 10 (commented out in the original code)
+        # if(abid.lt.1.e-10*relop.and.alam.lt.alax0) go to 10 (commented out in the original code)
         if anum < anumin or anum > anumax:
             continue                        # GO TO 10
-        if anum > anumax:                   # 原代码重复判断，直译保留
+        if anum > anumax:                   # duplicate test in the original code, kept verbatim
             continue                        # GO TO 10
         if abs(anum - ahe2) < tenm4 and C.IFHE2 > 0:
             continue                        # GO TO 10
@@ -10679,7 +10725,7 @@ def inilin_grid():
         if iat <= 2:
             isprff = ispec(iat, ion, alam)  # FUNCTION ISPEC
         if iat == 2:
-            # CALL HESET(...)：HESET 改写 IPRF0、ILWN、IUPN → 返回全部标量哑元
+            # CALL HESET(...): HESET overwrites IPRF0, ILWN, IUPN → return all scalar dummies
             il, alam, excl, excu, ion, iprf, ilwn, iun = heset(
                 il, alam, excl, excu, ion, iprf, ilwn, iun)
         C.ISPRF[il] = isprff
@@ -10695,7 +10741,7 @@ def inilin_grid():
                 print("\n **** MORE LINES WITH GRIEM PROFILES THAN MGRIEM\n"
                       "       FOR LINES WITH LAMBDA GREATER THAN%15.4f  NM\n"
                       % alam)
-                # GO TO 20（跳过 WGR0 存储）
+                # GO TO 20 (skip WGR0 storage)
             else:
                 C.WGR0[1, igrie0] = float(np.float32(wgr1))
                 C.WGR0[2, igrie0] = float(np.float32(wgr2))
@@ -10726,14 +10772,14 @@ def inilin_grid():
 
     # 611 FORMAT(/' ATOMIC LINES        :',I10/)
     print("\n ATOMIC LINES        :%10d\n" % C.NLIN0)
-    # WRITE(6,611) NLIN0,NNLT,NGRIEM（原代码已注释）
+    # WRITE(6,611) NLIN0,NNLT,NGRIEM (commented out in the original code)
     # 611 FORMAT(/' LINES - TOTAL        :',I10
     #       /' LINES - NLTE         :',I10
-    #       /' LINES - GRIEM        :',I10/)（原代码已注释）
-    # 601 FORMAT（见上）
-    # 602 FORMAT('0 **** MORE LINES WITH SPECIAL PROFILES THAN MPRF'/...)（原代码已注释）
-    # 603 FORMAT（见上）
-    # 604 FORMAT('0 **** MORE LINES IN NLTE OPTION THAN MNLT'/...)（原代码已注释）
+    #       /' LINES - GRIEM        :',I10/) (commented out in the original code)
+    # 601 FORMAT (see above)
+    # 602 FORMAT('0 **** MORE LINES WITH SPECIAL PROFILES THAN MPRF'/...) (commented out in the original code)
+    # 603 FORMAT (see above)
+    # 604 FORMAT('0 **** MORE LINES IN NLTE OPTION THAN MNLT'/...) (commented out in the original code)
     return
 
 
@@ -10741,11 +10787,11 @@ def inibla():
     """driving procedure for treating a partial line list for the
     current wavelength region
 
-    对应 synspec54.f 行 9586–9631
+    Corresponds to synspec54.f lines 9586-9631
     """
     # PARAMETER (DP0=3.33564E-11, DP1=1.651E8,
     #            VW1=0.42, VW2=0.45,TENM4=1.E-4)
-    # （注意原代码中 VW2 有注释掉的旧值 0.3）
+    # (note: the original code has the old value 0.3 of VW2 commented out)
     dp0 = 3.33564e-11
     dp1 = 1.651e8
     vw1 = 0.42
@@ -10791,7 +10837,7 @@ def inibla():
 def idtab():
     """output of selected line parameters (identification table)
 
-    对应 synspec54.f 行 9636–9732
+    Corresponds to synspec54.f lines 9636-9732
     """
     # PARAMETER (C1=2.3025851, C2=4.2014672, C3=1.4387886)
     c1 = 2.3025851
@@ -10803,7 +10849,7 @@ def idtab():
     #        ' XI ',' XII','XIII',' XIV',' XV ',
     #        ' XVI','XVII',' 18 ',' XIX',' XX ',
     #        ' XXI','XXII',' 23 ','XXIV','XXV ',
-    #        'XXVI',' 27 ',' 28 ','XXIX',' XXX'/  （不再修改，直接初始化）
+    #        'XXVI',' 27 ',' 28 ','XXIX',' XXX'/  (not modified afterwards; initialized directly)
     typion = ['',
               ' I  ', ' II ', ' III', ' IV ', ' V  ',
               ' VI ', ' VII', 'VIII', ' IX ', ' X  ',
@@ -10832,7 +10878,7 @@ def idtab():
             return
         if C.IPRIN >= 2:
             # IF(IMODE.GE.0.OR.(IMODE.EQ.-1.AND.IBLANK.EQ.1)) WRITE(6,602)
-            # （原代码已注释）
+            # (commented out in the original code)
             pass
 
         for il0 in range(1, C.NLIN + 1):    # DO IL0=1,NLIN
@@ -10845,10 +10891,10 @@ def idtab():
                 id0 = C.IREFD[ijcn]
             if 0 < id0 < C.ND:
                 id_ = id0
-            iat = idiv(C.INDAT[il], 100)    # Fortran 整数除法
+            iat = idiv(C.INDAT[il], 100)    # Fortran integer division
             ion = imod(C.INDAT[il], 100)
-            # CALL PROFIL(IL,IAT,ID,AGAM)：PROFIL 改写 AGAM → 返回全部标量哑元
-            # TODO(port): AGAM 实参在调用前未赋值（PROFIL 立即覆写），传 0.0
+            # CALL PROFIL(IL,IAT,ID,AGAM): PROFIL overwrites AGAM → return all scalar dummies
+            # TODO(port): AGAM argument unassigned before the call (PROFIL overwrites it immediately); pass 0.0
             il, iat, id_, agam = profil(il, iat, id_, 0.0)
             abcnt = (math.exp(C.GF0[il] - C.EXCL0[il] / C.TEMP[id_])
                      * C.RRR[id_, ion, iat] * C.STIM[id_])
@@ -10895,7 +10941,7 @@ def idtab():
                            % (alam, C.TYPAT[iat], typion[ion][:3], gf, excl,
                               str0, eqw, apr, ill, ilu, id_))
         # END DO
-    # 602 FORMAT（原代码已注释）
+    # 602 FORMAT (commented out in the original code)
     # 100 CONTINUE
     return
 
@@ -10903,7 +10949,7 @@ def idtab():
 def iniblh():
     """output information about hydrogen lines
 
-    对应 synspec54.f 行 9737–9861
+    Corresponds to synspec54.f lines 9737-9861
     """
     # PARAMETER (C1=2.3025851, C2=4.2014672, C3=1.4387886)
     c1 = 2.3025851
@@ -10919,7 +10965,7 @@ def iniblh():
     # PARAMETER (UN=1.)
     un = 1.0
 
-    # DATA TYPION（不再修改，直接初始化；数据同 IDTAB）
+    # DATA TYPION (not modified afterwards; initialized directly; same data as in IDTAB)
     typion = ['',
               ' I  ', ' II ', ' III', ' IV ', ' V  ',
               ' VI ', ' VII', 'VIII', ' IX ', ' X  ',
@@ -10999,10 +11045,10 @@ def iniblh():
             m2 = 20
         ilinh = 0
         for j in range(m2, m1 - 1, -1):     # DO J=M2,M1,-1
-            # CALL STARK0(I,J,izz,XKIJ,WL0,FIJ,FIJ0)：STARK0 改写
-            # XKIJ/WL0/FIJ/FIJ0 → 按约定返回全部标量哑元
-            # TODO(port): XKIJ/WL0/FIJ/FIJ0 实参在首次调用前未赋值
-            # （STARK0 全部覆写），传 0.0
+            # CALL STARK0(I,J,izz,XKIJ,WL0,FIJ,FIJ0): STARK0 overwrites
+            # XKIJ/WL0/FIJ/FIJ0 → by convention return all scalar dummies
+            # TODO(port): XKIJ/WL0/FIJ/FIJ0 arguments unassigned before the
+            # first call (STARK0 overwrites all of them); pass 0.0
             i, j, izz, xkij, wl0, fij, fij0 = stark0(i, j, izz,
                                                      0.0, 0.0, 0.0, 0.0)
             alam = wl0
@@ -11039,7 +11085,7 @@ def iniblh():
                     apr = ap3
                 if str_ >= 1.0e4:
                     apr = ap4
-                # if(iprin.ge.2) WRITE(6,601) ...（原代码已注释）
+                # if(iprin.ge.2) WRITE(6,601) ... (commented out in the original code)
                 # 601 FORMAT(F10.3,2X,2A4,F7.2,F12.3,1PE11.2,0PF8.1,1X,A4,2i3)
                 write_line(14, "%10.3f  %s%s%7.2f%12.3f%11.2e%8.1f %s%3d%3d"
                            % (alam, C.TYPAT[iat], typion[ion], gf, excl,
@@ -11047,26 +11093,26 @@ def iniblh():
         # END DO
     # END DO
 
-    # 601 FORMAT（见上）
+    # 601 FORMAT (see above)
     return
-# chunk09: synspec54.f 行 9867–11047 的逐行直译
-# 包含: NLTSET, PHTION, NLTE, LINOP, LINOPW, PROFIL, GRIEM, GAMHE, EPS, XK2DOP
+# chunk09: line-by-line literal translation of synspec54.f lines 9867-11047
+# includes: NLTSET, PHTION, NLTE, LINOP, LINOPW, PROFIL, GRIEM, GAMHE, EPS, XK2DOP
 
 
 def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
            isql, ilql, ipql, isqu, ilqu, ipqu, ieven, innlt0, ilmatch):
     """NLTE option -  automatic assignement of level indices
 
-    对应 synspec54.f 行 9867–10269。
-    标量哑元 IEVEN/INNLT0/ILMATCH 在体内被赋值, 按约定 return 全部 18 个
-    标量哑元(按哑元声明顺序), 调用点须解包接收。
+    Corresponds to synspec54.f lines 9867-10269.
+    Scalar dummies IEVEN/INNLT0/ILMATCH are assigned in the body; by
+    convention return all 18 scalar dummies (in dummy declaration order); the caller must unpack them.
     """
     # PARAMETER (MNION = MIOEX, MNLEV = MLEVEL, ECONST= 5.03411142E15)
     # PARAMETER (INLLEV = 13)
     econst = 5.03411142e15
     inllev = 13
     # character*2 typin(60)
-    # DATA typin /' 1',' 2',' 3',...,'60'/  (DATA 后不再修改)
+    # DATA typin /' 1',' 2',' 3',...,'60'/  (not modified after DATA)
     typin = [''] + [(' ' + str(k)) if k < 10 else str(k) for k in range(1, 61)]
 
     # +++++++++++++++++++++++++++
@@ -11079,7 +11125,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
         try:
             C.NNION = int(read_line(inllev).split()[0])
         except (EOFError, ValueError, IndexError):
-            _end55 = True            # END=55 / ERR=55 → 转到标号 55
+            _end55 = True            # END=55 / ERR=55 → branch to label 55
         # IF(NNION.LE.0) GO TO 55
         if not _end55 and C.NNION > 0:
             for i in range(1, C.NNION + 1):
@@ -11112,7 +11158,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                             indion = ionex
                     if indion <= 0:
                         quit(' INCONSISTENCY IN UNIT 13 INPUT - NLTE')
-                    noff = C.NFIRST[indion] - 1   # 赋值后未再使用
+                    noff = C.NFIRST[indion] - 1   # not used after assignment
                     ine = 1
                     ino = 1
                     for ii in range(C.NFIRST[indion], C.NLAST[indion] + 1):
@@ -11122,7 +11168,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                         iev = 0
                         if feq(typ1, 'even'):
                             iev = 1
-                        ind = 0   # TODO(port): Fortran 未初始化 IND, 且之后未使用(死变量)
+                        ind = 0   # TODO(port): IND uninitialized in Fortran and unused afterwards (dead variable)
                         for k in range(1, 61):
                             if feq(typin[k], typ2):
                                 ind = k
@@ -11180,7 +11226,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                     else:
                         C.ELIML[indion, i] = eion * econst
                 C.INDLV[indion, i] = ii
-        # 90 CONTINUE 循环结束
+        # 90 CONTINUE end of loop
         C.NNION = indion
 
         # Header for the table with the level assignments
@@ -11213,13 +11259,13 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                 isql, ilql, ipql, isqu, ilqu, ipqu, ieven, innlt0, ilmatch)
     if C.NEVEN[inion] == 0:
         ieven = 2
-    # TODO(port): Fortran 局部变量跨调用静态保留; 个别路径下 ILWN/IUN 未赋值
-    # 即被使用(如无匹配时 GO TO 145/200 跳过后续), 这里统一先初始化为 0
+    # TODO(port): Fortran locals persist statically across calls; on some
+    # paths ILWN/IUN are used unassigned (e.g. GO TO 145/200 on no match skips their search); initialize both to 0 here
     ilwn = 0
     iun = 0
     inmatchl = 0
     inmatchu = 0
-    # IF(NEVEN(INION).LT.0) GOTO 400 → 整个 IEVEN 分支块仅当 NEVEN>=0 执行
+    # IF(NEVEN(INION).LT.0) GOTO 400 → the whole IEVEN branch block runs only for NEVEN>=0
     if C.NEVEN[inion] >= 0:
 
         if ieven == 1:
@@ -11232,7 +11278,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                     break                               # GO TO 120
             if not _found:
                 ilwn = 0
-                # GO TO 145 → 跳过 IUN 的搜索
+                # GO TO 145 → skip the IUN search
             else:
                 # 120 CONTINUE
                 ilwn = C.INDEV[inion, ind]
@@ -11261,7 +11307,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                     break                               # GO TO 160
             if not _found:
                 ilwn = 0
-                # GO TO 200 → 跳过 IUN 的搜索
+                # GO TO 200 → skip the IUN search
             else:
                 # 160 CONTINUE
                 ilwn = C.INDOD[inion, ind]
@@ -11296,7 +11342,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                 if not _found:
                     ilwn = 0
                     iun = 0
-                    # GO TO 300 → 跳过 IUN 的搜索
+                    # GO TO 300 → skip the IUN search
                 else:
                     # 220 CONTINUE
                     ilwn = C.INDLV[inion, ind]
@@ -11332,7 +11378,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                                   and ilql <= C.LQUANT2[_lv]) or ilql == -1)):
                         ind = j
                         inmatchl += 1
-                        # GO TO 320(原代码中被注释掉)
+                        # GO TO 320 (commented out in the original code)
                 if inmatchl > 1:
                     # FORMAT '(A55,1X,F12.4)'
                     write_line(11, ' NLTSET: WARNING-- multiple matches for '
@@ -11354,7 +11400,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                                       and ilqu <= C.LQUANT2[_lv]) or ilqu == -1)):
                             ind = j
                             inmatchu += 1
-                            # GO TO 340(原代码中被注释掉)
+                            # GO TO 340 (commented out in the original code)
                     if inmatchu > 1:
                         # FORMAT '(A55,1X,F12.4)'
                         write_line(11, ' NLTSET: WARNING-- multiple matches for '
@@ -11367,7 +11413,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
                 else:
                     ilwn = 0
                     iun = 0
-                    # GO TO 350 → 跳过上限搜索
+                    # GO TO 350 → skip the upper-level search
                 # 350 CONTINUE
 
                 if inmatchl == 0 or inmatchu == 0:
@@ -11440,7 +11486,7 @@ def nltset(mode, il, iat, ion, alam0, excl, excu, ql, qu,
             C.INDNLT[il] = -1
     else:
         C.INDNLT[il] = -1
-    # BNUL(IL)=real(BN*(FREQ0(IL)*1.E-15)**3) —— real 即 SNGL → float
+    # BNUL(IL)=real(BN*(FREQ0(IL)*1.E-15)**3) -- real is SNGL → float
     C.BNUL[il] = float(BN * (C.FREQ0[il] * 1.e-15) ** 3)
     C.ILOWN[il] = ilwn
     C.IUPN[il] = iun
@@ -11452,12 +11498,12 @@ def phtion(id, abso, emis, fre, nfre):
     """Opacity due to detailed photoionization (read from tables by
     routine READPH)
 
-    对应 synspec54.f 行 10276–10321。
-    标量哑元 ID/NFRE 不被修改, 数组 ABSO/EMIS 就地累加, 无返回值。
+    Corresponds to synspec54.f lines 10276-10321.
+    Scalar dummies ID/NFRE are not modified; arrays ABSO/EMIS are accumulated in place; no return value.
     """
     # PARAMETER (C3=1.4387886)
     c3 = 1.4387886
-    # DIMENSION PLANF(MFRQ),STIMU(MFRQ) —— 局部数组, 1 基索引
+    # DIMENSION PLANF(MFRQ),STIMU(MFRQ) -- local arrays, 1-based indexing
     planf = np.zeros(MFRQ + 1)
     stimu = np.zeros(MFRQ + 1)
 
@@ -11475,7 +11521,7 @@ def phtion(id, abso, emis, fre, nfre):
     # 10 CONTINUE
     for i in range(1, C.NPHT + 1):           # DO 30
         if C.JPHT[i] <= 0:
-            iat = int(C.APHT[i])             # Fortran INT, 向零截断
+            iat = int(C.APHT[i])             # Fortran INT, truncation toward zero
             x = (C.APHT[i] - float(iat) + 1.e-4) * 1.e2
             ion = int(x) + 1
             pop = C.RRR[id, ion, iat] * C.GPHT[i] * math.exp(-C.EPHT[i] * c3 / t)
@@ -11493,8 +11539,8 @@ def phtion(id, abso, emis, fre, nfre):
 def nlte(il, ilw, iun, gi, gj):
     """Control procedure for the NLTE option
 
-    对应 synspec54.f 行 10327–10421。
-    标量哑元均不被修改, 无返回值。
+    Corresponds to synspec54.f lines 10327-10421.
+    No scalar dummies are modified; no return value.
     """
     # PARAMETER (UN=1., C3=1.4387886, XET=8067.6, XET3=XET*C3)
     un = 1.
@@ -11510,7 +11556,7 @@ def nlte(il, ilw, iun, gi, gj):
     ilnlt = C.INDNLT[il]
     if ilnlt <= 0:
         return
-    iat = idiv(C.INDAT[il], 100)             # Fortran 整数除法
+    iat = idiv(C.INDAT[il], 100)             # Fortran integer division
     ion = imod(C.INDAT[il], 100)
     egf = math.exp(C.GF0[il])
     bnu = BN * (C.FREQ0[il] * 1.e-15) ** 3
@@ -11522,7 +11568,7 @@ def nlte(il, ilw, iun, gi, gj):
         # line is a transition between explicit levels of the
         # input model
 
-        nki = C.NNEXT[C.IEL[ilw]]            # 赋值后未再使用
+        nki = C.NNEXT[C.IEL[ilw]]            # not used after assignment
         for id in range(1, C.ND + 1):        # DO 60
             t = C.TEMP[id]
             cor = 1.
@@ -11559,7 +11605,7 @@ def nlte(il, ilw, iun, gi, gj):
     # 100 CONTINUE
     almil = 2.997925e17 / C.FREQ0[il]
     hkf = HK * C.FREQ0[il]
-    tau = 0.     # TODO(port): TAU 在 ID=1 分支内被赋值后累加; 初始化仅为防御
+    tau = 0.     # TODO(port): TAU is assigned in the ID=1 branch and then accumulated; the initialization is defensive only
     abm = 0.
     for id in range(1, C.ND + 1):            # DO 110
         t = C.TEMP[id]
@@ -11590,8 +11636,8 @@ def nlte(il, ilw, iun, gi, gj):
 def linop(id, ablin, emlin, avab):
     """TOTAL LINE OPACITY (ABLIN)  AND EMISSIVITY (EMLIN)
 
-    对应 synspec54.f 行 10427–10584。
-    标量哑元 ID/AVAB 不被修改, 数组 ABLIN/EMLIN 就地累加, 无返回值。
+    Corresponds to synspec54.f lines 10427-10584.
+    Scalar dummies ID/AVAB are not modified; arrays ABLIN/EMLIN are accumulated in place; no return value.
     """
     # PARAMETER (UN=1., EXT0=3.17, TEN=10., C3=1.4387886, XET=8067.6,
     #            XET3=XET*C3)
@@ -11601,7 +11647,7 @@ def linop(id, ablin, emlin, avab):
     c3 = 1.4387886
     xet = 8067.6
     xet3 = xet * c3
-    # DIMENSION ABLINN(MFREQ) —— 局部数组, 1 基索引
+    # DIMENSION ABLINN(MFREQ) -- local array, 1-based indexing
     ablinn = np.zeros(MFREQ + 1)
 
     for ij in range(1, C.NFREQ + 1):         # DO 10
@@ -11619,7 +11665,7 @@ def linop(id, ablin, emlin, avab):
     for i in range(1, C.NLIN + 1):           # DO 100
         il = C.INDLIN[i]
         innlt = C.INDNLT[il]
-        iat = idiv(C.INDAT[il], 100)         # Fortran 整数除法
+        iat = idiv(C.INDAT[il], 100)         # Fortran integer division
         ion = imod(C.INDAT[il], 100)
         lpr = True
         isp = C.ISPRF[il]
@@ -11627,11 +11673,11 @@ def linop(id, ablin, emlin, avab):
             lpr = False
         if isp >= 6:
             continue                         # GO TO 100
-        agam = 0.                            # PROFIL 会重写 AGAM, 先给初值
+        agam = 0.                            # PROFIL overwrites AGAM; give an initial value first
         il, iat, id, agam = profil(il, iat, id, agam)
         dop1 = C.DOPA1[iat, id]
         fr0 = C.FREQ0[il]
-        sl0 = 0.   # TODO(port): NLTE 分支才用; Fortran 中此处亦可能未定义
+        sl0 = 0.   # TODO(port): used only in the NLTE branch; may also be undefined here in Fortran
         if innlt == 0:
             ab0 = (math.exp(C.GF0[il] - C.EXCL0[il] * tem1)
                    * C.RRR[id, ion, iat] * dop1 * C.STIM[id])
@@ -11733,7 +11779,7 @@ def linop(id, ablin, emlin, avab):
 
     if C.NSP == 0:
         return
-    for iis in range(1, C.NSP + 1):          # DO 120 (IS 改名 iis, 避开关键字)
+    for iis in range(1, C.NSP + 1):          # DO 120 (IS renamed iis to avoid a keyword)
         isp = C.ISP0[iis]
         if isp >= 6 and isp <= 24:
             phe2(isp, id, ablin, emlin)
@@ -11746,8 +11792,8 @@ def linopw(id, ablin, emlin):
     """TOTAL LINE OPACITY (ABLIN)  AND EMISSIVITY (EMLIN)
     (a variant for winds)
 
-    对应 synspec54.f 行 10590–10830。
-    标量哑元 ID 不被修改, 数组 ABLIN/EMLIN 就地累加, 无返回值。
+    Corresponds to synspec54.f lines 10590-10830.
+    Scalar dummy ID is not modified; arrays ABLIN/EMLIN are accumulated in place; no return value.
     """
     # PARAMETER (UN=1., EXT0=3.17, TEN=10., C3=1.4387886, XET=8067.6,
     #            XET3=XET*C3)
@@ -11757,7 +11803,7 @@ def linopw(id, ablin, emlin):
     c3 = 1.4387886
     xet = 8067.6
     xet3 = xet * c3
-    # DIMENSION ABLINN(MFREQ) —— 局部数组, 1 基索引
+    # DIMENSION ABLINN(MFREQ) -- local array, 1-based indexing
     ablinn = np.zeros(MFREQ + 1)
 
     for ij in range(1, C.NFREQ + 1):         # DO 10
@@ -11766,8 +11812,8 @@ def linopw(id, ablin, emlin):
         emlin[ij] = 0.
     # 10 CONTINUE
     C.WDIL[id] = 1.
-    plw = C.PLAN[id] * C.WDIL[id]            # 赋值后未再使用
-    # plw=xjcon(id)(原代码中被注释掉)
+    plw = C.PLAN[id] * C.WDIL[id]            # not used after assignment
+    # plw=xjcon(id) (commented out in the original code)
 
     if C.NLIN == 0:
         return
@@ -11779,7 +11825,7 @@ def linopw(id, ablin, emlin):
     xx = C.FREQ[C.NOPAC] - C.FREQ[1]
     C.DFRCON = C.NOPAC - 1
     C.DFRCON = -C.DFRCON / xx
-    ifrcon = int(C.DFRCON)                   # 赋值后未再使用
+    ifrcon = int(C.DFRCON)                   # not used after assignment
     for i in range(1, C.NLIN + 1):           # DO 100
         il = C.INDLIN[i]
         innlt = C.INDNLT[il]
@@ -11799,15 +11845,15 @@ def linopw(id, ablin, emlin):
 
             fr0 = C.FREQ0[il]
             xjc = 3. + C.DFRCON * (C.FREQ[1] - fr0)
-            ijc = int(xjc)                   # Fortran INT, 向零截断
+            ijc = int(xjc)                   # Fortran INT, truncation toward zero
             C.IJCNTR[i] = ijc
             if ijc <= 1 or ijc >= C.NOPAC:
-                pass                         # GO TO 255 → 跳过中心频率细化
+                pass                         # GO TO 255 → skip the central-frequency refinement
             else:
                 if fr0 < C.FREQ[ijc]:
                     ijc0 = ijc
                     dfr0 = C.FREQ[ijc0] - fr0
-                    while True:              # 标号 252 的 GO TO 循环
+                    while True:              # GO TO loop of label 252
                         ijc0 += 1
                         dfr = abs(C.FREQ[ijc0] - fr0)
                         if dfr < dfr0:
@@ -11819,7 +11865,7 @@ def linopw(id, ablin, emlin):
                 elif fr0 > C.FREQ[ijc]:
                     ijc0 = ijc
                     dfr0 = fr0 - C.FREQ[ijc0]
-                    while True:              # 标号 254 的 GO TO 循环
+                    while True:              # GO TO loop of label 254
                         ijc0 -= 1
                         dfr = abs(C.FREQ[ijc0] - fr0)
                         if dfr < dfr0:
@@ -11830,9 +11876,9 @@ def linopw(id, ablin, emlin):
                         break
                 C.IJCNTR[i] = ijc
             # 255 continue
-            # write(80,*) i,ijcntr(i),2.997925e18/freq0(il)(原代码中被注释掉)
+            # write(80,*) i,ijcntr(i),2.997925e18/freq0(il) (commented out in the original code)
 
-        iat = idiv(C.INDAT[il], 100)         # Fortran 整数除法
+        iat = idiv(C.INDAT[il], 100)         # Fortran integer division
         ion = imod(C.INDAT[il], 100)
         fr0 = C.FREQ0[il]
         lpr = True
@@ -11841,11 +11887,11 @@ def linopw(id, ablin, emlin):
             lpr = False
         if isp >= 6:
             continue                         # GO TO 100
-        agam = 0.                            # PROFIL 会重写 AGAM, 先给初值
+        agam = 0.                            # PROFIL overwrites AGAM; give an initial value first
         il, iat, id, agam = profil(il, iat, id, agam)
         dop1 = C.DOPA1[iat, id] / fr0
         fr0 = C.FREQ0[il]
-        sl0 = 0.   # TODO(port): 部分路径才赋值; Fortran 中此处亦可能未定义
+        sl0 = 0.   # TODO(port): assigned only on some paths; may also be undefined here in Fortran
         if innlt == 0:
             if C.itrad <= 0:
                 ab0 = (math.exp(C.GF0[il] - C.EXCL0[il] * tem1)
@@ -11896,14 +11942,14 @@ def linopw(id, ablin, emlin):
         # set up limiting frequencies where the line I is supposed to
         # contribute to the opacity
 
-        # if(ifwin.le.0) then(原代码中被注释掉)
+        # if(ifwin.le.0) then (commented out in the original code)
         avabw = C.ABSTDW[C.IJCONT[il], id] * C.RELOP
         ex0 = ab0 / avabw * agam
         ext = ext0
         if ex0 > ten:
             ext = math.sqrt(ex0)
         ext = ext / dop1
-        ijext = int((C.DFRCON * ext) + 1.5)  # Fortran INT, 向零截断
+        ijext = int((C.DFRCON * ext) + 1.5)  # Fortran INT, truncation toward zero
         ij1 = max(C.IJCNTR[i] - ijext, 1)
         ij2 = min(C.IJCNTR[i] + ijext, C.NFREQ)
         if ij1 >= C.NFREQ or ij2 <= 2:
@@ -11911,7 +11957,7 @@ def linopw(id, ablin, emlin):
         # else
         # ij1=3
         # ij2=nfreq
-        # end if(以上四行为原代码中的注释)
+        # end if (the four lines above are comments in the original code)
 
         if innlt == 0 and C.itrad <= 0:
 
@@ -11944,7 +11990,7 @@ def linopw(id, ablin, emlin):
                     abl = ab0 * voigtk(agam, xf)
                     ablinn[ij] += abl
                     if C.ilne[id] > 0:
-                        continue             # GO TO 80 → 跳过发射项
+                        continue             # GO TO 80 → skip the emission term
                     emlin[ij] += abl * sl0
 
             else:
@@ -11954,7 +12000,7 @@ def linopw(id, ablin, emlin):
                     abl = ab0 * phe1(id, fr, isp - 1)
                     ablinn[ij] += abl
                     if C.ilne[id] > 0:
-                        continue             # GO TO 90 → 跳过发射项
+                        continue             # GO TO 90 → skip the emission term
                     emlin[ij] += abl * sl0
     # 100 CONTINUE
 
@@ -11979,13 +12025,13 @@ def linopw(id, ablin, emlin):
 
 
 def profil(il, iat, id, agam):
-    """对应 synspec54.f 行 10836–10889。
-    (原 Fortran 无头部注释, 仅 SUBROUTINE PROFIL(IL,IAT,ID,AGAM))
-    标量哑元 AGAM 在体内被赋值, 按约定 return 全部 4 个标量哑元。
+    """Corresponds to synspec54.f lines 10836-10889.
+    (the original Fortran has no header comment, only SUBROUTINE PROFIL(IL,IAT,ID,AGAM))
+    Scalar dummy AGAM is assigned in the body; by convention return all 4 scalar dummies.
     """
     # PARAMETER (PI4=7.95774715E-2)
     pi4 = 7.95774715e-2
-    # DIMENSION WGR(4) —— 局部数组, 1 基索引
+    # DIMENSION WGR(4) -- local array, 1-based indexing
     wgr = np.zeros(5)
 
     iprf = C.IPRF0[il]
@@ -12005,7 +12051,7 @@ def profil(il, iat, id, agam):
 
     elif iprf > 0:
         anp = C.POPUL[C.NKH, id]
-        gam = 0.                             # GAMHE 会重写 GAM, 先给初值
+        gam = 0.                             # GAMHE overwrites GAM; give an initial value first
         iprf, t, ane, anp, id, gam = gamhe(iprf, t, ane, anp, id, gam)
         agam = agam + gam
 
@@ -12016,7 +12062,7 @@ def profil(il, iat, id, agam):
             wgr[i] = C.WGR0[i, C.IGRIEM[il]]
         fr = C.FREQ0[il]
         ion = imod(C.INDAT[il], 100)
-        gam = 0.                             # GRIEM 会重写 GAM, 先给初值
+        gam = 0.                             # GRIEM overwrites GAM; give an initial value first
         id, t, ane, ion, fr, gam = griem(id, t, ane, ion, fr, wgr, gam)
         agam = agam + gam
 
@@ -12039,9 +12085,9 @@ def griem(id, t, ane, ion, fr, wgr, gam):
     OF STARK WIDTHS FOR  T=5000, 10000, 20000, 40000 K,
     AND FOR  NE=1.E16 (FOR NEUTRALS)  OR  NE = 1.E17 (FOR IONS)
 
-    对应 synspec54.f 行 10893–10910。
-    标量哑元 GAM 在体内被赋值, 按约定 return 全部 6 个标量哑元
-    (WGR 为数组哑元, 就地使用不返回)。
+    Corresponds to synspec54.f lines 10893-10910.
+    Scalar dummy GAM is assigned in the body; by convention return all 6
+    scalar dummies (WGR is an array dummy, used in place, not returned).
     """
     if t <= 0.:
         return id, t, ane, ion, fr, gam
@@ -12060,13 +12106,13 @@ def gamhe(ind, t, ane, anp, id, gam):
     AFTER DIMITRIJEVIC AND SAHAL-BRECHOT, 1984, J.Q.S.R.T. 31, 301
     OR FREUDENSTEIN AND COOPER, 1978, AP.J. 224, 1079  (FOR C(IND).GT.0)
 
-    对应 synspec54.f 行 10914–10982。
-    标量哑元 GAM 在体内被赋值, 按约定 return 全部 6 个标量哑元。
+    Corresponds to synspec54.f lines 10914-10982.
+    Scalar dummy GAM is assigned in the body; by convention return all 6 scalar dummies.
     """
     # DIMENSION W(5,20),V(4,20),C(20)
-    # DATA 初始化且之后不再修改 → 函数顶部直接赋值; Fortran DATA 按列优先
-    # 填充, 故用 reshape(..., order='F') 后嵌入 1 基索引数组。
-    # 局部数组 C 改名 c, 避免遮蔽 commons 别名 C。
+    # DATA-initialized and never modified afterwards → assign directly at the
+    # function top; Fortran DATA fills column-major, so use reshape(..., order='F')
+    # and embed into 1-based arrays. Local array C renamed c to avoid shadowing the commons alias C.
 
     #   ELECTRONS T= 5000   10000   20000   40000     LAMBDA
     # DATA W / ...
@@ -12148,10 +12194,10 @@ def eps(t, ane, alam, ion, n):
     """NLTE PARAMETER EPSILON (COLLISIONAL/SPONTANEOUS DEEXCITATION)
     AFTER  KASTNER, 1981, J.Q.S.R.T. 26, 377
 
-    对应 synspec54.f 行 10986–11008。
-    标量哑元均不被修改, 返回函数值。
+    Corresponds to synspec54.f lines 10986-11008.
+    No scalar dummies are modified; returns the function value.
     """
-    # DATA CK0,CK1 /7.75E-8, 2.58E-8/  (DATA 后不再修改)
+    # DATA CK0,CK1 /7.75E-8, 2.58E-8/  (not modified after DATA)
     ck0 = 7.75e-8
     ck1 = 2.58e-8
     x = 1.438e8 / alam / t
@@ -12161,7 +12207,7 @@ def eps(t, ane, alam, ion, n):
     a = 4.36e7 * xkt * xkt / (1. - math.exp(-x))
     # IF(ION.EQ.1) GO TO 10
     if ion == 1:
-        # 10  (局部变量 C 改名 c, 避免遮蔽 commons 别名 C)
+        # 10  (local variable C renamed c to avoid shadowing the commons alias C)
         c = 2.16 / t / math.sqrt(t) / x ** 1.68 * ane
     else:
         b = 1.1 + math.log(t1 / tt) - 0.4 / t1 / t1
@@ -12178,10 +12224,10 @@ def xk2dop(tau):
     """KERNEL FUNCTION K2  (AUXILIARY PROCEDURE TO NLTE)
     AFTER  HUMMER,  1981, J.Q.S.R.T. 26, 187
 
-    对应 synspec54.f 行 11012–11044。
-    标量哑元 TAU 不被修改, 返回函数值。
+    Corresponds to synspec54.f lines 11012-11044.
+    Scalar dummy TAU is not modified; returns the function value.
     """
-    # DATA 常数(之后不再修改)
+    # DATA constants (not modified afterwards)
     pi2sq = 2.506628275
     pisq = 1.772453851
     a0, a1, a2, a3, a4 = (1.0, -1.117897000e-1, -1.249099917e-1,
@@ -12208,9 +12254,9 @@ def xk2dop(tau):
     val = tau / pi2sq * math.log(tau / pisq) + p / q
     return val
 # -*- coding: utf-8 -*-
-# chunk10: synspec54.f 行 11048–12332 的逐行直译
-# 覆盖子程序: INKUR, INPMOD, INPBF, LEVSOL, CHANGE, RATMAT, SABOLF,
-#             SBFHMI_old, OPADD, WN, WNSTOR, (TIMING 注释块), QUIT, VOIGTE, SIGAVS
+# chunk10: line-by-line literal translation of synspec54.f lines 11048-12332
+# covers subroutines: INKUR, INPMOD, INPBF, LEVSOL, CHANGE, RATMAT, SABOLF,
+#             SBFHMI_old, OPADD, WN, WNSTOR, (TIMING comment block), QUIT, VOIGTE, SIGAVS
 
 
 def inkur():
@@ -12227,23 +12273,23 @@ def inkur():
     C      P       - gass pressure
     C      ANE     - electron density
     C
-    对应 synspec54.f 行 11048–11112
+    Corresponds to synspec54.f lines 11048-11112
     """
     # DIMENSION POP(MLEVEL),ES(MLEVEL,MLEVEL),BS(MLEVEL),POPLTE(MLEVEL)
-    # COMMON POP,ES,BS   → C.POP, C.ES, C.BS（POP 本例程未用到）
-    poplte = np.zeros(MLEVEL + 1)          # POPLTE 为纯局部数组
+    # COMMON POP,ES,BS   → C.POP, C.ES, C.BS (POP not used in this routine)
+    poplte = np.zeros(MLEVEL + 1)          # POPLTE is a purely local array
     # READ(8,501) TEF,GRAV
     #  501 FORMAT(4X,F8.0,9X,F8.5)
     _line = read_line(8)
-    tef = float(_line[4:12])               # 4X,F8.0（TEF 仅用于输出，局部量）
+    tef = float(_line[4:12])               # 4X,F8.0 (TEF only used for output; local quantity)
     C.GRAV = float(_line[21:29])           # 9X,F8.5
     # READ(8,502) ND
     #  502 FORMAT(/////////////////////10X,I3/)
-    for _i in range(21):                   # 21 个 '/' ：跳过 21 条记录
+    for _i in range(21):                   # 21 '/' characters: skip 21 records
         read_line(8)
     _line = read_line(8)
     C.ND = int(_line[10:13])               # 10X,I3
-    read_line(8)                           # 格式末尾的 '/' ：再多跳过一条记录
+    read_line(8)                           # trailing '/' in the format: skip one more record
     C.ND = C.ND - 1                        # ND=ND-1
     # WRITE(6,600) TEF,GRAV
     #  600 FORMAT(' INPUT KURUCZ MODEL FOR TEFF=',F7.0,'   LOG G =',
@@ -12255,7 +12301,7 @@ def inkur():
     print("-----------------------------------------------")
     print()
     for id in range(1, C.ND + 1):                       # DO 10 ID=1,ND
-        # READ(8,*) DM(ID),TEMP(ID),P,ELEC(ID)（自由格式）
+        # READ(8,*) DM(ID),TEMP(ID),P,ELEC(ID) (free format)
         _t = read_line(8).replace(',', ' ').split()
         C.DM[id] = float(_t[0])
         C.TEMP[id] = float(_t[1])
@@ -12269,16 +12315,16 @@ def inkur():
               f"{C.ELEC[id]:12.3e}{C.DENS[id]:12.3e}")
         t = C.TEMP[id]
         if C.IFMOL > 0 and t < C.TMOLIM:
-            # AN=TOTN(ID)（原注释行）
+            # AN=TOTN(ID) (original comment line)
             aein = C.ELEC[id]
-            # CALL MOLEQ(ID,T,AN,AEIN,ANE,1)；MOLEQ 给标量哑元 ANE 赋值，
-            # 按约定返回全部标量哑元；字面量 1 用临时变量 _ipri 接收
+            # CALL MOLEQ(ID,T,AN,AEIN,ANE,1); MOLEQ assigns scalar dummy ANE,
+            # so by convention return all scalar dummies; the literal 1 is received via temp _ipri
             id, t, an, aein, ane, _ipri = moleq(id, t, an, aein, ane, 1)
         else:
             for iat in range(1, C.NATOM + 1):            # DO IAT=1,NATOM
                 C.ATTOT[iat, id] = (C.DENS[id] / C.WMM[id] / C.YTOT[id]
                                     * C.ABUND[iat, id])
-        # WRITE(6,601) ...（原注释行，略）
+        # WRITE(6,601) ... (original comment line, omitted)
         wnstor(id)                                       # CALL WNSTOR(ID)
         sabolf(id)                                       # CALL SABOLF(ID)
         ratmat(id, C.ES, C.BS)                           # CALL RATMAT(ID,ES,BS)
@@ -12286,7 +12332,7 @@ def inkur():
         for j in range(1, C.NLEVEL + 1):                 # DO J=1,NLEVEL
             C.POPUL[j, id] = poplte[j]
     # 10 CONTINUE
-    # WRITE(77,503) ND, 3 / WRITE(77,504) (DM(ID),ID=1,ND)（原注释行，略）
+    # WRITE(77,503) ND, 3 / WRITE(77,504) (DM(ID),ID=1,ND) (original comment lines, omitted)
     for id in range(1, C.ND + 1):                        # DO ID=1,ND
         # WRITE(77,504) TEMP(ID),ELEC(ID),DENS(ID)
         #  504 FORMAT(1P6E13.6)
@@ -12328,13 +12374,13 @@ def inpmod():
     C            = 0  -  no interpolation, i.e. scale DEPTH coincides with DM
     C            > 0  -  polynomial interpolation of the (INTRPL-1)th order
     C
-    对应 synspec54.f 行 11118–11277
+    Corresponds to synspec54.f lines 11118-11277
     """
     # PARAMETER (MINPUT=MLEVEL+4)
-    # 无名 COMMON 的 ESEMAT,BESE,POPLTE,POPUL0,X,TEMP0,ELEC0,DENS0,PPL0,
-    # PPL,DEPTH,DM0,DP 以及 /NLTPOP/PNLT、/quasex/iexpl,iltot → C.* 访问
-    totn = np.zeros(MDEPTH + 1)                          # TOTN(MDEPTH) 局部
-    plte = np.zeros((MLEVEL + 1, MDEPTH + 1))            # PLTE(MLEVEL,MDEPTH) 局部
+    # ESEMAT,BESE,POPLTE,POPUL0,X,TEMP0,ELEC0,DENS0,PPL0,
+    # PPL,DEPTH,DM0,DP of the blank COMMON, plus /NLTPOP/PNLT and /quasex/iexpl,iltot → accessed as C.*
+    totn = np.zeros(MDEPTH + 1)                          # TOTN(MDEPTH) local
+    plte = np.zeros((MLEVEL + 1, MDEPTH + 1))            # PLTE(MLEVEL,MDEPTH) local
     numlt = 3
     if C.INMOD == 2:
         numlt = 4
@@ -12342,7 +12388,7 @@ def inpmod():
     _t = read_line(8).replace(',', ' ').split()
     ndpth = int(_t[0])
     numpar = int(_t[1])
-    # READ(8,*) (DEPTH(I),I=1,NDPTH)（自由格式，可能跨多条记录）
+    # READ(8,*) (DEPTH(I),I=1,NDPTH) (free format, may span multiple records)
     _vals = []
     while len(_vals) < ndpth:
         _vals += read_line(8).replace(',', ' ').split()
@@ -12380,8 +12426,8 @@ def inpmod():
             ipri = 1
             aein = C.ELEC[id]
             an = totn[id]
-            # CALL MOLEQ(ID,T,AN,AEIN,ANE,IPRI)；MOLEQ 给 ANE 赋值，
-            # 按约定返回全部标量哑元
+            # CALL MOLEQ(ID,T,AN,AEIN,ANE,IPRI); MOLEQ assigns ANE,
+            # so by convention return all scalar dummies
             id, t, an, aein, ane, ipri = moleq(id, t, an, aein, ane, ipri)
         else:
             if C.IMODE > -2:
@@ -12399,7 +12445,7 @@ def inpmod():
         for i in range(1, nlev0 + 1):                    # DO I=1,NLEV0
             C.POPUL[i, id] = C.POPLTE[i]
             plte[i, id] = C.POPLTE[i]
-            # if(id.eq.1) write(6,651) ...（原注释行，略）
+            # if(id.eq.1) write(6,651) ... (original comment line, omitted)
         # if the input file fort.8 contains also NLTE level populations
         # of b-factors, replace the LTE populations by those
         if nump > ip:
@@ -12407,9 +12453,9 @@ def inpmod():
             for i in range(1, nlev0 + 1):
                 j = C.iltot[i]
                 C.POPUL[j, id] = C.X[ip + i] * C.RELAB[C.IATM[i], id]
-                # if(id.eq.1) write(6,651) ...（原注释行，略）
+                # if(id.eq.1) write(6,651) ... (original comment line, omitted)
                 #  651 format('in',2i4,1p2e12.4)
-            # （原注释掉的负占据数修补循环，略）
+            # (original commented-out negative-population fix-up loop, omitted)
             # in the case the input "NLTE populations are in fact b-factors,
             # compute the real populations
             if C.IBFAC == 1:
@@ -12445,18 +12491,18 @@ def inpmod():
                 C.PNLT[iat, ion, id] = C.POPUL[nki, id] / C.G[nki] * bcon
     # 100 CONTINUE
     # check abundances
-    # CALL CHCKAB（原注释行，略）
+    # CALL CHCKAB (original comment line, omitted)
     return
 
 
 def inpbf():
     """C     ================
     C
-    对应 synspec54.f 行 11284–11318
+    Corresponds to synspec54.f lines 11284-11318
     """
     # PARAMETER (MINPUT=MLEVEL+4)
     # DIMENSION DEPTH(MDEPTH),X(MINPUT,MDEPTH),XX(MDEPTH),BF(MDEPTH)
-    # 注意：此处的 DEPTH/X 是本例程纯局部数组（不在 COMMON 中）
+    # Note: DEPTH/X here are purely local arrays of this routine (not in COMMON)
     minput = MLEVEL + 4
     depth = np.zeros(MDEPTH + 1)
     x = np.zeros((minput + 1, MDEPTH + 1))
@@ -12470,7 +12516,7 @@ def inpbf():
     _t = read_line(8).replace(',', ' ').split()
     ndpth = int(_t[0])
     numpar = int(_t[1])
-    # READ(8,*) (DEPTH(I),I=1,NDPTH)（自由格式，可能跨多条记录）
+    # READ(8,*) (DEPTH(I),I=1,NDPTH) (free format, may span multiple records)
     _vals = []
     while len(_vals) < ndpth:
         _vals += read_line(8).replace(',', ' ').split()
@@ -12493,7 +12539,7 @@ def inpbf():
         for id in range(1, ndpth + 1):
             xx[id] = x[i, id]
         # CALL INTERP(DEPTH,XX,DM,BF,NDPTH,ND,2,1,1)
-        # INTERP 只修改数组哑元（含 ILOGX=1 时对 DEPTH/DM 就地取 LOG10）
+        # INTERP modifies only array dummies (with ILOGX=1 it takes LOG10 of DEPTH/DM in place)
         interp(depth, xx, C.DM, bf, ndpth, C.ND, 2, 1, 1)
         for id in range(1, C.ND + 1):
             C.POPUL[i - numlt, id] = C.POPUL[i - numlt, id] * bf[id]
@@ -12506,7 +12552,7 @@ def levsol(a, b, popp, nlvcal):
     C     new populations by inverting several partial rate matrices for the
     C     individual chemical species
     C
-    对应 synspec54.f 行 11326–11362
+    Corresponds to synspec54.f lines 11326-11362
     """
     # DIMENSION A(MLEVEL,MLEVEL),B(MLEVEL),POPP(MLEVEL),
     #    AP(MLEVEL,MLEVEL),BP(MLEVEL),POPP1(MLEVEL)
@@ -12531,7 +12577,7 @@ def levsol(a, b, popp, nlvcal):
             for j in range(n1, nk + 1):                  # DO 10 J=N1,NK
                 ap[i - n1 + 1, j - n1 + 1] = a[i, j]
             bp[i - n1 + 1] = b[i]
-        # CALL LINEQS(AP,BP,POPP1,NLP,MLEVEL)；LINEQS 只修改数组哑元
+        # CALL LINEQS(AP,BP,POPP1,NLP,MLEVEL); LINEQS modifies only array dummies
         lineqs(ap, bp, popp1, nlp, MLEVEL)
         for i in range(n1, nk + 1):                      # DO 30 I=N1,NK
             popp[i] = popp1[i - n1 + 1]
@@ -12590,9 +12636,9 @@ def change():
     C      REL     -  population multiplier - see above
     C                 if REL=0, the program sets up REL=1
     C
-    对应 synspec54.f 行 11369–11468
+    Corresponds to synspec54.f lines 11369-11468
     """
-    # 无名 COMMON 的 ESEMAT,BESE,POPLTE,POPUL0,POPULL,POPL → C.* 访问
+    # ESEMAT,BESE,POPLTE,POPUL0,POPULL,POPL of the blank COMMON → accessed as C.*
     s = 2.0706e-16                                       # PARAMETER (S = 2.0706E-16)
     ifese = 0
     for ii in range(1, C.NLEVEL + 1):                    # DO 100 II=1,NLEVEL
@@ -12613,15 +12659,15 @@ def change():
             if iold != 0:                                # IF(IOLD.EQ.0) GO TO 10
                 C.POPUL0[ii, id] = C.POPUL[iold, id]
                 continue                                 # GO TO 90
-            # 标号 10
+            # label 10
             if mode == 0:                                # IF(MODE.NE.0) GO TO 20
                 C.POPUL0[ii, id] = C.POPUL[isiold, id] * rel
                 continue                                 # GO TO 90
-            # 标号 20
+            # label 20
             t = C.TEMP[id]
             ane = C.ELEC[id]
             if mode >= 3:                                # IF(MODE.GE.3) GO TO 40
-                # 标号 40
+                # label 40
                 if ifese == 1:
                     sabolf(id)                           # CALL SABOLF(ID)
                     ratmat(id, C.ESEMAT, C.BESE)         # CALL RATMAT(ID,ESEMAT,BESE)
@@ -12630,21 +12676,21 @@ def change():
                     for iii in range(1, C.NLEVEL + 1):   # DO 50 III=1,NLEVEL
                         C.POPULL[iii, id] = C.POPLTE[iii]
                 C.POPUL0[ii, id] = C.POPULL[ii, id]
-                continue                                 # （落到 90 CONTINUE）
+                continue                                 # (falls through to 90 CONTINUE)
             nxtnew = C.NNEXT[C.IEL[ii]]
             sb = (s / t / math.sqrt(t) * C.G[ii] / C.G[nxtnew]
                   * math.exp(C.ENION[ii] / t / BOLK))
             if mode <= 1:                                # IF(MODE.GT.1) GO TO 30
                 C.POPUL0[ii, id] = sb * ane * C.POPUL[nxtold, id] * rel
                 continue                                 # GO TO 90
-            # 标号 30
+            # label 30
             kk = isinew
             knext = C.NNEXT[C.IEL[kk]]
             sbk = (s / t / math.sqrt(t) * C.G[kk] / C.G[knext]
                    * math.exp(C.ENION[kk] / t / BOLK))
             C.POPUL0[ii, id] = (sb / sbk * C.POPUL[nxtold, id]
                                 / C.POPUL[nxtsio, id] * C.POPUL[isiold, id] * rel)
-            # GO TO 90（continue 隐含）
+            # GO TO 90 (implied by continue)
         # 90 CONTINUE
     # 100 CONTINUE
     for i in range(1, C.NLEVEL + 1):                     # DO 110 I=1,NLEVEL
@@ -12658,7 +12704,7 @@ def ratmat(id, a, b):
     """C
     C     LTE RATE MATRIX  (SAHA-BOLTZMANN EQS. + CHARGE CONSERVATION EQ.)
     C
-    对应 synspec54.f 行 11474–11510
+    Corresponds to synspec54.f lines 11474-11510
     """
     un = 1.0                                             # parameter (un=1.)
     ane = C.ELEC[id]
@@ -12694,9 +12740,9 @@ def sabolf(id):
     C
     C     Input: ID  - depth index
     C
-    对应 synspec54.f 行 11514–11628
+    Corresponds to synspec54.f lines 11514-11628
     """
-    uh = 1.5                                             # PARAMETER (UH=1.5)（原代码未使用）
+    uh = 1.5                                             # PARAMETER (UH=1.5) (unused in the original code)
     cmax = 2.154e4                                       # PARAMETER (CMAX=2.154D4,...)
     ccon = 2.0706e-16
     two = 2.0
@@ -12714,7 +12760,7 @@ def sabolf(id):
     for ion in range(1, C.NION + 1):                     # DO 50 ION=1,NION
         qz = C.IZ[ion]
         cfn = con / C.G[C.NNEXT[ion]]
-        dch = 0.0                                        # DCH=0.（原代码未再使用）
+        dch = 0.0                                        # DCH=0. (not used afterwards in the original code)
         iups = C.IUPSUM[ion]
         ssbf = 0.0
         C.USUM[ion] = 0.0
@@ -12726,9 +12772,9 @@ def sabolf(id):
         for ii in range(C.NFIRST[ion], C.NLAST[ion] + 1):  # DO 10 II=NFIRST(ION),NLAST(ION)
             if C.ifwop[ii] < 0:
                 e = EH * qz * qz / tk
-                sum_l = 0.0                              # SUM（避免遮蔽内建 sum）
+                sum_l = 0.0                              # SUM (renamed to avoid shadowing the builtin sum)
                 for j in range(nl1up, NLMX + 1):         # DO 5 J=nl1up,NLMX
-                    xj = j                               # XJ=J（原代码未再使用）
+                    xj = j                               # XJ=J (not used afterwards in the original code)
                     xi = j * j
                     x = e / xi
                     fi = xi * math.exp(x) * C.WNHINT[j, id]
@@ -12750,8 +12796,8 @@ def sabolf(id):
             # 1. More exact approach - using (exact) partition functions
             iat = C.NUMAT[C.IATM[C.NFIRST[ion]]]
             xmx = xmax * math.sqrt(qz)
-            # CALL PARTF(IAT,IZ(ION),T,ANE,XMX,U)；PARTF 只给标量哑元 U 赋值，
-            # 按约定返回全部标量哑元；C.IZ[ion] 实参用 _izi 临时接收
+            # CALL PARTF(IAT,IZ(ION),T,ANE,XMX,U); PARTF assigns only scalar
+            # dummy U, so by convention return all scalar dummies; the C.IZ[ion] argument is received via temp _izi
             u = 0.0
             iat, _izi, t, ane, xmx, u = partf(iat, C.IZ[ion], t, ane, xmx, u)
             ee = C.ENION[C.NFIRST[ion]] / tk
@@ -12769,7 +12815,7 @@ def sabolf(id):
             #    levels, assumed hydrogenic (ie. their ionization energy and
             #    statistical weight hydrogenic)
             sum_l = 0.0
-            dsum = 0.0                                   # DSUM=0.（原代码未再使用）
+            dsum = 0.0                                   # DSUM=0. (not used afterwards in the original code)
             e = EH * qz * qz / tk
             for j in range(C.NQUANT[C.NLAST[ion]] + 1, iups + 1):  # DO 30 J=...,IUPS
                 xi = j * j
@@ -12800,15 +12846,15 @@ def sbfhmi_old(fr):
     C
     C     Bound-free cross-section for H- (negative hydrogen ion)
     C
-    对应 synspec54.f 行 11634–11655
+    Corresponds to synspec54.f lines 11634-11655
     """
-    sbfhmi = 0.0        # 原代码中对名字 SBFHMI 的赋值（此处为局部变量，死代码，直译保留）
+    sbfhmi = 0.0        # original code assigns to the name SBFHMI (a local variable here; dead code, kept verbatim)
     sbfhmi_old_val = 0.0
     fr0 = 1.8259e14
     if fr < fr0:
         return sbfhmi_old_val
     if fr < 2.111e14:
-        # GO TO 10 分支
+        # GO TO 10 branch
         x = 2.997925e15 * (1.0 / fr0 - 1.0 / fr)
         sbfhmi = ((2.69818e-1 + x * (2.2019e-1 + x * (-4.11288e-2 + x * 2.73236e-3)))
                   * x * 1.0e-17)
@@ -12849,7 +12895,7 @@ def opadd(mode, id, fr, abad, emad, scad):
     C     EMAD  - emission coefficient (at frequency FR and depth ID)
     C     SCAD  - scattering coefficient (at frequency FR and depth ID)
     C
-    对应 synspec54.f 行 11663–11872
+    Corresponds to synspec54.f lines 11663-11872
     """
     frayh = 2.463e15                                     # PARAMETER (FRAYH = 2.463E15, ...)
     frayhe = 5.150e15
@@ -12860,15 +12906,15 @@ def opadd(mode, id, fr, abad, emad, scad):
     abad = 0.0
     emad = 0.0
     scad = 0.0
-    # TODO(port): 原代码中 MODE<0 或 IATH<=0 时 t/ane/anh/anhe/hkt 可能未赋值
-    # （Fortran 依赖静态存储的残留值），此处预置 0.0 以避免 NameError
+    # TODO(port): in the original code t/ane/anh/anhe/hkt may be unassigned
+    # when MODE<0 or IATH<=0 (Fortran relies on stale static-storage values); preset 0.0 here to avoid NameError
     t = 0.0
     ane = 0.0
     anh = 0.0
     anhe = 0.0
     hkt = 0.0
     t32 = 0.0
-    oph2 = 0.0          # TODO(port): oph2 在调用 h2minus/cia_* 前未定义，预置 0.0
+    oph2 = 0.0          # TODO(port): oph2 undefined before calling h2minus/cia_*; preset 0.0
     if C.IATH > 0:
         n0hn = C.NFIRST[C.IELH]
         nkh = C.NKA[C.IATH]
@@ -12879,14 +12925,14 @@ def opadd(mode, id, fr, abad, emad, scad):
             t32 = 1.0 / t / math.sqrt(t)
         anh = C.DENS[id] / (C.WMM[id] * C.YTOT[id])
         anhe = C.RRR[id, 1, 2]
-        it = C.NLEVEL                                    # IT=NLEVEL（原代码未再使用）
+        it = C.NLEVEL                                    # IT=NLEVEL (not used afterwards in the original code)
         #   -----------------------
         #   HI  Rayleigh scattering
         #   -----------------------
         if C.IRSCT != 0 and C.IOPHLI != 1 and C.IOPHLI != 2:
             x = 1.0 / (cls / min(fr, frayh)) ** 2
             sg = (5.799e-13 + (1.422e-6 + 2.784 * x) * x) * x * x
-            # ABAD=POPUL(N0HN,ID)*SG（原注释行，略）
+            # ABAD=POPUL(N0HN,ID)*SG (original comment line, omitted)
             scad = C.POPUL[n0hn, id] * sg
             scad = anh * sg
         if C.IOPHMI != 0:
@@ -12907,7 +12953,7 @@ def opadd(mode, id, fr, abad, emad, scad):
             x = (cls / min(fr, frayhe)) ** 2
             cs = 5.484e-14 / x / x * (1.0 + (2.44e5 + 5.94e10 / (x - 2.90e5)) / x) ** 2
             sg = anhe * cs
-            # abad=abad+sg（原注释行，略）
+            # abad=abad+sg (original comment line, omitted)
             scad = scad + sg
         #   -----------------------
         #   H2  Rayleigh scattering
@@ -12917,7 +12963,7 @@ def opadd(mode, id, fr, abad, emad, scad):
             x2 = 1.0 / x / x
             cs = (8.14e-13 + 1.28e-6 / x + 1.61 * x2) * x2
             sg = cs * C.anh2[id]
-            # abad=abad+sg（原注释行，略）
+            # abad=abad+sg (original comment line, omitted)
             scad = scad + sg
         if (C.IOPH2P > 0 and C.IFMOL > 0 and
                 t < C.TMOLIM and fr < 3.28e15):
@@ -12950,8 +12996,8 @@ def opadd(mode, id, fr, abad, emad, scad):
     #   H2-  free-free
     #   -----------------------------
     if C.IOPH2M != 0 and mode >= 0 and C.IFMOL > 0 and t < C.TMOLIM:
-        # call h2minus(t,anh2(id),ane,fr,oph2)；h2minus 只给标量哑元 oph2m 赋值，
-        # 按约定返回全部标量哑元；数组元素实参用临时变量接收
+        # call h2minus(t,anh2(id),ane,fr,oph2); h2minus assigns only scalar
+        # dummy oph2m, so by convention return all scalar dummies; the array-element argument is received via a temp
         t, _anh2, ane, fr, oph2 = h2minus(t, C.anh2[id], ane, fr, oph2)
         ab1 = ab1 + oph2
     #   -----------------------------
@@ -12966,7 +13012,7 @@ def opadd(mode, id, fr, abad, emad, scad):
         #     CIA H2-H2 opacity
         #     ---------------------------
         if C.IOH2H2 > 0:
-            # call cia_h2h2(t,anh2(id),fr,oph2)；opac 为输出哑元
+            # call cia_h2h2(t,anh2(id),fr,oph2); opac is an output dummy
             t, _ah2, fr, oph2 = cia_h2h2(t, C.anh2[id], fr, oph2)
             ab1 = ab1 + oph2
         #     ---------------------------
@@ -13016,7 +13062,7 @@ def wn(xn, a, id, z):
     c            id  - depth index
     c            z   - ionic charge
     c
-    对应 synspec54.f 行 11878–11930
+    Corresponds to synspec54.f lines 11878-11930
     """
     p1 = 0.1402                                          # parameter (p1=0.1402,...)
     p2 = 0.1285
@@ -13036,7 +13082,7 @@ def wn(xn, a, id, z):
     else:
         xkn = ckn * xn / (xn + un) / (xn + un)
     # evaluation of beta
-    # beta=cb*bergfc*z*z*z*xkn/(xn*xn*xn*xn)*exp(f23*log(elec(id)))（原注释行）
+    # beta=cb*bergfc*z*z*z*xkn/(xn*xn*xn*xn)*exp(f23*log(elec(id))) (original comment line)
     beta = cb * z * z * z * xkn / (xn * xn * xn * xn) * math.exp(f23 * math.log(C.ELEC[id]))
     # approximate expression for Q(beta)
     x = math.exp(p4 * math.log(un + p3 * a))
@@ -13054,7 +13100,7 @@ def wn(xn, a, id, z):
     if C.IELHE1 > 0:
         xnhe1 = C.POPUL[C.NFIRST[C.IELHE1], id]
     w0 = math.exp(wa0 * xn2 * xn2 * xn2 * (xnh + xnhe1))
-    w0 = 1.0            # 原代码紧随其后 W0=1.（覆盖上一行，直译保留）
+    w0 = 1.0            # the original code has W0=1. immediately after (overriding the previous line; kept verbatim)
     wn_val = wp * w0
     return wn_val
 
@@ -13065,18 +13111,18 @@ def wnstor(id):
     C     Stores occupation probabilities for hydrogen levels
     C     in common WNCOM for further use
     C
-    对应 synspec54.f 行 11936–11974
+    Corresponds to synspec54.f lines 11936-11974
     """
     un = 1.0                                             # PARAMETER (UN=1.,TWO=2.,...)
     two = 2.0
     sixth = 1.0 / 6.0
     ccor = 0.09
-    p1 = 0.1402                                          # parameter (p1=0.1402,...)（原代码未使用）
+    p1 = 0.1402                                          # parameter (p1=0.1402,...) (unused in the original code)
     p2 = 0.1285
     p3 = 1.0
     p4 = 3.15
     p5 = 4.0
-    tkn = 3.01                                           # parameter (tkn=3.01,...)（原代码未使用）
+    tkn = 3.01                                           # parameter (tkn=3.01,...) (unused in the original code)
     ckn = 5.33333333
     cb = 8.59e14
     f23 = -2.0 / 3.0
@@ -13107,8 +13153,8 @@ def wnstor(id):
 
 
 #  ----------------------------------------------------------------------------
-#  原代码 11981–12007 行为整体注释掉的 SUBROUTINE TIMING(MOD,ITER)（计时例程，
-#  调用机器相关例程 etime），无有效可执行语句，保留此说明注释。
+#  Original lines 11981-12007 are a wholly commented-out SUBROUTINE TIMING(MOD,ITER)
+#  (a timing routine calling the machine-dependent etime); no executable statements, so only this note is kept.
 #  ----------------------------------------------------------------------------
 
 
@@ -13117,7 +13163,7 @@ def quit(text):
     c
     c     stops the program and writes a text
     c
-    对应 synspec54.f 行 12011–12021
+    Corresponds to synspec54.f lines 12011-12021
     """
     # write(6,10) text
     #   10 format(1x,a)
@@ -13132,9 +13178,9 @@ def voigte(a, vs):
     c     a=gamma/(4*pi*dnud)   and  v=(nu-nu0)/dnud.  this  is  done after
     c     traving (landolt-b\\rnstein, p. 449).
     c
-    对应 synspec54.f 行 12030–12119
+    Corresponds to synspec54.f lines 12030-12119
     """
-    # DATA ak /.../（DATA 初始化且之后不修改 → 函数顶部直接赋值，1 基索引）
+    # DATA ak /.../ (DATA-initialized, never modified → assign directly at the function top, 1-based indexing)
     ak = [0.0,
           -1.12470432, -0.15516677, 3.28867591, -2.34357915,
           0.42139162, -4.48480194, 9.39456063, -6.61487486, 1.98919585,
@@ -13147,15 +13193,15 @@ def voigte(a, vs):
     u = a + v
     v2 = v * v
     if a == 0.0:
-        # a eq 0.（标号 140）
+        # a eq 0. (label 140)
         hh = 0.0
         if v2 < 100.0:
             hh = math.exp(-v2)
         return hh
     if a > 0.2:
-        # 标号 120
+        # label 120
         if a > 1.4 or u > 3.2:
-            # a gt 1.4  or  a + v gt 3.2（标号 130）
+            # a gt 1.4  or  a + v gt 3.2 (label 130)
             a2 = a * a
             u = sq2 * (a2 + v2)
             u2 = 1.0 / (u * u)
@@ -13165,36 +13211,36 @@ def voigte(a, vs):
         ex = 0.0
         if v2 < 100.0:
             ex = math.exp(-v2)
-        k = 2                                            # GO TO 100（k=2 落入下方公共块）
+        k = 2                                            # GO TO 100 (k=2 falls into the common block below)
     else:
         if v >= 5.0:
-            # a le 0.2  and  v ge 5.（标号 121）
+            # a le 0.2  and  v ge 5. (label 121)
             hh = a * (15.0 + 6.0 * v2 + 4.0 * v2 * v2) / (4.0 * v2 * v2 * v2 * sqp)
             return hh
         ex = 0.0
         if v2 < 100.0:
             ex = math.exp(-v2)
         k = 1
-    # 标号 100
+    # label 100
     quo = 1.0
     if v < 2.4:
-        # 标号 101
+        # label 101
         m = 6
         if v < 1.3:
             m = 1
     else:
         quo = 1.0 / (v2 - 1.5)
         m = 11
-    # 标号 102
+    # label 102
     for i in range(1, 6):                                # do 103 i=1,5
         a1[i] = ak[m]
         m = m + 1
     h1 = quo * (a1[1] + v * (a1[2] + v * (a1[3] + v * (a1[4] + v * a1[5]))))
     if k <= 1:
-        # a le 0.2  and v lt 5.（k=1 时跳过标号 110）
+        # a le 0.2  and v lt 5. (label 110 skipped when k=1)
         hh = h1 * a + ex * (1.0 + a * a * (1.0 - 2.0 * v2))
         return hh
-    # 标号 110
+    # label 110
     pqs = 2.0 / sqp
     h1p = h1 + pqs * ex
     h2p = pqs * h1p - 2.0 * v2 * ex
@@ -13216,33 +13262,33 @@ def sigavs():
     C     explicit levels. For other levels, additional input data in
     C     unit 54 !!
     C
-    对应 synspec54.f 行 12125–12326
+    Corresponds to synspec54.f lines 12125-12326
     """
     hccm = H * 2.997925e10                               # PARAMETER (HCCM=H*2.997925D10,...)
     bam = 1.0e-18
     crd = np.zeros(MFCRA + 1)                            # DIMENSION CRD(MFCRA)
     frd = np.zeros(MFCRA + 1)                            # DIMENSION FRD(MFCRA)
-    # DATA XIFE/.../（DATA 初始化且之后不修改 → 直接赋值，1 基索引）
+    # DATA XIFE/.../ (DATA-initialized, never modified → assign directly, 1-based indexing)
     xife = [0.0, 63480.0, 130563.0, 247220.0, 442000.0, 605000.0, 799000.0,
             1008000.0, 1218380.0]
-    # COMMON/IONFIL/FIDATA,FIODF1,FIODF2,FIBFCS → C.*（本例程只用 FIBFCS）
+    # COMMON/IONFIL/FIDATA,FIODF1,FIODF2,FIBFCS → C.* (this routine uses only FIBFCS)
 
     def _rd_err(unit, spec, errmsg):
-        # READ(unit,*,END=...,ERR=...) 的直译：自由格式读一行并按
-        # spec('i'=int,'f'=float) 解析；EOF 或解析错误 → 对应标号处的 quit
+        # literal translation of READ(unit,*,END=...,ERR=...): read one line
+        # in free format and parse per spec('i'=int,'f'=float); EOF or parse error → quit at the corresponding label
         try:
             _tok = read_line(unit).replace(',', ' ').split()
             return [int(v) if s == 'i' else float(v) for s, v in zip(spec, _tok)]
         except (EOFError, ValueError, IndexError):
             quit(errmsg)
-            raise SystemExit                             # quit 已 STOP，明确语义
+            raise SystemExit                             # quit already STOPs; make the semantics explicit
 
     fr1 = C.FREQ[1]
     fr2 = C.FREQ[2]
     nunit = 0
     nqht = 0
     if C.IASV != 0:                                      # IF(IASV.EQ.0) GOTO 100
-        #     WRITE(6,600)（原注释行，略）
+        #     WRITE(6,600) (original comment line, omitted)
         #  600 FORMAT(///,' DETAILED PHOTOIONIZATION CROSS-SECTIONS',
         #     * ' (EXPLICIT LEVELS)',/,
         #     * ' ---------------------------------------',/)
@@ -13277,8 +13323,8 @@ def sigavs():
             nbfi = nsup
             if nsup > (n2 - n1 + 1):
                 nbfi = (n2 - n1 + 1)
-            # call quit(' Too many bf-trans. in input file (SIGAVS)')（原注释行，略）
-            # WRITE(6,601) ATI,INSA（原注释行，略）
+            # call quit(' Too many bf-trans. in input file (SIGAVS)') (original comment line, omitted)
+            # WRITE(6,601) ATI,INSA (original comment line, omitted)
             for ii in range(1, nbfi + 1):                # DO 12 II=1,NBFI
                 # READ(INSA,*,END=500,ERR=500) IILO,EELO,GGLO,NFCRR
                 iilo, eelo, gglo, nfcrr = _rd_err(
@@ -13288,9 +13334,9 @@ def sigavs():
                 if ik > n2 or ik < n1:
                     quit(' Inconsistent level numbering in SIGAVS')
                 if iiat == 26:                           # IF(IIAT.NE.26) GOTO 13
-                    ecmr = xife[iiz] - eelo              # ECMR（原代码未再使用）
-                    # DE=... / IF(DE.GT.1.D-4) call quit(...)（原注释行，略）
-                # 标号 13：READ(INSA,*,END=500,ERR=500) FR0,CR0
+                    ecmr = xife[iiz] - eelo              # ECMR (not used afterwards in the original code)
+                    # DE=... / IF(DE.GT.1.D-4) call quit(...) (original comment lines, omitted)
+                # label 13: READ(INSA,*,END=500,ERR=500) FR0,CR0
                 fr0, cr0 = _rd_err(insa, 'ff',
                                    ' ERROR IN DATA FILE FOR BF SIG OF AVERAGED LEVELS (1)')
                 nfd = 1
@@ -13334,7 +13380,7 @@ def sigavs():
                     C.CRMX[ik] = max(C.CRMX[ik], crd[ij])
                 # 15 CONTINUE
                 if C.CRMX[ik] > 0.0:
-                    # WRITE(6,601) ATI,IILO,EELO,NFD（原注释行，略）
+                    # WRITE(6,601) ATI,IILO,EELO,NFD (original comment line, omitted)
                     #  601 FORMAT(F7.2,I6,F13.3,I8)
                     C.NFCR[ik] = nfd
                     for ij in range(1, nfd + 1):         # DO 16 IJ=1,NFD
@@ -13343,7 +13389,7 @@ def sigavs():
                     # 16 CONTINUE
             # 12 CONTINUE
         # 10 CONTINUE
-    # 标号 100：READ(50,*,END=540,ERR=540) NUNIT
+    # label 100: READ(50,*,END=540,ERR=540) NUNIT
     try:
         _tok = read_line(50).replace(',', ' ').split()
         nunit = int(_tok[0])
@@ -13396,7 +13442,7 @@ def sigavs():
             C.AQHT[ik] = atir
             C.EQHT[ik] = eelo
             C.GQHT[ik] = gglo
-            # READ(INSA,*) FR0,CR0（无 END/ERR 分支，直译为普通自由格式读）
+            # READ(INSA,*) FR0,CR0 (no END/ERR branch; translated as a plain free-format read)
             _tok = read_line(insa).replace(',', ' ').split()
             fr0 = float(_tok[0])
             cr0 = float(_tok[1])
@@ -13405,7 +13451,7 @@ def sigavs():
             crd[nfd] = cr0
             luv = False
             for ij in range(1, nfcrr):                   # DO 130 IJ=1,NFCRR-1
-                # READ(INSA,*) FRIN,CRIN（无 END/ERR 分支）
+                # READ(INSA,*) FRIN,CRIN (no END/ERR branch)
                 _tok = read_line(insa).replace(',', ' ').split()
                 frin = float(_tok[0])
                 crin = float(_tok[1])
@@ -13433,8 +13479,8 @@ def sigavs():
                 else:
                     fr0 = frin
                     cr0 = crin
-                # TODO(port): 原代码此处没有循环 14 中的 NFD>MFCRA 检查，
-                # nfd 超过 MFCRA 时数组会越界（与 Fortran 越界写对应）
+                # TODO(port): the original code lacks the NFD>MFCRA check of
+                # loop 14 here; the arrays overflow when nfd exceeds MFCRA (matching the Fortran out-of-bounds write)
             # 130 CONTINUE
             C.CRMY[ik] = 0.0
             for ij in range(1, nfd + 1):                 # DO 140 IJ=1,NFD
@@ -13453,22 +13499,22 @@ def sigavs():
     # 110 CONTINUE
     # 540 RETURN
     # 500 call quit(' ERROR IN DATA FILE FOR BF SIG OF AVERAGED LEVELS (1)')
-    #     → 由 _rd_err 内联实现（标号 500）
+    #     → implemented inline by _rd_err (label 500)
     # 501 call quit(' ERROR IN DATA FILE FOR BF SIG OF AVERAGED LEVELS (2)')
-    #     → 由 _rd_err 内联实现（标号 501）
+    #     → implemented inline by _rd_err (label 501)
     return
 # ======================================================================
-# chunk11: synspec54.f 行 12333–13582
-# 包含: PHTX, GETLAL, ALLARD, LYAHHE, READBF, PRETAB, VOIGTK, RTECD, RTEDFE
+# chunk11: synspec54.f lines 12333-13582
+# includes: PHTX, GETLAL, ALLARD, LYAHHE, READBF, PRETAB, VOIGTK, RTECD, RTEDFE
 # ======================================================================
 
 
-# PHTX 的 SAVE 局部数组（Fortran SAVE，跨调用保持），提升为模块级
+# SAVE local arrays of PHTX (Fortran SAVE, persist across calls), promoted to module level
 _save_phtx_photi = np.zeros((MCROSS + 1, MFREQ + 1))          # SAVE PHOTI(MCROSS,MFREQ)
 _save_phtx_ijp = np.zeros(MLEVEL + 1, dtype=np.int64)         # SAVE IJP(MLEVEL)
 _save_phtx_ijq = np.zeros(MPHOT + 1, dtype=np.int64)          # SAVE IJQ(MPHOT)
 
-# LYAHHE 的 SAVE 标量（DATA iread/0/，之后被修改，隐含 SAVE）
+# SAVE scalar of LYAHHE (DATA iread/0/, modified later, hence implicit SAVE)
 _save_lyahhe_iread = 0                                        # DATA IREAD/0/
 
 
@@ -13478,9 +13524,9 @@ def phtx(id, abso, emis, fre, icon):
 C     Opacity due to detailed photoionization (read from tables by
 C     routine SIGAVS)
 
-    对应 synspec54.f 行 12333–12433
+    Corresponds to synspec54.f lines 12333-12433
     """
-    photi = _save_phtx_photi          # SAVE 数组别名
+    photi = _save_phtx_photi          # alias of the SAVE array
     ijp = _save_phtx_ijp
     ijq = _save_phtx_ijq
     c3 = 1.4387886                    # PARAMETER (C3=1.4387886)
@@ -13491,7 +13537,7 @@ C     routine SIGAVS)
         return
     t = C.TEMP[id]
     nfre = C.NFREQ
-    ij0 = 3                           # ij0 之后未被使用（原代码如此）
+    ij0 = 3                           # ij0 unused afterwards (as in the original code)
     if icon == 1:
         ij0 = 1
         nfre = C.NFREQC
@@ -13512,12 +13558,12 @@ C     routine SIGAVS)
                     continue                          # GOTO 40
                 ik1 = max(2, ijp[i])                  # MAX0
                 for ij in range(3, nfre + 1):         # DO 42 IJ=3,NFRE
-                    ik2 = ik1  # Fortran 中若 45 循环内未赋值，IK2 沿用上次值
+                    ik2 = ik1  # in Fortran, IK2 keeps its previous value if not assigned inside loop 45
                     for ik in range(ik1, C.NFCR[i] + 1):  # DO 45 IK=IK1,NFCR(I)
                         if C.FRECR[i, ik] < fre[ij]:
                             ik2 = ik
                             break                     # GOTO 46
-                    # 标号 46
+                    # label 46
                     ik1 = ik2
                     if ij == 3:
                         ijp[i] = ik1
@@ -13536,7 +13582,7 @@ C     routine SIGAVS)
                 abso[ij] = abso[ij] + ab
                 emis[ij] = emis[ij] + ab * planf[ij]
 
-    # 标号 100
+    # label 100
     if C.NQHT == 0:
         return
     if id == 1:
@@ -13545,12 +13591,12 @@ C     routine SIGAVS)
                 continue                              # GOTO 110
             ik1 = max(2, ijq[i])
             for ij in range(3, nfre + 1):             # DO 120 IJ=3,NFRE
-                ik2 = ik1  # Fortran 中若 125 循环内未赋值，IK2 沿用上次值
+                ik2 = ik1  # in Fortran, IK2 keeps its previous value if not assigned inside loop 125
                 for ik in range(ik1, C.NFQHT[i] + 1):  # DO 125 IK=IK1,NFQHT(I)
                     if C.FRECQ[i, ik] < fre[ij]:
                         ik2 = ik
                         break                         # GOTO 126
-                # 标号 126
+                # label 126
                 ik1 = ik2
                 if ij == 3:
                     ijq[i] = ik1
@@ -13581,12 +13627,12 @@ c     and Balmer alpha, including the quasi-molecular satellites;
 c     valid for first and second order in neutral and ionized H density
 c     modified routine provided originally by D. Koester
 
-    对应 synspec54.f 行 12438–12530
+    Corresponds to synspec54.f lines 12438-12530
     """
     # parameter (NXMAX=1400,NNMAX=5)
     nnmax = 5
-    # TODO(port): Fortran 自由格式(list-directed) READ 在值不够时会自动续读下一条
-    # 记录；这里按“每条记录一行、值齐全”解析，并用 _f 兼容 D 指数。
+    # TODO(port): a Fortran free-format (list-directed) READ automatically
+    # continues to the next record when values run out; here we parse one record per line with all values present, and use _f to accept D exponents.
     _f = lambda s: float(s.replace('D', 'E').replace('d', 'e'))
 
     # Lyman alpha
@@ -13609,8 +13655,8 @@ c     modified routine provided originally by D. Koester
         C.stnnea = 10.0 ** C.stnnea
         C.stncha = 10.0 ** C.stncha
         C.iwarna = 0
-        # TODO(port): 原代码此处第二次 close(nunalp)；fortran.py 的 close_unit
-        # 对未打开单元会抛 KeyError
+        # TODO(port): the original code closes nunalp a second time here;
+        # fortran.py's close_unit raises KeyError for a unit that is not open
         close_unit(C.nunalp)
         print()
         print(' read quasi-molecular data for L alpha')
@@ -13641,7 +13687,7 @@ c     modified routine provided originally by D. Koester
     C.nxgam = 0
     if C.nungam > 0:
         C.nungam = 67
-        # 原代码 open 的是 nunalp（笔误），但两者都已被置为 67，语义一致
+        # the original code opens nunalp here (a typo), but both are already set to 67, so the semantics match
         open_unit(C.nunalp, './data/lgquasi.dat', 'r')   # status='old'
         p = read_line(C.nungam).split()
         C.nxgam = int(p[0])
@@ -13664,7 +13710,7 @@ c     modified routine provided originally by D. Koester
     C.nxbal = 0
     if C.nunbal > 0:
         C.nunbal = 67
-        # 原代码 open 的是 nunalp（笔误），同上，均为 67
+        # the original code opens nunalp here (a typo); as above, both are 67
         open_unit(C.nunalp, './data/lhquasi.dat', 'r')   # status='old'
         p = read_line(C.nunbal).split()
         C.nxbal = int(p[0])
@@ -13704,15 +13750,15 @@ c             if integrated over A;
 c             It then renormalized by multiplying by
 c             8.853e-29*lambda_0^2*f_ij
 
-    对应 synspec54.f 行 12535–12762
+    Corresponds to synspec54.f lines 12535-12762
 
-    prof 为被赋值的标量哑元 → 按约定返回全部标量哑元
-    (xl, hneutr, hcharg, prof, iq, jq)。
+    prof is an assigned scalar dummy → by convention return all scalar
+    dummies (xl, hneutr, hcharg, prof, iq, jq).
     """
     # parameter (NXMAX=1400,NNMAX=5)
     # parameter (xnorma=..., xnormb=..., xnormg=..., xnormc=...)
     xnorma = 8.8528e-29 * 1215.6 * 1215.6 * 0.41618
-    xnormb = 8.8528e-29 * 1025.73 * 1025.7 * 0.0791   # 原代码即 1025.73*1025.7
+    xnormb = 8.8528e-29 * 1025.73 * 1025.7 * 0.0791   # the original code indeed has 1025.73*1025.7
     xnormg = 8.8528e-29 * 972.53 * 972.53 * 0.0290
     xnormc = 8.8528e-29 * 6562.0 * 6562.0 * 0.6407
 
@@ -13739,9 +13785,9 @@ c             8.853e-29*lambda_0^2*f_ij
         if xl <= C.xlalp[C.nxalp]:
             jl = 0
             ju = C.nxalp + 1
-            # 标号 10: GO TO 10 → while 二分查找循环
+            # label 10: GO TO 10 → while binary-search loop
             while ju - jl > 1:
-                jm = idiv(ju + jl, 2)                 # Fortran 整数除法
+                jm = idiv(ju + jl, 2)                 # Fortran integer division
                 if (C.xlalp[C.nxalp] > C.xlalp[1]) == (xl > C.xlalp[jm]):  # .EQV.
                     jl = jm
                 else:
@@ -13796,7 +13842,7 @@ c             8.853e-29*lambda_0^2*f_ij
 
         jl = 0
         ju = C.nxbet + 1
-        # 标号 20: GO TO 20 → while 二分查找循环
+        # label 20: GO TO 20 → while binary-search loop
         while ju - jl > 1:
             jm = idiv(ju + jl, 2)
             if (C.xlbet[C.nxbet] > C.xlbet[1]) == (xl > C.xlbet[jm]):
@@ -13838,7 +13884,7 @@ c             8.853e-29*lambda_0^2*f_ij
 
         jl = 0
         ju = C.nxgam + 1
-        # 标号 30: GO TO 30 → while 二分查找循环
+        # label 30: GO TO 30 → while binary-search loop
         while ju - jl > 1:
             jm = idiv(ju + jl, 2)
             if (C.xlgam[C.nxgam] > C.xlgam[1]) == (xl > C.xlgam[jm]):
@@ -13874,7 +13920,7 @@ c             8.853e-29*lambda_0^2*f_ij
 
         jl = 0
         ju = C.nxbal + 1
-        # 标号 40: GO TO 40 → while 二分查找循环
+        # label 40: GO TO 40 → while binary-search loop
         while ju - jl > 1:
             jm = idiv(ju + jl, 2)
             if (C.xlbal[C.nxbal] > C.xlbal[1]) == (xl > C.xlbal[jm]):
@@ -13902,17 +13948,17 @@ def lyahhe(xl, ahe, prof):
 
 c     Lyman alpha broadening by helium - after N. Allard
 
-    对应 synspec54.f 行 12768–12828
+    Corresponds to synspec54.f lines 12768-12828
 
-    prof 被赋值（且 iread=0 的首次调用中 dummy xl 被 READ 覆写，原代码如此）
-    → 按约定返回全部标量哑元 (xl, ahe, prof)。
+    prof is assigned (and on the first call with iread=0 the dummy xl is overwritten by READ, as in the original code)
+    → by convention return all scalar dummies (xl, ahe, prof).
     """
     global _save_lyahhe_iread
     # parameter (nxmax=1000)
     nxmax = 1000
     xlhh0 = np.zeros(nxmax + 1)       # xlhh0(nxmax)
     sighh0 = np.zeros(nxmax + 1)      # sighh0(nxmax)
-    # TODO(port): 自由格式 READ，_f 兼容 D 指数
+    # TODO(port): free-format READ; _f accepts D exponents
     _f = lambda s: float(s.replace('D', 'E').replace('d', 'e'))
 
     if _save_lyahhe_iread == 0:
@@ -13920,10 +13966,10 @@ c     Lyman alpha broadening by helium - after N. Allard
         # c open(unit=67, file='siglyhhe_21_T14500.lam', status='old')
         it = 0
         for i in range(1, nxmax + 1):
-            # read(67,*,err=5,end=5) xl,sig —— 读取出错或 EOF → 标号 5
+            # read(67,*,err=5,end=5) xl,sig -- read error or EOF → label 5
             try:
                 p = read_line(67).split()
-                xl = _f(p[0])         # TODO(port): 哑元 xl 被 READ 覆写（原代码如此）
+                xl = _f(p[0])         # TODO(port): dummy xl overwritten by READ (as in the original code)
                 sig = _f(p[1])
             except (EOFError, ValueError, IndexError):
                 break                 # err=5 / end=5
@@ -13932,7 +13978,7 @@ c     Lyman alpha broadening by helium - after N. Allard
                 xl = 1.0 / (1.0e-8 * xl + 1.0 / 1215.67)
             xlhh0[it] = xl
             sighh0[it] = sig
-        # 标号 5
+        # label 5
         C.nxhhe = it
         for i in range(1, C.nxhhe + 1):
             C.xlhhe[i] = xlhh0[C.nxhhe - i + 1]
@@ -13949,7 +13995,7 @@ c     Lyman alpha broadening by helium - after N. Allard
         return xl, ahe, prof
     jl = 0
     ju = C.nxhhe + 1
-    # 标号 10: GO TO 10 → while 二分查找循环
+    # label 10: GO TO 10 → while binary-search loop
     while ju - jl > 1:
         jm = idiv(ju + jl, 2)
         if (C.xlhhe[C.nxhhe] > C.xlhhe[1]) == (xl > C.xlhhe[jm]):  # .EQV.
@@ -13975,26 +14021,26 @@ c     comments
 c
 c     lines beginning with ! or * are understood as comments
 
-    对应 synspec54.f 行 12834–12853
+    Corresponds to synspec54.f lines 12834-12853
     """
     # 501 format(a)
-    # 显式以 w+ 打开 IBUFF(=fort.95): 隐式打开是 "w" 只写模式,
-    # 后面 rewind 后要回读, w+ 保证可读且每次运行截断旧内容
+    # open IBUFF(=fort.95) explicitly with w+: an implicit open is write-only
+    # "w" mode; after the later rewind it must be read back, and w+ is readable and truncates old content on each run
     open_unit(IBUFF, 'fort.95', 'w+')
-    # 标号 10 → while 循环开头
+    # label 10 → top of the while loop
     while True:
         # read(5,501,end=20) buff
-        # TODO(port): read_stdin_line 遇 EOF 抛 SystemExit；此处按 END=20 捕获并跳出
+        # TODO(port): read_stdin_line raises SystemExit on EOF; catch it here per END=20 and break out
         try:
             buff = read_stdin_line()
         except SystemExit:
-            break                     # END=20 → 标号 20
-        # buff(1:1) 比较；Python 空串切片安全（Fortran 空白行首字符为空格）
+            break                     # END=20 → label 20
+        # buff(1:1) comparison; slicing an empty string is safe in Python (in Fortran a blank line's first character is a space)
         if buff[:1] == '!' or buff[:1] == '*':
             continue                  # GO TO 10
         write_line(IBUFF, buff)       # write(ibuff,501) buff
         # GO TO 10
-    # 标号 20
+    # label 20
     rewind_unit(IBUFF)                # rewind ibuff
     return
 
@@ -14005,12 +14051,12 @@ def pretab():
 C     pretabulate expansion coefficients for the Voigt function
 C     200 steps per doppler width - up to 10 Doppler widths
 
-    对应 synspec54.f 行 12860–12898
+    Corresponds to synspec54.f lines 12860-12898
     """
     # PARAMETER (VSTEPS=200.,MVOI=2001)
     vsteps = 200.0
     mvoi = 2001
-    # DATA TABVI/.../（DATA 后不再修改 → 函数内直接赋值）
+    # DATA TABVI/.../ (not modified after DATA -> assigned directly inside the function)
     tabvi = np.zeros(82)
     tabvi[1:] = [
         0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3,
@@ -14039,7 +14085,7 @@ C     200 steps per doppler width - up to 10 Doppler widths
     n = mvoi                              # N=MVOI
     for i in range(1, n + 1):             # DO 10 I=1,N
         C.H0TAB[i] = float(i - 1) / vsteps
-    # INTERP 不修改标量哑元 → 调用点不解包
+    # INTERP does not modify scalar dummies -> no unpacking at the call site
     interp(tabvi, tabh1, C.H0TAB, C.H1TAB, 81, n, 2, 0, 0)
     for i in range(1, n + 1):             # DO 20 I=1,N
         vv = (float(i - 1) / vsteps) ** 2
@@ -14053,7 +14099,7 @@ def voigtk(a, v):
 
 C     Voigt function after Kurucz (in Computational Astrophysics)
 
-    对应 synspec54.f 行 12905–12945
+    Corresponds to synspec54.f lines 12905-12945
     """
     # PARAMETER (MVOI=2001)
     # PARAMETER (ONE=1., THREE=3., TEN=10., FIFTN=15., TWOH=200., ...)
@@ -14085,7 +14131,7 @@ C     Voigt function after Kurucz (in Computational Astrophysics)
             voigtk_val = c05642 * a / (v * v)
         return voigtk_val
     if a > c14 or a + v > c32:
-        # IF(A.GT.C14) GO TO 10 / IF(A+V.GT.C32) GO TO 10 → 标号 10
+        # IF(A.GT.C14) GO TO 10 / IF(A+V.GT.C32) GO TO 10 -> label 10
         aa = a * a
         vv = v * v
         u = (aa + vv) * c14142
@@ -14111,7 +14157,9 @@ C     for two continuum points
 C     used when one employs RTEDFE, ie. the DFE method for the
 C     transfer equation for the inner frequency points
 
-    对应 synspec54.f 行 12952–13403
+    Corresponds to synspec54.f lines 12952-13403
+
+    References: Feautrier 1964, CR 258, 3189.
     """
     # PARAMETER (UN=1.D0, HALF=0.5D0)
     un = 1.0
@@ -14122,7 +14170,7 @@ C     transfer equation for the inner frequency points
     sixth = un / 6.0
     # PARAMETER (TAUREF = 0.6666666666667)
     tauref = 0.6666666666667
-    # 局部数组（Fortran 1 基）
+    # local arrays (Fortran 1-based)
     d = np.zeros((4, 4, MDEPTH + 1))      # D(3,3,MDEPTH)
     anu = np.zeros((4, MDEPTH + 1))       # ANU(3,MDEPTH)
     aanu = np.zeros(MDEPTH + 1)           # AANU(MDEPTH)
@@ -14143,10 +14191,10 @@ C     transfer equation for the inner frequency points
     ss0 = np.zeros(MDEPTH + 1)            # SS0(MDEPTH)
     rint = np.zeros((MDEPTH + 1, MMU + 1))  # RINT(MDEPTH,MMU)
 
-    C.NMU = 3                             # NMU=3（COMMON /BASNUM/ 变量）
+    C.NMU = 3                             # NMU=3 (COMMON /BASNUM/ variable)
     nd1 = C.ND - 1
-    # TODO(port): Fortran 中 IREF 未显式初始化（条件不满足时保留旧值/未定义），
-    # 这里按 RTEDFE 的显式初始化取 1
+    # TODO(port): in Fortran IREF is not explicitly initialized (keeps old
+    # value/undefined if the condition is not met); here we take 1 as in RTEDFE
     iref = 1
 
     # loop over two continuum frequencies
@@ -14189,7 +14237,7 @@ C     transfer equation for the inner frequency points
                 p0 = un - math.exp(-tamm)
             else:
                 p0 = tamm * (un - half * tamm * (un - tamm * third * (un - quart * tamm)))
-            ex = un - p0                  # EX 之后未被使用（原代码如此）
+            ex = un - p0                  # EX is unused afterwards (as in the original code)
             q0 = q0 + p0 * amu[i] * wtmu[i]
             div = dtp1 / amu[i] * third
             vl[i] = div * (st0[id] + half * st0[id + 1]) + st0[id] * p0
@@ -14251,7 +14299,7 @@ C     transfer equation for the inner frequency points
             ga = un / dtp1 / dt0
             be = al + ga
             a = (un - half * al * dtp1 * dtp1) * sixth
-            # Fortran 局部变量 C 与 commons 别名 C 冲突 → 改名 c_l
+            # Fortran local variable C conflicts with commons alias C -> renamed c_l
             c_l = (un - half * ga * dtm1 * dtm1) * sixth
             b = un - a - c_l
             vl0 = a * st0[id - 1] + b * st0[id] + c_l * st0[id + 1]
@@ -14385,7 +14433,7 @@ C     transfer equation for the inner frequency points
         ah = 0.0
         for i in range(1, C.NMU + 1):
             ah = ah + wtmu[i] * amu[i] * anu[i, 1]
-        fh = ah / aj - half * alb1        # AJ 为回代循环最后一次(ID=1)的值
+        fh = ah / aj - half * alb1        # AJ is the value from the last (ID=1) back-substitution pass
 
         fkk[C.ND] = third
 
@@ -14407,7 +14455,7 @@ C     transfer equation for the inner frequency points
             al = un / dtm1 / dt0
             ga = un / dtp1 / dt0
             a = (un - half * dtp1 * dtp1 * al) * sixth
-            c_l = (un - half * dtm1 * dtm1 * ga) * sixth   # Fortran 局部 C
+            c_l = (un - half * dtm1 * dtm1 * ga) * sixth   # Fortran local C
             aaa = al * fkk[id - 1] - a * (un + ss0[id - 1])
             ccc = ga * fkk[id + 1] - c_l * (un + ss0[id + 1])
             bbb = (al + ga) * fkk[id] + (un - a - c_l) * (un + ss0[id])
@@ -14482,7 +14530,7 @@ C     transfer equation for the inner frequency points
                 al = un / dtm1 / dt0
                 ga = un / dtp1 / dt0
                 a = (un - half * dtp1 * dtp1 * al) * sixth
-                c_l = (un - half * dtm1 * dtm1 * ga) * sixth   # Fortran 局部 C
+                c_l = (un - half * dtm1 * dtm1 * ga) * sixth   # Fortran local C
                 aaa = div * al - a
                 ccc = div * ga - c_l
                 bbb = div * (al + ga) + un - a - c_l
@@ -14519,7 +14567,7 @@ C     transfer equation for the inner frequency points
         # 100 CONTINUE
 
     # call rtedfe for the internal points
-    rtedfe()                              # CALL RTEDFE（无参数）
+    rtedfe()                              # CALL RTEDFE (no arguments)
 
     return
 
@@ -14539,7 +14587,11 @@ C      CH     - two-dimensional array  absorption coefficient (frequency,
 C               depth)
 C      ET     - emission coefficient (frequency, depth)
 
-    对应 synspec54.f 行 13410–13577
+    Corresponds to synspec54.f lines 13410-13577
+
+    Method: higher-order Discontinuous Finite Element solution for the
+    inner frequency points.
+    References: Castor, Dykema & Klein 1992, ApJ 387, 561.
     """
     # PARAMETER (ONE=1.,TWO=2.,HALF=0.5)
     one = 1.0
@@ -14547,7 +14599,7 @@ C      ET     - emission coefficient (frequency, depth)
     half = 0.5
     # PARAMETER (TAUREF = 0.6666666666667)
     tauref = 0.6666666666667
-    # 局部数组（Fortran 1 基）
+    # local arrays (Fortran 1-based)
     dt = np.zeros(MDEPTH + 1)             # DT(MDEPTH)
     st0 = np.zeros(MDEPTH + 1)            # ST0(MDEPTH)
     ab0 = np.zeros(MDEPTH + 1)            # AB0(MDEPTH)
@@ -14581,7 +14633,7 @@ C      ET     - emission coefficient (frequency, depth)
             amui[i] = C.ANGL[i]
             amuw[i] = C.ANGL[i] * C.WANGL[i]
     else:
-        nmus = 0   # TODO(port): 原代码 IFLUX 既非 0 亦非 1 时 NMUS 未定义
+        nmus = 0   # TODO(port): NMUS undefined in the original code when IFLUX is neither 0 nor 1
 
     # overall loop over frequencies
     for ij in range(1, C.NFREQ + 1):      # DO IJ=1,NFREQ
@@ -14682,14 +14734,14 @@ C      ET     - emission coefficient (frequency, depth)
 
     return
 # ======================================================================
-# chunk12: synspec54.f 第 13583–15044 行
+# chunk12: synspec54.f lines 13583-15044
 # PARTF / PFFE / MATINV / LINEQS / EXPINT / INTERP / INTRP
 # ======================================================================
 
 
-# ===== PARTF 的 SAVE 变量（DATA 初始化且之后被修改，Fortran 隐含 SAVE）=====
+# ===== SAVE variables of PARTF (DATA-init'd and modified later, implicit SAVE) =====
 _save_partf_icomp = 0                                # DATA ICOMP /0/
-# INDEXS(NIONS=123)、INDEXM(NSS=222)：首次调用（ICOMP==0）时计算一次，需跨调用保持
+# INDEXS(NIONS=123), INDEXM(NSS=222): computed once on first call (ICOMP==0), persist across calls
 _save_partf_indexs = np.zeros(124, dtype=np.int64)
 _save_partf_indexm = np.zeros(223, dtype=np.int64)
 
@@ -14722,7 +14774,7 @@ C
 C     Output:
 C      U     - partition function
 C
-    对应 synspec54.f 行 13583–14427
+    Corresponds to synspec54.f lines 13583-14427
     """
     global _save_partf_icomp
     # PARAMETER (NIONS=123, NSS=222)
@@ -14742,7 +14794,7 @@ C
         2, 1, 2, 1, 6, 9, 4, 9, 6, 1, 2, 1, 6, 9, 4, 9, 6, 1,
         10, 21, 28, 25, 6, 25, 28, 21, 10, 21], dtype=np.int64)
 
-    # ---------------- DATA II1 / II2（按列优先填充 (5,15)）----------------
+    # ---------------- DATA II1 / II2 (fill (5,15) in column-major order) ----------------
     ii1 = [
           1,  -1,   0,   0,   0,
           2,   3,  -1,   0,   0,
@@ -14816,7 +14868,7 @@ C
     # EQUIVALENCE (IG01(1), IG0(1)), (IG02(1), IG0(54))
     ig0 = np.array([0] + ig01 + ig02, dtype=np.int64)
 
-    # ---------------- DATA IS1 / IS2 → IS（IS 是 Python 关键字，改名 is_l）----------------
+    # ---------------- DATA IS1 / IS2 -> IS (IS is a Python keyword, renamed is_l) ----------------
     is1 = [
          1,
          1,   1,
@@ -15037,7 +15089,7 @@ C
     #             (CH3(1),CHION(139)), (CH4(1),CHION(194))
     chion = np.array([0.0] + ch1 + ch2 + ch3 + ch4)
 
-    # ---------------- DATA AHH..AZN → ALF（EQUIVALENCE 依次拼接）----------------
+    # ---------------- DATA AHH..AZN -> ALF (EQUIVALENCE concatenated in order) ----------------
     # EQUIVALENCE (AHH(1),ALF(  1)),(ALB(1),ALF(  7)),(AB (1),ALF( 19)),
     #             (AC (1),ALF( 30)),(AN (1),ALF( 49)),(AO (1),ALF( 79)),
     #             (AF (1),ALF(128)),(ANN(1),ALF(162)),(ANA(1),ALF(185)),
@@ -15131,7 +15183,7 @@ C
               4.0707,   4.0637,   5.7245, 144.6376, 106.4909,
               4.0011,  19.2813,  27.5990,  35.1179,
              94.7454, 283.2486,
-             10.5474,  28.7137,  65.7378,  24.0000]                       # DATA AS（AS 是 Python 关键字，改名 as_l）
+             10.5474,  28.7137,  65.7378,  24.0000]                       # DATA AS (AS is a Python keyword, renamed as_l)
     acl = [   2.0007,  62.5048, 669.4942,  29.0259, 130.9740,
               3.9064,   0.3993,   5.3570,  60.3424, 119.9913,
             138.1567, 278.8418, 102.3681, 158.6314,
@@ -15237,7 +15289,7 @@ C
                    amg + aal + asi + ap + as_l + acl + aar + ak + aca +
                    asc + ati + av + acr + amn + afe + aco + ani + acu + azn)
 
-    # ---------------- DATA GHH..GZN → GAM（EQUIVALENCE 依次拼接）----------------
+    # ---------------- DATA GHH..GZN -> GAM (EQUIVALENCE concatenated in order) ----------------
     # EQUIVALENCE (GHH(1),GAM(  1)),(GLB(1),GAM(  7)),(GB (1),GAM( 19)),
     #             (GC (1),GAM( 30)),(GN (1),GAM( 49)),(GO (1),GAM( 79)),
     #             (GF (1),GAM(128)),(GNN(1),GAM(162)),(GNA(1),GAM(185)),
@@ -15437,7 +15489,7 @@ C
                    gmg + gal + gsi + gp + gs + gcl + gar + gk + gca +
                    gsc + gti + gv + gcr + gmn + gfe + gco + gni + gcu + gzn)
 
-    # DATA ICOMP /0/ → 模块级 _save_partf_icomp
+    # DATA ICOMP /0/ -> module-level _save_partf_icomp
     # c      save indexs, indexm, index0, is, im, ig0, igpr,
     # c     *     xl, chion, alf, gam
     indexs = _save_partf_indexs
@@ -15454,23 +15506,23 @@ C
             indexm[k] = ind
             ind = ind + im[k]
         _save_partf_icomp = 1
-    # 标号 5
+    # label 5
 
     # IF((IAT.EQ.26.or.iat.eq.28).AND.IZI.GE.4.AND.IZI.LE.9) GO TO 70
     if (iat == 26 or iat == 28) and izi >= 4 and izi <= 9:
-        # 标号 70
-        u = 0.0  # Fortran 中此处 U 未初始化
+        # label 70
+        u = 0.0  # U is uninitialized here in Fortran
         if iat == 26:
-            izi, t, ane, u = pffe(izi, t, ane, u)     # PFFE 修改 PF，返回全部标量哑元
+            izi, t, ane, u = pffe(izi, t, ane, u)     # PFFE modifies PF; return all scalar dummies
         if iat == 28:
-            dut = 0.0  # Fortran 中 DUT/DUN 未初始化
+            dut = 0.0  # DUT/DUN uninitialized in Fortran
             dun = 0.0
-            izi, t, u, dut, dun = pfni(izi, t, u, dut, dun)  # PFNI 修改 PF/DUT/DUN
+            izi, t, u, dut, dun = pfni(izi, t, u, dut, dun)  # PFNI modifies PF/DUT/DUN
         return iat, izi, t, ane, xmaxn, u
     # IF(IAT.GT.30.AND.IZI.LE.3) GO TO 80
     if iat > 30 and izi <= 3:
-        # 标号 80
-        # 字面量 3 对应哑元 MODE（PFHEAV 不修改 MODE，但按约定解包全部标量哑元）
+        # label 80
+        # literal 3 corresponds to dummy MODE (PFHEAV does not modify MODE, but all scalar dummies are unpacked by convention)
         iat, izi, _mode, t, ane, u = pfheav(iat, izi, 3, t, ane, u)
         return iat, izi, t, ane, xmaxn, u
     if iat > 8 and izi > 5:
@@ -15480,20 +15532,20 @@ C
     # Irwin partition functions by default
     if C.IIRWIN > 0 and t < 16000.0:
         if izi <= 2:
-            u0 = 0.0  # Fortran 中 U0 未初始化
-            # 字面量 0 对应哑元 INDMOL，用临时变量接收
+            u0 = 0.0  # U0 uninitialized in Fortran
+            # literal 0 corresponds to dummy INDMOL; received into a temporary variable
             iat, izi, _indmol, t, u0 = irwpf(iat, izi, 0, t, u0)
             u = u0
             return iat, izi, t, ane, xmaxn, u
     elif iat > 30 and izi <= 3:
-        # GO TO 80（实际不可达：前面已拦截 IAT>30 且 IZI<=3，保持直译）
+        # GO TO 80 (actually unreachable: IAT>30 and IZI<=3 already intercepted above; kept as literal translation)
         iat, izi, _mode, t, ane, u = pfheav(iat, izi, 3, t, ane, u)
         return iat, izi, t, ane, xmaxn, u
 
     # IF(IZI.LE.0.OR.IZI.GT.9.OR.IAT.LE.0.OR.IAT.GT.30) GO TO 50
     if izi <= 0 or izi > 9 or iat <= 0 or iat > 30:
-        # 标号 50
-        iat, izi, t, ane, u = pfspec(iat, izi, t, ane, u)  # PFSPEC 修改 U
+        # label 50
+        iat, izi, t, ane, u = pfspec(iat, izi, t, ane, u)  # PFSPEC modifies U
         return iat, izi, t, ane, xmaxn, u
     mode = C.MODPF[iat]                        # MODE=MODPF(IAT)
     if mode < 0:
@@ -15501,21 +15553,21 @@ C
         iat, izi, t, ane, u = pfspec(iat, izi, t, ane, u)
         return iat, izi, t, ane, xmaxn, u
     if mode > 0:
-        # 标号 60
+        # label 60
         u = float(igle[iat - izi + 1])
         # C      U=PFSTD(IZI,IAT)
         return iat, izi, t, ane, xmaxn, u
     i0 = index0[izi, iat]
-    # 算术 IF(I0) 40,50,10
+    # arithmetic IF(I0) 40,50,10
     if i0 < 0:
-        # 标号 40
+        # label 40
         u = float(-i0)
         return iat, izi, t, ane, xmaxn, u
     elif i0 == 0:
         # GO TO 50
         iat, izi, t, ane, u = pfspec(iat, izi, t, ane, u)
         return iat, izi, t, ane, xmaxn, u
-    # 标号 10
+    # label 10
     qz = float(izi)
     # C     MAX=XMAXN*SQRT(QZ)
     xmax = xmaxn
@@ -15563,7 +15615,7 @@ c     after Fischel and Sparks, 1971, NASA SP-3066
 c
 c     Output:  PF   partition function
 c
-    对应 synspec54.f 行 14432–14729
+    Corresponds to synspec54.f lines 14432-14729
     """
     # parameter (xen=2.302585093,xmil=0.001,xmilen=xmil*xen)
     xen = 2.302585093
@@ -15592,7 +15644,7 @@ c
         0.842, 0.871, 0.906, 0.945, 0.987, 1.030, 1.074, 1.117,
         1.160, 1.201, 1.242, 1.280, 1.317, 1.353])
 
-    # data p4b（DATA 按列优先填充 p4b(10,28)；已展开 r*value 重复记号）
+    # data p4b (DATA fills p4b(10,28) in column-major order; r*value repeat notation expanded)
     p4b = np.zeros((11, 29))
     p4b[1:, 1:] = np.array([
         1.406, 1.393, 1.389, 1.387, 1.387, 1.387, 1.387, 1.387, 1.387, 1.387,
@@ -15632,7 +15684,7 @@ c
         1.652, 1.675, 1.697, 1.718, 1.738, 1.757, 1.775, 1.792,
         1.808, 1.823, 1.838, 1.851, 1.877, 1.900])
 
-    # data p5b（p5b(10,20)）
+    # data p5b(p5b(10,20))
     p5b = np.zeros((11, 21))
     p5b[1:, 1:] = np.array([
         1.943, 1.928, 1.923, 1.921, 1.921, 1.921, 1.921, 1.921, 1.921, 1.921,
@@ -15665,7 +15717,7 @@ c
         1.699, 1.709, 1.719, 1.729, 1.746, 1.762, 1.777, 1.790,
         1.803, 1.814, 1.825, 1.834, 1.843])
 
-    # data p6b（p6b(10,13)）
+    # data p6b(p6b(10,13))
     p6b = np.zeros((11, 14))
     p6b[1:, 1:] = np.array([
         1.862, 1.855, 1.853, 1.852, 1.852, 1.852, 1.852, 1.852, 1.852, 1.852,
@@ -15690,7 +15742,7 @@ c
         1.401, 1.408, 1.415, 1.421, 1.427, 1.433, 1.439, 1.444, 1.454, 1.463,
         1.471, 1.479, 1.486, 1.492, 1.498, 1.504, 1.509, 1.514, 1.525, 1.534])
 
-    # data p7b（p7b(10,10)）
+    # data p7b(p7b(10,10))
     p7b = np.zeros((11, 11))
     p7b[1:, 1:] = np.array([
         1.555, 1.546, 1.544, 1.543, 1.542, 1.542, 1.542, 1.542, 1.542, 1.542,
@@ -15713,7 +15765,7 @@ c
         0.981, 0.982, 0.983, 0.984, 0.984, 0.985, 0.986, 0.986, 0.987, 0.988,
         0.989])
 
-    # data p8b（p8b(10,9)）
+    # data p8b(p8b(10,9))
     p8b = np.zeros((11, 10))
     p8b[1:, 1:] = np.array([
         0.992, 0.991, 0.990, 0.990, 0.990, 0.990, 0.990, 0.990, 0.990, 0.990,
@@ -15730,7 +15782,7 @@ c
     # data p9a /39*0.000,0.001,0.002,0.005,0.008,0.014,0.021/
     p9a = np.array([0.0] + [0.0] * 39 + [0.001, 0.002, 0.005, 0.008, 0.014, 0.021])
 
-    # data p9b（p9b(10,5)）
+    # data p9b(p9b(10,5))
     p9b = np.zeros((11, 6))
     p9b[1:, 1:] = np.array([
         0.032, 0.032, 0.031, 0.031, 0.031, 0.031, 0.031, 0.031, 0.031, 0.031,
@@ -15741,13 +15793,13 @@ c
     ]).reshape(5, 10).T
 
     na = nca[ion]
-    nb = 50 - na                       # NB 计算后未被使用（Fortran 亦然）
+    nb = 50 - na                       # NB is unused after being computed (also in Fortran)
     pne = math.log10(ane * xbtz * t)
     t0 = xmil * t
     j = 1
     goto16 = False
     if pne < pn[1]:
-        pass                           # GO TO 15（J 保持 1）
+        pass                           # GO TO 15 (J stays 1)
     elif pne > pn[nne]:
         j1 = nne
         j2 = nne
@@ -15757,24 +15809,24 @@ c
             if pne >= pn[j] and pne < pn[j + 1]:
                 break                  # GO TO 15
         else:
-            # TODO(port): 循环正常结束（如 pne==pn(nne)）时 Fortran 中 J=NNE，
-            # 随后 j2=j1+1 会越界；Fortran 原代码此处亦为未定义行为，保持直译
+            # TODO(port): if the loop ends normally (e.g. pne==pn(nne)), J=NNE in Fortran,
+            # then j2=j1+1 is out of bounds; also undefined in the original, kept literal
             j = nne
     if not goto16:
-        # 标号 15
+        # label 15
         j1 = j
         j2 = j1 + 1
         if pne < pn[1]:
             j2 = 1
-    # 标号 16
+    # label 16
     for i in range(1, 50):             # DO 20 I=1,49
         if t0 >= tt[i] and t0 < tt[i + 1]:
             break                      # GO TO 25
     else:
-        # TODO(port): 循环正常结束（如 t0<tt(1)）时 Fortran 中 I=50，i2=51 越界；
-        # Fortran 原代码此处亦为未定义行为，保持直译
+        # TODO(port): if the loop ends normally (e.g. t0<tt(1)), I=50 and i2=51 are out of
+        # bounds in Fortran; also undefined in the original, kept as a literal translation
         i = 50
-    # 标号 25
+    # label 25
     i1 = i
     i2 = i + 1
     if t0 > tt[50]:
@@ -15899,11 +15951,11 @@ C            to be inverted;
 C      Inversion is accomplished in place and the original matrix is
 C      replaced by its inverse
 C
-    对应 synspec54.f 行 14736–14811
+    Corresponds to synspec54.f lines 14736-14811
     """
     # IF(N.EQ.1) GO TO 250
     if n == 1:
-        # 标号 250
+        # label 250
         a[1, 1] = 1.0 / a[1, 1]
         return
     for i in range(2, n + 1):                # DO 50 I=2,N
@@ -15912,17 +15964,17 @@ C
             jm1 = j - 1
             div = a[j, j]
             sum = 0.0
-            # IF(JM1.LT.1) GO TO 20 → 跳过求和，直接执行标号 20 的赋值
+            # IF(JM1.LT.1) GO TO 20 -> skip the summation, execute the label 20 assignment directly
             if jm1 >= 1:
                 for k in range(1, jm1 + 1):  # DO 10 K=1,JM1
                     sum = sum + a[i, k] * a[k, j]
-            # 标号 20
+            # label 20
             a[i, j] = (a[i, j] - sum) / div
         for j in range(i, n + 1):            # DO 40 J=I,N
             sum = 0.0
             for k in range(1, im1 + 1):      # DO 30 K=1,IM1
                 sum = sum + a[i, k] * a[k, j]
-            # 标号 40
+            # label 40
             a[i, j] = a[i, j] - sum
     for ii in range(2, n + 1):               # DO 80 II=2,N
         i = n + 2 - ii
@@ -15933,17 +15985,17 @@ C
             j = i - jj
             jp1 = j + 1
             sum = 0.0
-            # IF(JP1.GT.IM1) GO TO 70 → 跳过求和，直接执行标号 70 的赋值
+            # IF(JP1.GT.IM1) GO TO 70 -> skip the summation, execute the label 70 assignment directly
             if jp1 <= im1:
                 for k in range(jp1, im1 + 1):  # DO 60 K=JP1,IM1
                     sum = sum + a[i, k] * a[k, j]
-            # 标号 70
+            # label 70
             a[i, j] = -a[i, j] - sum
     for ii in range(1, n + 1):               # DO 110 II=1,N
         i = n + 1 - ii
         div = a[i, i]
         ip1 = i + 1
-        # IF(IP1.GT.N) GO TO 110 → 跳过内层循环，但仍执行标号 110 的赋值
+        # IF(IP1.GT.N) GO TO 110 -> skip the inner loop, but still execute the label 110 assignment
         if ip1 <= n:
             for jj in range(ip1, n + 1):     # DO 100 JJ=IP1,N
                 j = n + ip1 - jj
@@ -15951,7 +16003,7 @@ C
                 for k in range(ip1, j + 1):  # DO 90 K=IP1,J
                     sum = sum + a[i, k] * a[k, j]
                 a[i, j] = -sum / div
-        # 标号 110
+        # label 110
         a[i, i] = 1.0 / a[i, i]
 
     for i in range(1, n + 1):                # DO 240 I=1,N
@@ -15959,7 +16011,7 @@ C
             k0 = i
             # IF(J.GE.I) GO TO 220
             if j >= i:
-                # 标号 220
+                # label 220
                 k0 = j
                 sum = a[i, k0]
                 if k0 != n:                  # IF(K0.EQ.N) GO TO 230
@@ -15969,10 +16021,10 @@ C
                         sum = sum + a[i, k] * a[k, j]
             else:
                 sum = 0.0
-                # 标号 200
+                # label 200
                 for k in range(k0, n + 1):   # DO 210 K=K0,N
                     sum = sum + a[i, k] * a[k, j]
-            # 标号 230（GO TO 230 也落到这里）
+            # label 230 (GO TO 230 also lands here)
             a[i, j] = sum
     return
 
@@ -15990,7 +16042,7 @@ C            B  - the rhs vector
 C     Output: X - solution vector
 C     Note that matrix A and vector B are destroyed here !
 C
-    对应 synspec54.f 行 14818–14880
+    Corresponds to synspec54.f lines 14818-14880
     """
     d = np.zeros(MLEVEL + 1)                 # DIMENSION D(MLEVEL)
     ip = np.zeros(MLEVEL + 1, dtype=np.int64)  # DIMENSION IP(MLEVEL)
@@ -16007,7 +16059,7 @@ C
                 jp1 = j + 1
                 for k in range(jp1, n + 1):  # DO 20 K=JP1,N
                     d[k] = d[k] - a[k, j] * a[j, i]
-        # 标号 40
+        # label 40
         am = abs(d[i])
         ip[i] = i
         for k in range(i, n + 1):            # DO 50 K=I,N
@@ -16020,20 +16072,20 @@ C
         d[it] = d[i]
         ip1 = i + 1
         if ip1 > n:
-            break                            # GO TO 80 → 跳出循环 70
+            break                            # GO TO 80 -> exit loop 70
         for k in range(ip1, n + 1):          # DO 60 K=IP1,N
             a[k, i] = d[k] / a[i, i]
-    # 标号 80
+    # label 80
     for i in range(1, n + 1):                # DO 100 I=1,N
         it = ip[i]
         x[i] = b[it]
         b[it] = b[i]
         ip1 = i + 1
         if ip1 > n:
-            break                            # GO TO 110 → 跳出循环 100
+            break                            # GO TO 110 -> exit loop 100
         for j in range(ip1, n + 1):          # DO 90 J=IP1,N
             b[j] = b[j] - a[j, i] * x[i]
-    # 标号 110
+    # label 110
     for i in range(1, n + 1):                # DO 140 I=1,N
         k = n - i + 1
         sum = 0.0
@@ -16042,7 +16094,7 @@ C
         if kp1 <= n:
             for j in range(kp1, n + 1):      # DO 120 J=KP1,N
                 sum = sum + a[k, j] * x[j]
-        # 标号 130
+        # label 130
         x[k] = (x[k] - sum) / a[k, k]
     return
 
@@ -16053,7 +16105,7 @@ C     ==================
 C
 C     First exponential integral function E1(X)
 C
-    对应 synspec54.f 行 14887–14904
+    Corresponds to synspec54.f lines 14887-14904
     """
     if x <= 1.0:
         expint_v = (-math.log(x) - 0.57721566 + x * (0.99999193 + x * (-0.24991055
@@ -16085,15 +16137,15 @@ C      NXX  - number of elements in array XX
 C     Output:
 C      YY   - interpolated functional values YY=y(XX)
 C
-    对应 synspec54.f 行 14911–14992
+    Corresponds to synspec54.f lines 14911-14992
     """
-    # 语句函数 EXP10(X0)=EXP(X0*2.30258509299405D0)
+    # statement function EXP10(X0)=EXP(X0*2.30258509299405D0)
     def exp10(x0):
         return math.exp(x0 * 2.30258509299405)
 
     # IF(NPOL.LE.0.OR.NX.LE.0) GO TO 200
     if npol <= 0 or nx <= 0:
-        # 标号 200
+        # label 200
         n = nx
         if nxx >= nx:
             n = nxx
@@ -16109,7 +16161,7 @@ C
     if ilogy != 0:
         for i in range(1, nx + 1):
             y[i] = math.log10(y[i])
-    nm = idiv(npol + 1, 2)                   # Fortran 整数除法 (NPOL+1)/2
+    nm = idiv(npol + 1, 2)                   # Fortran integer division (NPOL+1)/2
     nm1 = nm + 1
     nup = nx + nm1 - npol
     for id in range(1, nxx + 1):             # DO ID=1,NXX
@@ -16118,8 +16170,8 @@ C
             if xxx <= x[i]:
                 break                        # GO TO 70
         else:
-            i = nup                          # 循环正常结束后执行 I=NUP
-        # 标号 70
+            i = nup                          # execute I=NUP after the loop ends normally
+        # label 70
         j = i - nm
         jj = j + npol - 1
         yyy = 0.0
@@ -16150,7 +16202,7 @@ c     =====================================================
 c
 c     a more efficient interpolation routine - using bisection
 c
-    对应 synspec54.f 行 14997–15040
+    Corresponds to synspec54.f lines 14997-15040
     """
     yint = np.zeros(MFGRID + 1)              # dimension yint(mfgrid)
     jint = np.zeros(MFGRID + 1, dtype=np.int64)  # dimension jint(mfgrid)
@@ -16163,9 +16215,9 @@ c
         xint = wlgrid[ij]
         jl = 0
         ju = nfr + 1
-        # 标号 10（GO TO 10 → while 循环）
+        # label 10 (GO TO 10 -> while loop)
         while ju - jl > 1:
-            jm = idiv(ju + jl, 2)            # Fortran 整数除法 (JU+JL)/2
+            jm = idiv(ju + jl, 2)            # Fortran integer division (JU+JL)/2
             # IF((FR2.GT.FR1).EQV.(XINT.GT.WLTAB(JM)))
             if (fr2 > fr1) == (xint > wltab[jm]):
                 jl = jm
@@ -16177,19 +16229,19 @@ c
         if j == 0:
             j = j + 1
         jint[ij] = j
-        # c           yint(ij)=un/log10(wltab(j+1)/wltab(j))（原代码注释掉的形式）
+        # c           yint(ij)=un/log10(wltab(j+1)/wltab(j)) (commented-out form in the original)
         yint[ij] = 1.0 / (wltab[j + 1] - wltab[j])
 
     for ij in range(1, nfgrid + 1):
         j = jint[ij]
         rc = (absop[j + 1] - absop[j]) * yint[ij]
-        # c           abgrd(ij)=rc*log10(wlgrid(ij)/wltab(j))+absop(j)（原代码注释掉的形式）
+        # c           abgrd(ij)=rc*log10(wlgrid(ij)/wltab(j))+absop(j) (commented-out form in the original)
         abgrd[ij] = rc * (wlgrid[ij] - wltab[j]) + absop[j]
     return
 # -*- coding: utf-8 -*-
-# chunk13: synspec54.f 行 15045-17482 的逐行直译
-# 包含子程序: PFSPEC / PARTDV / PFNi / PFHEAV
-# 拼装上下文（由 synspec54.py 提供，本分片禁止 import）:
+# chunk13: line-by-line literal translation of synspec54.f lines 15045-17482
+# contained subroutines: PFSPEC / PARTDV / PFNi / PFHEAV
+# assembly context (provided by synspec54.py; this chunk must not import):
 #   import math, sys; import numpy as np; from params import *
 #   import commons as C; from fortran import *
 
@@ -16218,8 +16270,8 @@ def pfspec(IAT, IZI, T, ANE, U):
 
     M.A.Barstow - University of Leicester, Dept of Physics & Astronomy
 
-    对应 synspec54.f 行 15045-16746。
-    标量哑元 U 被赋值 → 按约定返回全部标量哑元 (IAT, IZI, T, ANE, U)。
+    Corresponds to synspec54.f lines 15045-16746.
+    Scalar dummy U is assigned -> by convention return all scalar dummies (IAT, IZI, T, ANE, U).
     """
     # INCLUDE 'PARAMS.FOR'
     # real nvii
@@ -16261,10 +16313,10 @@ def pfspec(IAT, IZI, T, ANE, U):
     ZC = 6.0
     ZN = 7.0
     ZO = 8.0
-    # DIMENSION/INTEGER 声明的各离子数组（N***=QUANTUM NO. OF LEVEL,
-    # G***=STATISTICAL WEIGHT OF LEVEL, EN***=ENERGY OF LEVEL, S*=SCREENING NO. OF LEVEL）
-    # 以下 DATA 初始化，之后不再修改 → 按约定置于函数顶部
-    # DATA NHYD/.../（原 synspec54.f 行 15106-15122）
+    # ion arrays declared via DIMENSION/INTEGER (N***=QUANTUM NO. OF LEVEL,
+    # G***=STATISTICAL WEIGHT OF LEVEL, EN***=ENERGY OF LEVEL, S*=SCREENING NO. OF LEVEL)
+    # DATA-initialized below, never modified afterwards -> placed at the top of the function by convention
+    # DATA NHYD/.../ (original synspec54.f lines 15106-15122)
     NHYD = np.array([0] + [
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
         11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
@@ -16277,7 +16329,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
         91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
     ], dtype=np.int64)
-    # DATA GHYD/.../（原 synspec54.f 行 15123-15156）
+    # DATA GHYD/.../ (original synspec54.f lines 15123-15156)
     GHYD = np.array([0] + [
         2.000000, 8.000000, 18.00000, 32.00000, 50.00000, 72.00000, 98.00000, 128.0000, 162.0000, 200.0000,
         242.0000, 288.0000, 338.0000, 392.0000, 450.0000, 512.0000, 578.0000, 648.0000, 722.0000, 800.0000,
@@ -16290,7 +16342,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         13122.00, 13448.00, 13778.00, 14112.00, 14450.00, 14792.00, 15138.00, 15488.00, 15842.00, 16200.00,
         16562.00, 16928.00, 17298.00, 17672.00, 18050.00, 18432.00, 18818.00, 19208.00, 19602.00, 20000.00,
     ], dtype=float)
-    # DATA ENHYD/.../（原 synspec54.f 行 15157-15190）
+    # DATA ENHYD/.../ (original synspec54.f lines 15157-15190)
     ENHYD = np.array([0] + [
         0.0000000E+00, 10.19085000000000, 12.07804444444444, 12.73856250000000, 13.04428800000000, 13.21036111111111, 13.31049795918367, 13.37549062500000, 13.42004938271605, 13.45192200000000,
         13.47550413223140, 13.49344027777778, 13.50739881656805, 13.51847448979592, 13.52740977777778, 13.53472265625000, 13.54078339100346, 13.54586234567901, 13.55016066481994, 13.55383050000000,
@@ -16303,9 +16355,9 @@ def pfspec(IAT, IZI, T, ANE, U):
         13.58572900472489, 13.58577920880428, 13.58582760923211, 13.58587429138322, 13.58591933564014, 13.58596281773932, 13.58600480908971, 13.58604537706612, 13.58608458527964, 13.58612249382716,
         13.58615915952180, 13.58619463610586, 13.58622897444791, 13.58626222272522, 13.58629442659280, 13.58632562934028, 13.58635587203741, 13.58638519366930, 13.58641363126212, 13.58644122000000,
     ], dtype=float)
-    # DATA SHYD/.../（原 synspec54.f 行 15191-15191）
+    # DATA SHYD/.../ (original synspec54.f lines 15191-15191)
     SHYD = np.array([0] + [0.0e0] * 100, dtype=float)
-    # DATA NHEL/.../（原 synspec54.f 行 15192-15203）
+    # DATA NHEL/.../ (original synspec54.f lines 15192-15203)
     NHEL = np.array([0] + [
         1, 2, 2, 2, 2, 2, 2, 3, 3, 3,
         3, 3, 3, 3, 3, 4, 4, 4, 4, 4,
@@ -16318,7 +16370,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
         72, 73, 74, 75, 76, 77, 78, 79, 80, 81,
     ], dtype=np.int64)
-    # DATA GHEL/.../（原 synspec54.f 行 15204-15230）
+    # DATA GHEL/.../ (original synspec54.f lines 15204-15230)
     GHEL = np.array([0] + [
         1.0e0, 3.0e0, 1.0e0, 5.0e0, 3.0e0, 1.0e0, 3.0e0, 3.0e0, 1.0e0, 5.0e0,
         3.0e0, 1.0e0, 15.0e0, 5.0e0, 3.0e0, 3.0e0, 1.0e0, 9.0e0, 15.0e0, 5.0e0,
@@ -16331,7 +16383,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         15376.00000000000, 15876.00000000000, 16384.00000000000, 16900.00000000000, 17424.00000000000, 17956.00000000000, 18496.00000000000, 19044.00000000000, 19600.00000000000, 20164.00000000000,
         20736.00000000000, 21316.00000000000, 21904.00000000000, 22500.00000000000, 23104.00000000000, 23716.00000000000, 24336.00000000000, 24964.00000000000, 25600.00000000000, 26244.00000000000,
     ], dtype=float)
-    # DATA ENHEL/.../（原 synspec54.f 行 15231-15261）
+    # DATA ENHEL/.../ (original synspec54.f lines 15231-15261)
     ENHEL = np.array([0] + [
         0.0e0, 19.819e0, 20.615e0, 20.964e0, 20.964e0, 20.964e0, 21.218e0, 22.718e0, 22.920e0, 23.007e0,
         23.007e0, 23.007e0, 23.073e0, 23.074e0, 23.087e0, 23.593e0, 23.673e0, 23.707e0, 23.736e0, 23.736e0,
@@ -16344,13 +16396,13 @@ def pfspec(IAT, IZI, T, ANE, U):
         24.58380189906348, 24.58390262030738, 24.58399865722656, 24.58409029585799, 24.58417780073462, 24.58426141679661, 24.58434137110727, 24.58441787439614, 24.58449112244898, 24.58456129736163,
         24.58462856867284, 24.58469309438919, 24.58475502191381, 24.58481448888889, 24.58487162396122, 24.58492654747850, 24.58497937212360, 24.58503020349303, 24.58507914062500, 24.58512627648224,
     ], dtype=float)
-    # DATA SHEL/.../（原 synspec54.f 行 15262-15268）
+    # DATA SHEL/.../ (original synspec54.f lines 15262-15268)
     SHEL = np.array([0] + [
         0.375e0, 0.622e0, 0.622e0, 0.842e0, 0.842e0, 0.842e0, 0.842e0, 0.747e0, 0.747e0, 0.912e0,
         0.912e0, 0.912e0, 0.993e0, 0.993e0, 0.912e0, 0.810e0, 0.810e0, 0.937e0, 0.995e0, 0.995e0,
         1.000e0, 1.000e0, 0.937e0, 0.949e0, 0.958e0,
     ] + [1.000e0] * 75, dtype=float)
-    # DATA NCI/.../（原 synspec54.f 行 15269-15276）
+    # DATA NCI/.../ (original synspec54.f lines 15269-15276)
     NCI = np.array([0] + [
         2, 2, 2, 2, 2, 2, 3, 3, 3, 3,
         2, 2, 2, 3, 3, 3, 3, 3, 3, 3,
@@ -16367,7 +16419,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         9, 9, 9, 10, 10, 10, 11, 11, 11, 2,
         3, 3, 3, 2, 2,
     ], dtype=np.int64)
-    # DATA GCI/.../（原 synspec54.f 行 15277-15303）
+    # DATA GCI/.../ (original synspec54.f lines 15277-15303)
     GCI = np.array([0] + [
         1.0e0, 3.0e0, 5.0e0, 5.0e0, 1.0e0, 5.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0,
         7.0e0, 5.0e0, 3.0e0, 3.0e0, 3.0e0, 5.0e0, 7.0e0, 3.0e0, 1.0e0, 3.0e0,
@@ -16384,7 +16436,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5.0e0, 7.0e0, 7.0e0, 3.0e0, 5.0e0, 7.0e0, 3.0e0, 5.0e0, 7.0e0, 5.0e0,
         3.0e0, 5.0e0, 7.0e0, 3.0e0, 3.0e0,
     ], dtype=float)
-    # DATA ENCI/.../（原 synspec54.f 行 15304-15330）
+    # DATA ENCI/.../ (original synspec54.f lines 15304-15330)
     ENCI = np.array([0] + [
         0.0e0, 2.0333605e-03, 5.3933649e-03, 1.263870, 2.684086, 4.182672, 7.480511, 7.482891, 7.487915, 7.684888,
         7.946046, 7.946620, 7.946474, 8.537387, 8.640516, 8.643146, 8.647287, 8.771255, 8.846707, 8.848247,
@@ -16401,7 +16453,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         11.09843, 11.09843, 11.09880, 11.13129, 11.13129, 11.13129, 11.15477, 11.15477, 11.15477, 12.13544,
         12.83767, 12.84024, 12.84331, 13.11772, 14.86312,
     ], dtype=float)
-    # DATA NCII/.../（原 synspec54.f 行 15331-15337）
+    # DATA NCII/.../ (original synspec54.f lines 15331-15337)
     NCII = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         3, 3, 3, 2, 3, 3, 2, 2, 4, 4,
@@ -16420,7 +16472,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
         6, 6, 6, 6, 6, 6, 6,
     ], dtype=np.int64)
-    # DATA GCII/.../（原 synspec54.f 行 15338-15369）
+    # DATA GCII/.../ (original synspec54.f lines 15338-15369)
     GCII = np.array([0] + [
         2.0e0, 4.0e0, 2.0e0, 4.0e0, 6.0e0, 6.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0,
         2.0e0, 2.0e0, 4.0e0, 4.0e0, 4.0e0, 6.0e0, 6.0e0, 4.0e0, 2.0e0, 2.0e0,
@@ -16439,7 +16491,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         8.0e0, 10.0e0, 6.0e0, 8.0e0, 10.0e0, 12.0e0, 8.0e0, 6.0e0, 4.0e0, 2.0e0,
         2.0e0, 4.0e0, 6.0e0, 8.0e0, 6.0e0, 4.0e0, 2.0e0,
     ], dtype=float)
-    # DATA ENCII/.../（原 synspec54.f 行 15370-15401）
+    # DATA ENCII/.../ (original synspec54.f lines 15370-15401)
     ENCII = np.array([0] + [
         0.0e0, 7.9350658e-03, 5.331397, 5.334075, 5.337658, 9.290338, 9.290624, 11.96386, 13.71590, 13.72101,
         14.44900, 16.33194, 16.33332, 17.60895, 18.04607, 18.04625, 18.65519, 18.65582, 19.49478, 20.14995,
@@ -16458,7 +16510,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         28.66875, 28.66875, 28.70253, 28.70253, 28.70253, 28.70253, 28.70515, 28.70515, 28.70515, 28.70515,
         29.31561, 29.31561, 29.31561, 29.31561, 29.33557, 29.33557, 29.33557,
     ], dtype=float)
-    # DATA NCIII/.../（原 synspec54.f 行 15402-15408）
+    # DATA NCIII/.../ (original synspec54.f lines 15402-15408)
     NCIII = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -16477,7 +16529,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
         7, 7, 7, 7, 7, 7,
     ], dtype=np.int64)
-    # DATA GCIII/.../（原 synspec54.f 行 15409-15439）
+    # DATA GCIII/.../ (original synspec54.f lines 15409-15439)
     GCIII = np.array([0] + [
         1.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 5.0e0, 1.0e0,
         3.0e0, 1.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0, 5.0e0,
@@ -16496,7 +16548,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0, 5.0e0, 3.0e0, 1.0e0,
         3.0e0, 5.0e0, 7.0e0, 1.0e0, 3.0e0, 5.0e0,
     ], dtype=float)
-    # DATA ENCIII/.../（原 synspec54.f 行 15440-15471）
+    # DATA ENCIII/.../ (original synspec54.f lines 15440-15471)
     ENCIII = np.array([0] + [
         0.0e0, 6.486296, 6.489148, 6.496191, 12.69008, 17.03237, 17.03602, 17.04185, 18.08638, 22.62984,
         29.52845, 30.64541, 32.10371, 32.19328, 32.19396, 32.19555, 33.47080, 33.45866, 33.47146, 34.27982,
@@ -16515,7 +16567,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         52.24497, 52.31775, 52.31775, 52.31775, 52.43107, 52.43107, 52.43107, 52.45302, 52.45302, 52.45302,
         53.23251, 53.23251, 53.23251, 53.27802, 53.27802, 53.27802,
     ], dtype=float)
-    # DATA NCIV/.../（原 synspec54.f 行 15472-15474）
+    # DATA NCIV/.../ (original synspec54.f lines 15472-15474)
     NCIV = np.array([0] + [
         2, 2, 2, 3, 3, 3, 3, 3, 4, 4,
         4, 4, 4, 4, 4, 5, 5, 5, 5, 5,
@@ -16524,7 +16576,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7, 7, 7, 7, 7, 7, 8, 8, 8, 8,
         8, 8, 8, 8, 8,
     ], dtype=np.int64)
-    # DATA GCIV/.../（原 synspec54.f 行 15475-15485）
+    # DATA GCIV/.../ (original synspec54.f lines 15475-15485)
     GCIV = np.array([0] + [
         2.0e0, 2.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0, 2.0e0, 2.0e0,
         4.0e0, 4.0e0, 6.0e0, 6.0e0, 8.0e0, 2.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0,
@@ -16533,7 +16585,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6.0e0, 8.0e0, 8.0e0, 10.0e0, 10.0e0, 12.0e0, 2.0e0, 4.0e0, 6.0e0, 8.0e0,
         8.0e0, 10.0e0, 12.0e0, 14.0e0, 16.0e0,
     ], dtype=float)
-    # DATA ENCIV/.../（原 synspec54.f 行 15486-15496）
+    # DATA ENCIV/.../ (original synspec54.f lines 15486-15496)
     ENCIV = np.array([0] + [
         0.0e0, 7.995100, 8.008378, 37.54872, 39.68134, 39.68525, 40.28040, 40.28173, 49.76113, 50.62434,
         50.62599, 50.87540, 50.87595, 50.88784, 50.88784, 55.21889, 55.65134, 55.65221, 55.77947, 55.77947,
@@ -16542,22 +16594,22 @@ def pfspec(IAT, IZI, T, ANE, U):
         60.05156, 60.05156, 60.05191, 60.05191, 60.05194, 60.05194, 61.05946, 61.05946, 61.09294, 61.09294,
         61.09319, 61.09319, 61.09319, 61.09319, 61.09319,
     ], dtype=float)
-    # DATA NCV/.../（原 synspec54.f 行 15497-15497）
+    # DATA NCV/.../ (original synspec54.f lines 15497-15497)
     NCV = np.array([0] + [
         1, 2, 2, 2, 2, 2, 3, 3, 3, 3,
         4, 5, 6, 7, 8,
     ], dtype=np.int64)
-    # DATA GCV/.../（原 synspec54.f 行 15498-15500）
+    # DATA GCV/.../ (original synspec54.f lines 15498-15500)
     GCV = np.array([0] + [
         1.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 3.0e0, 5.0e0, 7.0e0, 3.0e0,
         3.0e0, 3.0e0, 3.0e0, 3.0e0, 3.0e0,
     ], dtype=float)
-    # DATA ENCV/.../（原 synspec54.f 行 15501-15503）
+    # DATA ENCV/.../ (original synspec54.f lines 15501-15503)
     ENCV = np.array([0] + [
         0.0e0, 298.9618, 304.4046, 304.4030, 304.4199, 307.8855, 354.2645, 354.2645, 354.2645, 354.5177,
         370.9247, 378.5349, 382.6710, 385.1917, 386.6807,
     ], dtype=float)
-    # DATA NNI/.../（原 synspec54.f 行 15504-15514）
+    # DATA NNI/.../ (original synspec54.f lines 15504-15514)
     NNI = np.array([0] + [
         2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
         2, 2, 2, 3, 3, 3, 3, 3, 3, 3,
@@ -16583,7 +16635,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         11, 11, 11, 11, 11, 11, 11, 11, 11, 13,
         13, 12, 12, 12, 12, 12, 12, 12,
     ], dtype=np.int64)
-    # DATA GNI/.../（原 synspec54.f 行 15515-15560）
+    # DATA GNI/.../ (original synspec54.f lines 15515-15560)
     GNI = np.array([0] + [
         4.0e0, 6.0e0, 4.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 6.0e0, 2.0e0, 4.0e0,
         6.0e0, 4.0e0, 2.0e0, 2.0e0, 2.0e0, 4.0e0, 6.0e0, 8.0e0, 2.0e0, 4.0e0,
@@ -16609,7 +16661,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         2.0e0, 4.0e0, 6.0e0, 8.0e0, 4.0e0, 6.0e0, 2.0e0, 4.0e0, 6.0e0, 2.0e0,
         4.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 6.0e0, 4.0e0, 6.0e0,
     ], dtype=float)
-    # DATA ENNI/.../（原 synspec54.f 行 15561-15606）
+    # DATA ENNI/.../ (original synspec54.f lines 15561-15606)
     ENNI = np.array([0] + [
         0.0e0, 2.383371, 2.384363, 3.575739, 3.575739, 10.32619, 10.33038, 10.33617, 10.67904, 10.69042,
         10.92429, 10.92973, 10.93217, 11.60284, 11.75037, 11.75317, 11.75780, 11.76412, 11.83769, 11.83997,
@@ -16635,7 +16687,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         14.42781, 14.42781, 14.42781, 14.42781, 14.43636, 14.43636, 14.43698, 14.43698, 14.43698, 14.46253,
         14.44021, 14.44455, 14.44455, 14.45434, 14.45434, 14.45434, 14.45980, 14.45980,
     ], dtype=float)
-    # DATA NNII/.../（原 synspec54.f 行 15607-15611）
+    # DATA NNII/.../ (original synspec54.f lines 15607-15611)
     NNII = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         2, 2, 2, 3, 3, 3, 3, 2, 3, 3,
@@ -16651,7 +16703,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
         3, 3,
     ], dtype=np.int64)
-    # DATA GNII/.../（原 synspec54.f 行 15612-15636）
+    # DATA GNII/.../ (original synspec54.f lines 15612-15636)
     GNII = np.array([0] + [
         1.0e0, 3.0e0, 5.0e0, 5.0e0, 1.0e0, 5.0e0, 7.0e0, 5.0e0, 3.0e0, 5.0e0,
         3.0e0, 1.0e0, 5.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 3.0e0, 3.0e0, 3.0e0,
@@ -16667,7 +16719,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5.0e0, 7.0e0, 9.0e0, 11.0e0, 7.0e0, 5.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0,
         7.0e0, 9.0e0,
     ], dtype=float)
-    # DATA ENNII/.../（原 synspec54.f 行 15637-15661）
+    # DATA ENNII/.../ (original synspec54.f lines 15637-15661)
     ENNII = np.array([0] + [
         0.0e0, 6.0876831e-03, 1.6279284e-02, 1.898923, 4.052723, 5.848106, 11.43604, 11.43781, 11.43801, 13.54146,
         13.54146, 13.54228, 17.87734, 18.46259, 18.46651, 18.48341, 18.49722, 19.23384, 20.40944, 20.64636,
@@ -16683,7 +16735,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         30.17448, 30.17763, 30.18179, 30.18682, 30.34387, 30.34864, 30.35188, 30.41607, 30.41652, 30.41750,
         30.41894, 30.42068,
     ], dtype=float)
-    # DATA NNIII/.../（原 synspec54.f 行 15662-15667）
+    # DATA NNIII/.../ (original synspec54.f lines 15662-15667)
     NNIII = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         2, 2, 2, 3, 2, 2, 3, 3, 3, 3,
@@ -16700,7 +16752,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         4, 4, 4, 4, 4, 4, 4, 3, 3, 5,
         5, 5, 5,
     ], dtype=np.int64)
-    # DATA GNIII/.../（原 synspec54.f 行 15668-15694）
+    # DATA GNIII/.../ (original synspec54.f lines 15668-15694)
     GNIII = np.array([0] + [
         2.0e0, 4.0e0, 2.0e0, 4.0e0, 6.0e0, 6.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0,
         4.0e0, 6.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0,
@@ -16717,7 +16769,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         10.0e0, 8.0e0, 6.0e0, 4.0e0, 2.0e0, 6.0e0, 4.0e0, 4.0e0, 6.0e0, 2.0e0,
         4.0e0, 6.0e0, 8.0e0,
     ], dtype=float)
-    # DATA ENNIII/.../（原 synspec54.f 行 15695-15721）
+    # DATA ENNIII/.../ (original synspec54.f lines 15695-15721)
     ENNIII = np.array([0] + [
         0.0e0, 2.1635452e-02, 7.180255, 7.098413, 7.108480, 12.52548, 12.52643, 16.24252, 18.08651, 18.10019,
         23.16076, 25.17799, 25.18006, 27.43827, 28.56680, 28.56730, 30.45896, 30.46342, 33.13367, 33.13441,
@@ -16734,7 +16786,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         48.14229, 48.14024, 48.14488, 48.15087, 48.15427, 48.15307, 48.16119, 49.16950, 49.17073, 50.71214,
         50.71214, 50.71214, 50.71214,
     ], dtype=float)
-    # DATA NNIV/.../（原 synspec54.f 行 15722-15724）
+    # DATA NNIV/.../ (original synspec54.f lines 15722-15724)
     NNIV = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -16745,7 +16797,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5, 5, 5, 6, 6, 6, 4, 4, 4, 4,
         5, 5, 4,
     ], dtype=np.int64)
-    # DATA GNIV/.../（原 synspec54.f 行 15725-15739）
+    # DATA GNIV/.../ (original synspec54.f lines 15725-15739)
     GNIV = np.array([0] + [
         1.0e0, 1.0e0, 3.0e0, 7.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 5.0e0, 1.0e0,
         3.0e0, 1.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0, 5.0e0, 1.0e0,
@@ -16756,7 +16808,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7.0e0, 9.0e0, 11.0e0, 3.0e0, 5.0e0, 7.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0,
         3.0e0, 5.0e0, 7.0e0,
     ], dtype=float)
-    # DATA ENNIV/.../（原 synspec54.f 行 15740-15754）
+    # DATA ENNIV/.../ (original synspec54.f lines 15740-15754)
     ENNIV = np.array([0] + [
         0.0e0, 8.323934, 8.331770, 8.349648, 16.20427, 21.75491, 21.76399, 21.77946, 23.41898, 29.18244,
         46.76804, 50.15470, 50.32483, 50.32679, 50.33118, 52.06988, 52.07031, 52.07132, 53.20933, 57.68086,
@@ -16767,7 +16819,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         68.73986, 68.73986, 68.73986, 71.28416, 71.28416, 71.28416, 73.28070, 73.60580, 73.60580, 73.61063,
         78.63129, 78.63129, 78.63129,
     ], dtype=float)
-    # DATA NNV/.../（原 synspec54.f 行 15755-15756）
+    # DATA NNV/.../ (original synspec54.f lines 15755-15756)
     NNV = np.array([0] + [
         2, 2, 2, 3, 3, 3, 3, 3, 4, 4,
         4, 4, 4, 5, 5, 5, 5, 5, 6, 6,
@@ -16776,7 +16828,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
         8,
     ], dtype=np.int64)
-    # DATA GNV/.../（原 synspec54.f 行 15757-15766）
+    # DATA GNV/.../ (original synspec54.f lines 15757-15766)
     GNV = np.array([0] + [
         2.0e0, 2.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0, 2.0e0, 2.0e0,
         4.0e0, 4.0e0, 6.0e0, 2.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0, 2.0e0, 2.0e0,
@@ -16785,7 +16837,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         2.0e0, 4.0e0, 4.0e0, 6.0e0, 6.0e0, 8.0e0, 8.0e0, 10.0e0, 12.0e0, 14.0e0,
         16.0e0,
     ], dtype=float)
-    # DATA ENNV/.../（原 synspec54.f 行 15767-15777）
+    # DATA ENNV/.../ (original synspec54.f lines 15767-15777)
     ENNV = np.array([0] + [
         0.0e0, 9.976473, 10.00851, 56.55396, 59.23740, 59.24660, 60.05890, 60.06188, 75.17694, 76.26962,
         76.26962, 76.61120, 76.61120, 83.55153, 84.09893, 84.09893, 84.27598, 84.27598, 88.02306, 88.33514,
@@ -16794,19 +16846,19 @@ def pfspec(IAT, IZI, T, ANE, U):
         92.53167, 92.53167, 92.57358, 92.57358, 92.57618, 92.57618, 92.57668, 92.57668, 92.57668, 92.57668,
         92.57668,
     ], dtype=float)
-    # DATA NNVI/.../（原 synspec54.f 行 15778-15778）
+    # DATA NNVI/.../ (original synspec54.f lines 15778-15778)
     NNVI = np.array([0] + [
         1, 2, 2, 2, 2, 2, 3, 4,
     ], dtype=np.int64)
-    # DATA GNVI/.../（原 synspec54.f 行 15779-15779）
+    # DATA GNVI/.../ (original synspec54.f lines 15779-15779)
     GNVI = np.array([0] + [
         1.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 3.0e0, 3.0e0,
     ], dtype=float)
-    # DATA ENNVI/.../（原 synspec54.f 行 15780-15781）
+    # DATA ENNVI/.../ (original synspec54.f lines 15780-15781)
     ENNVI = np.array([0] + [
         0.0e0, 419.8009, 426.2953, 426.2965, 426.3325, 425.7398, 497.9737, 521.5830,
     ], dtype=float)
-    # DATA NOI/.../（原 synspec54.f 行 15782-15789）
+    # DATA NOI/.../ (original synspec54.f lines 15782-15789)
     NOI = np.array([0] + [
         2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
         3, 3, 3, 4, 4, 3, 3, 3, 3, 3,
@@ -16827,7 +16879,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5, 5, 5, 5, 5, 5, 5, 5, 5, 7,
         6, 6, 6, 2,
     ], dtype=np.int64)
-    # DATA GOI/.../（原 synspec54.f 行 15790-15824）
+    # DATA GOI/.../ (original synspec54.f lines 15790-15824)
     GOI = np.array([0] + [
         5.0e0, 3.0e0, 1.0e0, 5.0e0, 1.0e0, 5.0e0, 3.0e0, 3.0e0, 5.0e0, 7.0e0,
         5.0e0, 3.0e0, 1.0e0, 5.0e0, 3.0e0, 9.0e0, 7.0e0, 5.0e0, 5.0e0, 3.0e0,
@@ -16848,7 +16900,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7.0e0, 5.0e0, 9.0e0, 11.0e0, 9.0e0, 7.0e0, 5.0e0, 3.0e0, 1.0e0, 5.0e0,
         5.0e0, 3.0e0, 1.0e0, 3.0e0,
     ], dtype=float)
-    # DATA ENOI/.../（原 synspec54.f 行 15825-15859）
+    # DATA ENOI/.../ (original synspec54.f lines 15825-15859)
     ENOI = np.array([0] + [
         0.0e0, 01.9651687e-02, 2.8082693e-02, 1.967363, 0.4206081, 9.146132, 9.521420, 10.74028, 10.74053, 10.74098,
         10.98893, 10.98886, 10.98895, 11.83768, 11.93056, 12.07869, 12.07870, 12.07870, 12.07872, 12.07872,
@@ -16869,7 +16921,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         16.35702, 16.35702, 16.39057, 16.39063, 16.39308, 16.39308, 16.40451, 16.40451, 16.40451, 16.54127,
         16.56668, 16.56668, 16.56668, 23.53702,
     ], dtype=float)
-    # DATA NOII/.../（原 synspec54.f 行 15860-15867）
+    # DATA NOII/.../ (original synspec54.f lines 15860-15867)
     NOII = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         3, 3, 3, 3, 3, 2, 3, 3, 3, 3,
@@ -16892,7 +16944,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         4, 4, 4, 5, 5, 3, 3, 3, 3, 3,
         4,
     ], dtype=np.int64)
-    # DATA GOII/.../（原 synspec54.f 行 15868-15906）
+    # DATA GOII/.../ (original synspec54.f lines 15868-15906)
     GOII = np.array([0] + [
         4.0e0, 6.0e0, 4.0e0, 4.0e0, 2.0e0, 6.0e0, 4.0e0, 2.0e0, 6.0e0, 4.0e0,
         2.0e0, 4.0e0, 6.0e0, 2.0e0, 4.0e0, 2.0e0, 2.0e0, 2.0e0, 4.0e0, 6.0e0,
@@ -16915,7 +16967,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         12.0e0, 2.0e0, 4.0e0, 4.0e0, 6.20e0, 10.0e0, 8.0e0, 6.0e0, 4.0e0, 2.0e0,
         6.0e0,
     ], dtype=float)
-    # DATA ENOII/.../（原 synspec54.f 行 15907-15944）
+    # DATA ENOII/.../ (original synspec54.f lines 15907-15944)
     ENOII = np.array([0] + [
         0.0e0, 3.323850, 3.326454, 5.017305, 5.017491, 14.85813, 14.87838, 14.88860, 20.58005, 20.57736,
         22.96648, 22.97954, 23.001876, 23.41940, 23.44172, 24.26523, 25.28586, 25.63160, 25.63849, 25.64984,
@@ -16938,7 +16990,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         34.23350, 34.25269, 34.25269, 34.48530, 34.48530, 36.19083, 36.18759, 36.19109, 36.19123, 36.19131,
         37.05294,
     ], dtype=float)
-    # DATA NOIII/.../（原 synspec54.f 行 15945-15951）
+    # DATA NOIII/.../ (original synspec54.f lines 15945-15951)
     NOIII = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 3, 3, 2,
         2, 2, 2, 2, 2, 3, 3, 3, 3, 2,
@@ -16958,7 +17010,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         4, 4, 4, 4, 4, 4, 4, 4, 3, 3,
         3, 3, 3, 3, 3, 3, 3, 5,
     ], dtype=np.int64)
-    # DATA GOIII/.../（原 synspec54.f 行 15952-15985）
+    # DATA GOIII/.../ (original synspec54.f lines 15952-15985)
     GOIII = np.array([0] + [
         1.0e0, 3.0e0, 5.0e0, 5.0e0, 1.0e0, 5.0e0, 7.0e0, 5.0e0, 3.0e0, 5.0e0,
         3.0e0, 1.0e0, 5.0e0, 3.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 5.0e0,
@@ -16978,7 +17030,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5.0e0, 7.0e0, 3.0e0, 5.0e0, 7.0e0, 7.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0,
         9.0e0, 3.0e0, 5.0e0, 7.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0,
     ], dtype=float)
-    # DATA ENOIII/.../（原 synspec54.f 行 15986-16019）
+    # DATA ENOIII/.../ (original synspec54.f lines 15986-16019)
     ENOIII = np.array([0] + [
         0.0e0, 1.4059945e-02, 3.8038719e-02, 2.513308, 5.354124, 7.477820, 14.88140, 14.88477, 14.88550, 17.65325,
         17.65339, 17.65514, 23.19140, 24.43587, 26.09378, 33.13600, 33.15068, 33.18253, 33.85794, 35.18196,
@@ -16998,7 +17050,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         54.47044, 54.48261, 54.88958, 54.88958, 54.88958, 55.81414, 55.82281, 55.82951, 56.14741, 56.14741,
         56.14741, 56.31095, 56.31095, 56.31095, 56.73994, 56.73994, 56.73994, 58.73808,
     ], dtype=float)
-    # DATA NOIV/.../（原 synspec54.f 行 16020-16026）
+    # DATA NOIV/.../ (original synspec54.f lines 16020-16026)
     NOIV = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
@@ -17018,7 +17070,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         3, 3, 3, 6, 6, 6, 6, 4, 4, 3,
         4, 4, 7, 7, 7, 7,
     ], dtype=np.int64)
-    # DATA GOIV/.../（原 synspec54.f 行 16027-16059）
+    # DATA GOIV/.../ (original synspec54.f lines 16027-16059)
     GOIV = np.array([0] + [
         2.0e0, 4.0e0, 2.0e0, 4.0e0, 6.0e0, 6.0e0, 4.0e0, 2.0e0, 2.0e0, 6.0e0,
         4.0e0, 6.0e0, 4.0e0, 2.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 2.0e0, 4.0e0,
@@ -17038,7 +17090,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         8.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 6.0e0, 8.0e0, 4.0e0, 6.0e0, 2.0e0,
         4.0e0, 6.0e0, 2.0e0, 4.0e0, 6.0e0, 8.0e0,
     ], dtype=float)
-    # DATA ENOIV/.../（原 synspec54.f 行 16060-16092）
+    # DATA ENOIV/.../ (original synspec54.f lines 16060-16092)
     ENOIV = np.array([0] + [
         0.0e0, 4.7920357e-02, 8.824909, 8.841201, 8.864076, 15.73825, 15.73998, 20.37910, 22.37705, 22.40721,
         28.67474, 31.63571, 31.63934, 35.83378, 35.83476, 44.33902, 48.37428, 48.38508, 54.37857, 54.39532,
@@ -17058,7 +17110,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         80.72900, 81.00314, 81.01343, 81.37509, 81.37509, 81.37509, 81.37509, 81.42716, 81.42716, 81.83012,
         82.88895, 82.88895, 83.03365, 83.03365, 83.03365, 83.03365,
     ], dtype=float)
-    # DATA NOV/.../（原 synspec54.f 行 16093-16097）
+    # DATA NOV/.../ (original synspec54.f lines 16093-16097)
     NOV = np.array([0] + [
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -17073,7 +17125,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5, 5, 5, 5, 5, 5, 5, 6, 6, 6,
         6, 6, 6, 6, 6,
     ], dtype=np.int64)
-    # DATA GOV/.../（原 synspec54.f 行 16098-16120）
+    # DATA GOV/.../ (original synspec54.f lines 16098-16120)
     GOV = np.array([0] + [
         1.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 5.0e0, 1.0e0,
         3.0e0, 1.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0, 5.0e0,
@@ -17088,7 +17140,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5.0e0, 5.0e0, 5.0e0, 3.0e0, 5.0e0, 7.0e0, 7.0e0, 3.0e0, 3.0e0, 5.0e0,
         7.0e0, 1.0e0, 3.0e0, 5.0e0, 5.0e0,
     ], dtype=float)
-    # DATA ENOV/.../（原 synspec54.f 行 16121-16143）
+    # DATA ENOV/.../ (original synspec54.f lines 16121-16143)
     ENOV = np.array([0] + [
         0.0e0, 10.18183, 10.19878, 10.23674, 19.68863, 26.48845, 26.50776, 26.54108, 28.73015, 35.69651,
         67.83862, 69.59028, 72.01395, 72.28146, 72.28596, 72.29554, 74.50599, 74.50733, 74.50979, 75.95557,
@@ -17103,7 +17155,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         111.7535, 111.8898, 111.9082, 112.1444, 112.1444, 112.1444, 112.3809, 115.9379, 116.0435, 116.0435,
         116.0435, 116.1501, 116.1501, 116.1501, 116.2166,
     ], dtype=float)
-    # DATA NOVI/.../（原 synspec54.f 行 16144-16145）
+    # DATA NOVI/.../ (original synspec54.f lines 16144-16145)
     NOVI = np.array([0] + [
         2, 2, 2, 3, 3, 3, 3, 3, 4, 4,
         4, 4, 4, 4, 4, 5, 5, 5, 5, 5,
@@ -17112,7 +17164,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
         8, 8,
     ], dtype=np.int64)
-    # DATA GOVI/.../（原 synspec54.f 行 16146-16155）
+    # DATA GOVI/.../ (original synspec54.f lines 16146-16155)
     GOVI = np.array([0] + [
         2.0e0, 2.0e0, 4.0e0, 2.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0, 2.0e0, 2.0e0,
         4.0e0, 4.0e0, 6.0e0, 6.0e0, 8.0e0, 2.0e0, 2.0e0, 4.0e0, 4.0e0, 6.0e0,
@@ -17121,7 +17173,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         2.0e0, 2.0e0, 4.0e0, 6.0e0, 8.0e0, 8.0e0, 10.0e0, 12.0e0, 14.0e0, 16.0e0,
         4.0e0, 6.0e0,
     ], dtype=float)
-    # DATA ENOVI/.../（原 synspec54.f 行 16156-16166）
+    # DATA ENOVI/.../ (original synspec54.f lines 16156-16166)
     ENOVI = np.array([0] + [
         0.0e0, 11.94909, 12.01505, 79.35559, 82.58831, 82.60773, 83.64374, 83.65008, 105.7219, 107.0408,
         107.0487, 107.4805, 107.4831, 107.5050, 107.5062, 117.6237, 118.2920, 118.2920, 118.5122, 118.5122,
@@ -17130,22 +17182,22 @@ def pfspec(IAT, IZI, T, ANE, U):
         130.2520, 130.3984, 130.3984, 130.4674, 130.4674, 130.4680, 130.4680, 130.4680, 130.4680, 130.4680,
         130.4693, 130.4693,
     ], dtype=float)
-    # DATA NOVII/.../（原 synspec54.f 行 16167-16167）
+    # DATA NOVII/.../ (original synspec54.f lines 16167-16167)
     NOVII = np.array([0] + [
         1, 2, 2, 2, 2, 2, 3, 3, 3, 3,
         3, 3, 3, 4, 5, 6,
     ], dtype=np.int64)
-    # DATA GOVII/.../（原 synspec54.f 行 16168-16170）
+    # DATA GOVII/.../ (original synspec54.f lines 16168-16170)
     GOVII = np.array([0] + [
         1.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 3.0e0, 1.0e0, 3.0e0, 5.0e0, 7.0e0,
         5.0e0, 3.0e0, 3.0e0, 3.0e0, 3.0e0, 3.0e0,
     ], dtype=float)
-    # DATA ENOVII/.../（原 synspec54.f 行 16171-16173）
+    # DATA ENOVII/.../ (original synspec54.f lines 16171-16173)
     ENOVII = np.array([0] + [
         0.0e0, 561.0761, 568.6182, 568.6255, 568.6938, 573.9532, 664.1129, 664.1129, 664.1129, 665.1804,
         665.1804, 665.1804, 665.6218, 697.8022, 712.7239, 720.8449,
     ], dtype=float)
-    # DATA SCI/.../（原 synspec54.f 行 16174-16200）
+    # DATA SCI/.../ (original synspec54.f lines 16174-16200)
     SCI = np.array([0] + [
         4.179704, 4.179868, 4.180140, 4.284864, 4.411317, 4.556712, 4.417538, 4.418036, 4.419087, 4.460873,
         5.012059, 5.012145, 5.012123, 4.656621, 4.682271, 4.682931, 4.683973, 4.715525, 4.735114, 4.735517,
@@ -17162,7 +17214,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         5.006886, 5.006886, 5.008002, 5.012074, 5.012074, 5.012074, 5.014099, 5.014099, 5.014099, 6.000000,
         6.000000, 6.000000, 6.000000, 6.000000, 6.000000,
     ], dtype=float)
-    # DATA SCII/.../（原 synspec54.f 行 16201-16232）
+    # DATA SCII/.../ (original synspec54.f lines 16201-16232)
     SCII = np.array([0] + [
         3.322208, 3.322644, 3.633090, 3.633257, 3.633480, 3.893420, 3.893440, 4.089184, 4.229172, 4.229597,
         3.436720, 3.692591, 3.692789, 4.589103, 3.953149, 3.953178, 4.702748, 4.702820, 3.603431, 3.770060,
@@ -17181,7 +17233,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000,
         6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000,
     ], dtype=float)
-    # DATA SCIII/.../（原 synspec54.f 行 16233-16264）
+    # DATA SCIII/.../ (original synspec54.f lines 16233-16264)
     SCIII = np.array([0] + [
         2.247678, 2.511178, 2.511298, 2.511595, 2.783334, 2.988424, 2.988601, 2.988887, 3.040348, 3.275480,
         2.516355, 2.624130, 2.770250, 2.779440, 2.779510, 2.779673, 2.913505, 2.912204, 2.913576, 3.001503,
@@ -17200,7 +17252,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000,
         6.000000, 6.000000, 6.000000, 6.000000, 6.000000, 6.000000,
     ], dtype=float)
-    # DATA SCIV/.../（原 synspec54.f 行 16265-16275）
+    # DATA SCIV/.../ (original synspec54.f lines 16265-16275)
     SCIV = np.array([0] + [
         1.644934, 1.923884, 1.924364, 1.778341, 1.948965, 1.949284, 1.998202, 1.998312, 1.838941, 1.962835,
         1.963075, 1.999589, 1.999669, 2.001418, 2.001418, 1.874532, 1.972046, 1.972243, 2.001394, 2.001394,
@@ -17209,12 +17261,12 @@ def pfspec(IAT, IZI, T, ANE, U):
         2.007061, 2.007061, 2.007217, 2.007217, 2.007234, 2.007234, 1.989961, 1.989961, 2.009654, 2.009654,
         2.009800, 2.009800, 2.009800, 2.009800, 2.009800,
     ], dtype=float)
-    # DATA SCV/.../（原 synspec54.f 行 16276-16278）
+    # DATA SCV/.../ (original synspec54.f lines 16276-16278)
     SCV = np.array([0] + [
         0.6309066, 0.7688928, 0.9242349, 0.9241881, 0.9246764, 1.026124, 1.003322, 1.003322, 1.003322, 1.020118,
         1.021842, 1.027042, 1.033988, 1.051912, 1.003001,
     ], dtype=float)
-    # DATA SNI/.../（原 synspec54.f 行 16279-16324）
+    # DATA SNI/.../ (original synspec54.f lines 16279-16324)
     SNI = np.array([0] + [
         4.931870, 5.108953, 5.109031, 5.204087, 5.204087, 5.329969, 5.330800, 5.331948, 5.401419, 5.403777,
         5.968683, 5.969459, 5.969806, 5.605717, 5.641185, 5.641868, 5.642995, 5.644538, 5.662621, 5.663186,
@@ -17240,7 +17292,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6.000838, 6.000838, 6.000838, 6.000838, 6.039686, 6.039686, 6.042562, 6.042562, 6.042562, 6.018730,
         5.886326, 5.994597, 5.994597, 6.047575, 6.047575, 6.047575, 6.078406, 6.078406,
     ], dtype=float)
-    # DATA SNII/.../（原 synspec54.f 行 16325-16349）
+    # DATA SNII/.../ (original synspec54.f lines 16325-16349)
     SNII = np.array([0] + [
         4.048939, 4.049242, 4.049750, 4.145151, 4.258360, 4.356432, 4.688145, 4.688257, 4.688270, 4.826217,
         4.826217, 4.826272, 5.142618, 4.284333, 4.284811, 4.286872, 4.288557, 5.253337, 4.532960, 4.564950,
@@ -17256,7 +17308,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000,
         7.000000, 7.000000,
     ], dtype=float)
-    # DATA SNIII/.../（原 synspec54.f 行 16350-16376）
+    # DATA SNIII/.../ (original synspec54.f lines 16350-16376)
     SNIII = np.array([0] + [
         3.264886, 3.265738, 3.559230, 3.555733, 3.556163, 3.795859, 3.795903, 3.971288, 4.062202, 4.062887,
         4.328298, 4.441761, 4.441879, 3.362787, 4.644640, 4.644671, 3.648880, 3.649321, 3.924340, 3.924418,
@@ -17273,7 +17325,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000, 7.000000,
         7.000000, 7.000000, 7.000000,
     ], dtype=float)
-    # DATA SNIV/.../（原 synspec54.f 行 16377-16391）
+    # DATA SNIV/.../ (original synspec54.f lines 16377-16391)
     SNIV = np.array([0] + [
         2.226836, 2.490623, 2.490878, 2.491461, 2.755431, 2.952339, 2.952669, 2.953231, 3.013266, 3.231892,
         2.493613, 2.749589, 2.762857, 2.763010, 2.763353, 2.901417, 2.901452, 2.901533, 2.994477, 3.382731,
@@ -17284,7 +17336,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         2.998267, 2.998267, 2.998267, 2.959708, 2.959708, 2.959708, 4.785085, 4.873190, 4.873190, 4.874527,
         7.000000, 7.000000, 7.000000,
     ], dtype=float)
-    # DATA SNV/.../（原 synspec54.f 行 16392-16402）
+    # DATA SNV/.../ (original synspec54.f lines 16392-16402)
     SNV = np.array([0] + [
         1.634565, 1.915400, 1.916327, 1.771111, 1.943796, 1.944398, 1.997854, 1.998051, 1.833396, 1.959357,
         1.959357, 1.999384, 1.999384, 1.870467, 1.969524, 1.969524, 2.001982, 2.001982, 1.895972, 1.977561,
@@ -17293,11 +17345,11 @@ def pfspec(IAT, IZI, T, ANE, U):
         1.990742, 1.990742, 2.010469, 2.010469, 2.011696, 2.011696, 2.011930, 2.011930, 2.011930, 2.011930,
         2.011930,
     ], dtype=float)
-    # DATA SNVI/.../（原 synspec54.f 行 16403-16404）
+    # DATA SNVI/.../ (original synspec54.f lines 16403-16404)
     SNVI = np.array([0] + [
         0.6290283, 0.7657156, 0.9208641, 0.9208946, 0.9217644, 0.9074407, 1.024314, 1.024867,
     ], dtype=float)
-    # DATA SOI/.../（原 synspec54.f 行 16405-16439）
+    # DATA SOI/.../ (original synspec54.f lines 16405-16439)
     SOI = np.array([0] + [
         5.998809, 6.000254, 6.000874, 6.149045, 6.029965, 6.280362, 6.354168, 6.620857, 6.620917, 6.621027,
         6.681873, 6.681856, 6.681878, 6.554275, 6.592577, 6.991942, 6.991948, 6.991948, 6.991953, 6.991953,
@@ -17318,7 +17370,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
         8.000000, 8.000000, 8.000000, 8.000000,
     ], dtype=float)
-    # DATA SOII/.../（原 synspec54.f 行 16440-16478）
+    # DATA SOII/.../ (original synspec54.f lines 16440-16478)
     SOII = np.array([0] + [
         4.784610, 4.940430, 4.940555, 5.022952, 5.022962, 5.557054, 5.558274, 5.558889, 5.930025, 5.929834,
         5.160761, 5.162283, 5.164577, 5.214052, 5.216705, 6.210938, 5.445367, 5.490556, 5.491464, 5.492962,
@@ -17341,7 +17393,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6.963802, 6.974759, 6.974759, 6.897856, 6.897856, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
         8.000000,
     ], dtype=float)
-    # DATA SOIII/.../（原 synspec54.f 行 16479-16512）
+    # DATA SOIII/.../ (original synspec54.f lines 16479-16512)
     SOIII = np.array([0] + [
         3.980091, 3.980605, 3.981483, 4.073126, 4.181011, 4.263698, 4.567496, 2.851461, 2.851508, 4.688399,
         4.688406, 4.688483, 4.944256, 5.004756, 5.087306, 4.201648, 4.202927, 4.205704, 4.265077, 5.589531,
@@ -17361,7 +17413,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         7.261456, 7.271212, 7.771374, 7.771374, 7.771374, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
         8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
     ], dtype=float)
-    # DATA SOIV/.../（原 synspec54.f 行 16513-16546）
+    # DATA SOIV/.../ (original synspec54.f lines 16513-16546)
     SOIV = np.array([0] + [
         3.228562, 3.230039, 3.508826, 3.509360, 3.510109, 3.741247, 3.741307, 3.904661, 3.977057, 3.978160,
         4.214302, 4.331145, 4.331291, 4.503491, 4.503533, 3.322590, 3.617383, 3.618198, 4.097019, 4.098440,
@@ -17381,7 +17433,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
         8.000000, 8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
     ], dtype=float)
-    # DATA SOV/.../（原 synspec54.f 行 16547-16569）
+    # DATA SOV/.../ (original synspec54.f lines 16547-16569)
     SOV = np.array([0] + [
         2.212299, 2.477108, 2.477559, 2.478570, 2.736373, 2.929941, 2.930501, 2.931468, 2.995396, 3.204502,
         2.480139, 2.586177, 2.736415, 2.753261, 2.753545, 2.754149, 2.895501, 2.895588, 2.895747, 2.990361,
@@ -17396,7 +17448,7 @@ def pfspec(IAT, IZI, T, ANE, U):
         6.025977, 6.090481, 6.099398, 6.217293, 6.217293, 6.217293, 6.343698, 8.000000, 8.000000, 8.000000,
         8.000000, 8.000000, 8.000000, 8.000000, 8.000000,
     ], dtype=float)
-    # DATA SOVI/.../（原 synspec54.f 行 16570-16580）
+    # DATA SOVI/.../ (original synspec54.f lines 16570-16580)
     SOVI = np.array([0] + [
         1.626749, 1.908750, 1.910343, 1.765577, 1.939605, 1.940666, 1.997515, 1.997865, 1.829541, 1.956604,
         1.957376, 1.999562, 1.999822, 2.001964, 2.002083, 1.867336, 1.968342, 1.968342, 2.001995, 2.001995,
@@ -17405,13 +17457,13 @@ def pfspec(IAT, IZI, T, ANE, U):
         1.930105, 1.987143, 1.987143, 2.014184, 2.014184, 2.014431, 2.014431, 2.014431, 2.014431, 2.014431,
         2.014965, 2.014965,
     ], dtype=float)
-    # DATA SOVII/.../（原 synspec54.f 行 16581-16584）
+    # DATA SOVII/.../ (original synspec54.f lines 16581-16584)
     SOVII = np.array([0] + [
         0.6273875, 0.7631111, 0.9180546, 0.9182081, 0.9196253, 1.029738, 0.9543552, 0.9543552, 0.9543552, 1.004676,
         1.004676, 1.004676, 1.025589, 1.027917, 1.034432, 1.045346,
     ], dtype=float)
     # Find index for atom and ion, 10*IAT+IZI
-    # c       IF(IAT.EQ.26.AND.IZI.GE.6.AND.IZI.LE.9) GO TO 260  （原代码已注释，不翻译）
+    # c       IF(IAT.EQ.26.AND.IZI.GE.6.AND.IZI.LE.9) GO TO 260  (commented out in the original, not translated)
     _goto9999 = False
     if IAT > 2 and IAT < 6:
         _goto9999 = True  # GO TO 9999
@@ -17420,11 +17472,11 @@ def pfspec(IAT, IZI, T, ANE, U):
     if _goto9999:
         # 9999
         U = 0
-        # TODO(port): 原语句为 WRITE(*,*)!! INVALID ... !!（无引号，依赖编译器扩展）
+        # TODO(port): the original statement is WRITE(*,*)!! INVALID ... !! (no quotes, relies on a compiler extension)
         print('!! INVALID ATOM IN USER SUPPLIED ROUTINE PARTFUN !!')
         raise SystemExit  # STOP
     IND = 10 * IAT + IZI
-    # 原代码为一串 IF(IND.EQ.nn) GO TO nn；全部不匹配时顺序落入标号 11（H）
+    # the original code is a series of IF(IND.EQ.nn) GO TO nn; if none matches, control falls through to label 11 (H)
     if IND == 21:
         # 21: CALCULATING PARTITION FUNCTIONS FOR HEI
         T, ANE, ZHE, MHEI, U = partdv(T, ANE, ZHE, MHEI, NHEL, GHEL, ENHEL, SHEL, U)
@@ -17439,8 +17491,8 @@ def pfspec(IAT, IZI, T, ANE, U):
         # GO TO 8888
     elif IND == 61:
         # 62: CALCULATING PARTITION FUNCTIONS FOR CII
-        # TODO(port): 原代码笔误 IF(IND.EQ.61) GO TO 62（应为 IND.EQ.62），此分支永假；
-        # IND=62 时实际落入标号 11（按 H 处理），此处按原文直译保留
+        # TODO(port): typo in the original code: IF(IND.EQ.61) GO TO 62 (should be IND.EQ.62), so this
+        # branch is never taken; IND=62 falls through to label 11 (treated as H); kept literal
         T, ANE, ZC, MCII, U = partdv(T, ANE, ZC, MCII, NCII, GCII, ENCII, SCII, U)
         # GO TO 8888
     elif IND == 63:
@@ -17521,11 +17573,11 @@ def pfspec(IAT, IZI, T, ANE, U):
         # GO TO 8888
     else:
         # 11: CALCULATING PARTITION FUNCTIONS FOR HYDROGEN
-        # （IND==11，或上述 IF 全部不匹配时顺序落入标号 11——Fortran 原逻辑如此）
+        # (IND==11, or fall through to label 11 when none of the IFs above match -- original Fortran logic)
         T, ANE, ZH, MH, U = partdv(T, ANE, ZH, MH, NHYD, GHYD, ENHYD, SHYD, U)
         # GO TO 8888
     # C       CALCULATING PARTITION FUNCTIONS FOR FE VI - FE IX
-    # C260    CALL PFFE(IZI,T,ANE,U)   （原代码已注释，不翻译）
+    # C260    CALL PFFE(IZI,T,ANE,U)   (commented out in the original code; not translated)
     # 8888 CONTINUE
     return IAT, IZI, T, ANE, U  # RETURN
 
@@ -17539,8 +17591,8 @@ def partdv(TEMP, DNE, Z, NLEV, NE, GEE, ENRGY, S, U):
     SUBROUTINE PARTDV(TEMP,DNE,Z,NLEV,NE,GEE,ENRGY,S,U)
     ===================================================
 
-    对应 synspec54.f 行 16751-16779。
-    标量哑元 U 被赋值 → 按约定返回全部标量哑元 (TEMP, DNE, Z, NLEV, U)。
+    Corresponds to synspec54.f lines 16751-16779.
+    Scalar dummy argument U is assigned -> by convention all scalar dummy arguments are returned (TEMP, DNE, Z, NLEV, U).
     """
     # INCLUDE 'PARAMS.FOR'
     # DIMENSION GEE(*),ENRGY(*),S(*)
@@ -17587,20 +17639,20 @@ def pfni(ion, t, pf, dut, dun):
              DUT  d(PF)/dT
              DUN  d(PF)/d(ANE) (=0 in this version)
 
-    对应 synspec54.f 行 16783-17108。
-    标量哑元 PF/DUT/DUN 被赋值 → 按约定返回全部标量哑元 (ion, t, pf, dut, dun)。
+    Corresponds to synspec54.f lines 16783-17108.
+    Scalar dummy arguments PF/DUT/DUN are assigned -> by convention all scalar dummy arguments are returned (ion, t, pf, dut, dun).
     """
     # implicit double precision (a-h,o-z)
     # dimension g0(6), p4a(190),p4b(170), ..., p9a(190),p9b(170)
     # parameter (xen=2.302585093,xmil=0.001)
     xen = 2.302585093
     xmil = 0.001
-    # 以下 DATA 初始化，之后不再修改 → 按约定置于函数顶部
-    # DATA G0/.../（原 synspec54.f 行 16810-16810）
+    # The following DATA initializations are never modified afterwards -> placed at the top of the function by convention
+    # DATA G0/.../ (original synspec54.f lines 16810-16810)
     g0 = np.array([0] + [
         28., 25., 6., 25., 28., 21.,
     ], dtype=float)
-    # DATA P4A/.../（原 synspec54.f 行 16812-16831）
+    # DATA P4A/.../ (original synspec54.f lines 16812-16831)
     p4a = np.array([0] + [
         1.447, 1.464, 1.482, 1.501, 1.518, 1.535, 1.551, 1.567, 1.582, 1.596,
         1.610, 1.623, 1.636, 1.648, 1.659, 1.671, 1.681, 1.692, 1.702, 1.711,
@@ -17622,7 +17674,7 @@ def pfni(ion, t, pf, dut, dun):
         3.589, 3.597, 3.604, 3.612, 3.619, 3.626, 3.634, 3.641, 3.648, 3.655,
         3.662, 3.669, 3.676, 3.682, 3.689, 3.696, 3.702, 3.709, 3.715, 3.722,
     ], dtype=float)
-    # DATA P4B/.../（原 synspec54.f 行 16832-16849）
+    # DATA P4B/.../ (original synspec54.f lines 16832-16849)
     p4b = np.array([0] + [
         3.589, 3.597, 3.604, 3.612, 3.619, 3.626, 3.634, 3.641, 3.648, 3.655,
         3.662, 3.669, 3.676, 3.682, 3.689, 3.696, 3.702, 3.709, 3.715, 3.722,
@@ -17642,7 +17694,7 @@ def pfni(ion, t, pf, dut, dun):
         4.240, 4.243, 4.245, 4.247, 4.250, 4.252, 4.255, 4.257, 4.259, 4.262,
         4.264, 4.266, 4.268, 4.271, 4.273, 4.275, 4.278, 4.280, 4.282, 4.284,
     ], dtype=float)
-    # DATA P5A/.../（原 synspec54.f 行 16850-16869）
+    # DATA P5A/.../ (original synspec54.f lines 16850-16869)
     p5a = np.array([0] + [
         1.398, 1.408, 1.427, 1.446, 1.466, 1.486, 1.506, 1.526, 1.545, 1.564,
         1.583, 1.601, 1.619, 1.636, 1.652, 1.668, 1.683, 1.698, 1.712, 1.725,
@@ -17664,7 +17716,7 @@ def pfni(ion, t, pf, dut, dun):
         3.120, 3.129, 3.138, 3.147, 3.156, 3.164, 3.173, 3.182, 3.190, 3.198,
         3.207, 3.215, 3.223, 3.232, 3.240, 3.248, 3.256, 3.264, 3.272, 3.279,
     ], dtype=float)
-    # DATA P5B/.../（原 synspec54.f 行 16870-16887）
+    # DATA P5B/.../ (original synspec54.f lines 16870-16887)
     p5b = np.array([0] + [
         3.120, 3.129, 3.138, 3.147, 3.156, 3.164, 3.173, 3.182, 3.190, 3.198,
         3.207, 3.215, 3.223, 3.232, 3.240, 3.248, 3.256, 3.264, 3.272, 3.279,
@@ -17684,7 +17736,7 @@ def pfni(ion, t, pf, dut, dun):
         3.945, 3.948, 3.951, 3.955, 3.958, 3.961, 3.964, 3.967, 3.970, 3.974,
         3.977, 3.980, 3.983, 3.986, 3.989, 3.992, 3.995, 3.998, 4.001, 4.004,
     ], dtype=float)
-    # DATA P6A/.../（原 synspec54.f 行 16888-16907）
+    # DATA P6A/.../ (original synspec54.f lines 16888-16907)
     p6a = np.array([0] + [
         0.778, 0.804, 0.817, 0.834, 0.854, 0.876, 0.901, 0.928, 0.957, 0.987,
         1.017, 1.048, 1.079, 1.109, 1.139, 1.169, 1.197, 1.225, 1.253, 1.279,
@@ -17706,7 +17758,7 @@ def pfni(ion, t, pf, dut, dun):
         2.631, 2.639, 2.648, 2.657, 2.666, 2.675, 2.683, 2.692, 2.701, 2.710,
         2.718, 2.727, 2.736, 2.744, 2.753, 2.761, 2.770, 2.779, 2.787, 2.796,
     ], dtype=float)
-    # DATA P6B/.../（原 synspec54.f 行 16908-16925）
+    # DATA P6B/.../ (original synspec54.f lines 16908-16925)
     p6b = np.array([0] + [
         2.631, 2.639, 2.648, 2.657, 2.666, 2.675, 2.683, 2.692, 2.701, 2.710,
         2.718, 2.727, 2.736, 2.744, 2.753, 2.761, 2.770, 2.779, 2.787, 2.796,
@@ -17726,7 +17778,7 @@ def pfni(ion, t, pf, dut, dun):
         3.608, 3.612, 3.616, 3.621, 3.625, 3.629, 3.633, 3.637, 3.641, 3.645,
         3.649, 3.653, 3.657, 3.661, 3.665, 3.669, 3.673, 3.677, 3.681, 3.685,
     ], dtype=float)
-    # DATA P7A/.../（原 synspec54.f 行 16926-16945）
+    # DATA P7A/.../ (original synspec54.f lines 16926-16945)
     p7a = np.array([0] + [
         1.398, 1.398, 1.398, 1.398, 1.406, 1.425, 1.443, 1.461, 1.480, 1.498,
         1.516, 1.534, 1.551, 1.568, 1.585, 1.601, 1.616, 1.631, 1.646, 1.660,
@@ -17748,7 +17800,7 @@ def pfni(ion, t, pf, dut, dun):
         2.325, 2.330, 2.335, 2.339, 2.344, 2.349, 2.354, 2.359, 2.364, 2.369,
         2.374, 2.379, 2.384, 2.389, 2.394, 2.399, 2.405, 2.410, 2.415, 2.420,
     ], dtype=float)
-    # DATA P7B/.../（原 synspec54.f 行 16946-16963）
+    # DATA P7B/.../ (original synspec54.f lines 16946-16963)
     p7b = np.array([0] + [
         2.325, 2.330, 2.335, 2.339, 2.344, 2.349, 2.354, 2.359, 2.364, 2.369,
         2.374, 2.379, 2.384, 2.389, 2.394, 2.399, 2.405, 2.410, 2.415, 2.420,
@@ -17768,7 +17820,7 @@ def pfni(ion, t, pf, dut, dun):
         3.147, 3.152, 3.156, 3.161, 3.165, 3.170, 3.175, 3.179, 3.184, 3.188,
         3.193, 3.197, 3.202, 3.206, 3.210, 3.215, 3.219, 3.224, 3.228, 3.232,
     ], dtype=float)
-    # DATA P8A/.../（原 synspec54.f 行 16964-16983）
+    # DATA P8A/.../ (original synspec54.f lines 16964-16983)
     p8a = np.array([0] + [
         1.447, 1.447, 1.447, 1.447, 1.447, 1.447, 1.459, 1.475, 1.489, 1.504,
         1.518, 1.531, 1.544, 1.556, 1.568, 1.580, 1.591, 1.602, 1.612, 1.622,
@@ -17790,7 +17842,7 @@ def pfni(ion, t, pf, dut, dun):
         2.070, 2.073, 2.076, 2.079, 2.082, 2.085, 2.088, 2.091, 2.094, 2.097,
         2.100, 2.103, 2.107, 2.110, 2.113, 2.116, 2.120, 2.123, 2.126, 2.130,
     ], dtype=float)
-    # DATA P8B/.../（原 synspec54.f 行 16984-17001）
+    # DATA P8B/.../ (original synspec54.f lines 16984-17001)
     p8b = np.array([0] + [
         2.070, 2.073, 2.076, 2.079, 2.082, 2.085, 2.088, 2.091, 2.094, 2.097,
         2.100, 2.103, 2.107, 2.110, 2.113, 2.116, 2.120, 2.123, 2.126, 2.130,
@@ -17810,7 +17862,7 @@ def pfni(ion, t, pf, dut, dun):
         2.669, 2.673, 2.677, 2.681, 2.685, 2.689, 2.693, 2.696, 2.700, 2.704,
         2.708, 2.712, 2.716, 2.720, 2.724, 2.728, 2.732, 2.736, 2.739, 2.743,
     ], dtype=float)
-    # DATA P9A/.../（原 synspec54.f 行 17002-17021）
+    # DATA P9A/.../ (original synspec54.f lines 17002-17021)
     p9a = np.array([0] + [
         1.322, 1.322, 1.322, 1.322, 1.322, 1.322, 1.322, 1.322, 1.322, 1.325,
         1.334, 1.342, 1.351, 1.358, 1.366, 1.373, 1.380, 1.386, 1.392, 1.398,
@@ -17832,7 +17884,7 @@ def pfni(ion, t, pf, dut, dun):
         1.699, 1.701, 1.704, 1.706, 1.709, 1.711, 1.714, 1.716, 1.719, 1.722,
         1.724, 1.727, 1.729, 1.732, 1.735, 1.738, 1.740, 1.743, 1.746, 1.749,
     ], dtype=float)
-    # DATA P9B/.../（原 synspec54.f 行 17022-17039）
+    # DATA P9B/.../ (original synspec54.f lines 17022-17039)
     p9b = np.array([0] + [
         1.699, 1.701, 1.704, 1.706, 1.709, 1.711, 1.714, 1.716, 1.719, 1.722,
         1.724, 1.727, 1.729, 1.732, 1.735, 1.738, 1.740, 1.743, 1.746, 1.749,
@@ -17857,7 +17909,7 @@ def pfni(ion, t, pf, dut, dun):
         dut = 0.
         dun = 0.
         return ion, t, pf, dut, dun
-    it = int(t / 1000)  # INT 向零截断
+    it = int(t / 1000)  # INT truncates toward zero
     if it >= 350:
         it = 349
     t1 = 1000. * it
@@ -17904,7 +17956,7 @@ def pfni(ion, t, pf, dut, dun):
         else:
             xu1 = p9b[it - 180]
             xu2 = p9b[it - 179]
-    # （ion 不在 4..9 时 xu1/xu2 未定义，与原 Fortran 行为一致）
+    # (xu1/xu2 are undefined when ion is not in 4..9, consistent with the original Fortran behavior)
     dxt = xmil * (xu2 - xu1)
     xu = xu1 + (t - t1) * dxt
     pf = math.exp(xen * xu)
@@ -17927,8 +17979,8 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
     EDITED 27 JULY 1994 BY GMW - REPLACED PT III PF COEFF. AND IP
     MODE 3 RETURNS PARTITION FUNCTION
 
-    对应 synspec54.f 行 17113-17479。
-    标量哑元 u 被赋值 → 按约定返回全部标量哑元 (IIZ, JNION, MODE, t, ane, u)。
+    Corresponds to synspec54.f lines 17113-17479.
+    Scalar dummy argument u is assigned -> by convention all scalar dummy arguments are returned (IIZ, JNION, MODE, t, ane, u).
     """
     # IMPLICIT REAL*8 (A-H,O-Z)
     # INCLUDE 'PARAMS.FOR'
@@ -17949,8 +18001,8 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
     POTLO = np.zeros(6 + 1)
     # DIMENSION SCALE(4)
     # DIMENSION NNN(6*218), NNN16..NNN39(54), NNN40(12)
-    # 以下 DATA 初始化（含各离子的打包系数，格式 ( 1)( 2)...(10)(IP)G），之后不再修改
-    # DATA NNN16/.../（原 synspec54.f 行 17158-17167）
+    # The following DATA initializations (packed coefficients of each ion, format ( 1)( 2)...(10)(IP)G) are never modified afterwards
+    # DATA NNN16/.../ (original synspec54.f lines 17158-17167)
     NNN16 = np.array([0] + [
         227027622, 306233052, 356839222, 446052912, 652382292, 763314, 108416342, 222428472, 353944332, 577378932,
         110314303, 1814900, 198724282, 293236452, 468362702, 86511123, 136016073, 3516000, 279836622, 461857562,
@@ -17959,7 +18011,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         68311693, 2028903, 897195961, 107212972, 165021182, 260230862, 356940532, 3682900, 100010001, 100410231,
         108712611, 167124841, 388460411, 939102,
     ], dtype=np.int64)
-    # DATA NNN17/.../（原 synspec54.f 行 17168-17177）
+    # DATA NNN17/.../ (original synspec54.f lines 17168-17177)
     NNN17 = np.array([0] + [
         200020021, 201620761, 223726341, 351352061, 80812472, 1796001, 100610471, 122617301, 300566361, 149924112,
         332342352, 3970000, 403245601, 493151431, 529654331, 559358091, 611065171, 600000, 99710051, 104511541,
@@ -17968,7 +18020,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         794489061, 1593000, 100010261, 114613921, 175221251, 249828711, 324436181, 3421000, 403143241, 491856701,
         649173781, 840396751, 113013392, 981000,
     ], dtype=np.int64)
-    # DATA NNN18/.../（原 synspec54.f 行 17178-17187）
+    # DATA NNN18/.../ (original synspec54.f lines 17178-17187)
     NNN18 = np.array([0] + [
         593676641, 884697521, 105911572, 129515012, 180322212, 1858700, 484470541, 91510972, 125614082, 157017612,
         199722912, 2829900, 630172361, 799686381, 919797221, 102810942, 117712832, 975000, 438055511, 691582151,
@@ -17977,7 +18029,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         427652992, 2160000, 510869921, 87410312, 123116552, 236530712, 377744832, 3590000, 100010001, 100010051,
         105012781, 198535971, 65911422, 1399507,
     ], dtype=np.int64)
-    # DATA NNN19/.../（原 synspec54.f 行 17188-17197）
+    # DATA NNN19/.../ (original synspec54.f lines 17188-17197)
     NNN19 = np.array([0] + [
         461049811, 522254261, 609088131, 168935052, 68612253, 2455908, 759990901, 101911142, 129017782, 302856642,
         99414333, 3690000, 200020011, 200720361, 211523021, 269434141, 459163351, 417502, 100010001, 100110321,
@@ -17986,7 +18038,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         122417632, 1102600, 100010001, 100110321, 129524961, 61014202, 291753192, 4300000, 791587851, 100012192,
         155119942, 254031782, 389946932, 637900,
     ], dtype=np.int64)
-    # DATA NNN20/.../（原 synspec54.f 行 17198-17207）
+    # DATA NNN20/.../ (original synspec54.f lines 17198-17207)
     NNN20 = np.array([0] + [
         118217102, 220827002, 319036792, 416646512, 513256072, 1223000, 92510012, 104710862, 112311612, 120212472,
         132814282, 2050000, 141320802, 291439702, 531170262, 92712273, 162521053, 684000, 354454352, 724689652,
@@ -17995,7 +18047,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         299933893, 1431900, 223725352, 280830972, 340937362, 406844002, 473150632, 2503900, 703972941, 82610822,
         154822682, 327244912, 571469372, 709900,
     ], dtype=np.int64)
-    # DATA NNN21/.../（原 synspec54.f 行 17208-17217）
+    # DATA NNN21/.../ (original synspec54.f lines 17208-17217)
     NNN21 = np.array([0] + [
         75714552, 274347322, 718897632, 123414913, 174920063, 1614900, 267645462, 669890262, 115514323, 173620673,
         242528083, 2714900, 90613732, 184823562, 291735332, 419949102, 565764332, 728000, 131318312, 227126932,
@@ -18004,7 +18056,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         189221613, 1675900, 210622722, 241025422, 267928262, 297731272, 327834282, 2846000, 148520202, 255230902,
         364942462, 489656082, 638872352, 746000,
     ], dtype=np.int64)
-    # DATA NNN22/.../（原 synspec54.f 行 17218-17227）
+    # DATA NNN22/.../ (original synspec54.f lines 17218-17227)
     NNN22 = np.array([0] + [
         153421292, 288137912, 484660322, 720187062, 101011483, 1807000, 254537212, 492362292, 770592182, 107312243,
         137615273, 3104900, 115919651, 320746011, 607576761, 95011642, 141817172, 832900, 755087211, 105913442,
@@ -18013,7 +18065,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         135316982, 2148000, 795887491, 97711762, 156620252, 248329422, 340038582, 3481900, 100010001, 100410241,
         109212891, 176827421, 444268771, 899003,
     ], dtype=np.int64)
-    # DATA NNN23/.../（原 synspec54.f 行 17228-17237）
+    # DATA NNN23/.../ (original synspec54.f lines 17228-17237)
     NNN23 = np.array([0] + [
         200020021, 201720921, 233329881, 451475371, 127520782, 1690301, 100310281, 114815371, 246138311, 519265531,
         791492761, 3747000, 252431921, 368440461, 433746521, 512259221, 723389021, 578400, 100110071, 104611651,
@@ -18022,7 +18074,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         686274341, 1462700, 100010251, 114013811, 175321601, 256829751, 338337901, 3049000, 404043481, 494656811,
         646772781, 813490751, 101411372, 863900,
     ], dtype=np.int64)
-    # DATA NNN24/.../（原 synspec54.f 行 17238-17247）
+    # DATA NNN24/.../ (original synspec54.f lines 17238-17247)
     NNN24 = np.array([0] + [
         303147981, 618472951, 827392621, 103711702, 131214532, 1650000, 313037601, 429347901, 536260591, 689477591,
         862494881, 2529900, 526258801, 657372351, 784284071, 897095741, 102711082, 900900, 440855541, 686481251,
@@ -18031,7 +18083,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         130914002, 1909000, 514269581, 86910562, 130716652, 215327742, 351843662, 3200000, 100010001, 100010091,
         109515351, 291060661, 119621482, 1212716,
     ], dtype=np.int64)
-    # DATA NNN25/.../（原 synspec54.f 行 17248-17257）
+    # DATA NNN25/.../ (original synspec54.f lines 17248-17257)
     NNN25 = np.array([0] + [
         414844131, 465649111, 538464651, 87112232, 158019362, 2120000, 615475101, 867797531, 112213462, 157618062,
         203622662, 3209900, 200020001, 201020501, 215623871, 283536181, 462756261, 389300, 100010001, 100310371,
@@ -18040,7 +18092,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         129115952, 1000000, 100010001, 100310351, 118416321, 264945521, 76512182, 3700000, 71111992, 172323592,
         312540402, 510763182, 765791012, 558000,
     ], dtype=np.int64)
-    # DATA NNN26/.../（原 synspec54.f 行 17258-17267）
+    # DATA NNN26/.../ (original synspec54.f lines 17258-17267)
     NNN26 = np.array([0] + [
         204529582, 383647882, 582469262, 807992692, 104911723, 1106000, 94712552, 148416582, 179819212, 203621522,
         227424042, 1916900, 295959132, 103515693, 215527593, 335939413, 449650223, 565000, 79718153, 289639443,
@@ -18049,7 +18101,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         299232633, 1055000, 46410533, 183826893, 354443773, 518459633, 674375243, 2320000, 139623042, 364860002,
         96114603, 209828633, 373446973, 549000,
     ], dtype=np.int64)
-    # DATA NNN27/.../（原 synspec54.f 行 17268-17277）
+    # DATA NNN27/.../ (original synspec54.f lines 17268-17277)
     NNN27 = np.array([0] + [
         460493692, 158523823, 327142303, 519661563, 709279783, 1073000, 455480232, 114014653, 178521013, 240927073,
         299232633, 2000000, 131720482, 280535692, 441254492, 676583972, 103412583, 555000, 139623042, 364860002,
@@ -18058,7 +18110,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         490556383, 1106900, 269037812, 520270372, 91111273, 133915483, 172719093, 2000000, 800080571, 851699301,
         127617362, 240433032, 444958442, 568000,
     ], dtype=np.int64)
-    # DATA NNN28/.../（原 synspec54.f 行 17278-17287）
+    # DATA NNN28/.../ (original synspec54.f lines 17278-17287)
     NNN28 = np.array([0] + [
         125416052, 211828182, 375549622, 644381732, 101112213, 1125000, 800080571, 851699301, 127617362, 240433032,
         444958442, 2000000, 240432982, 427555202, 708489962, 112613853, 167319843, 615900, 534793262, 139219123,
@@ -18067,7 +18119,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         354142883, 1151900, 480767202, 89011393, 144118243, 230028753, 354142883, 2000000, 343147532, 645887152,
         115314793, 183322063, 257729373, 593000,
     ], dtype=np.int64)
-    # DATA NNN29/.../（原 synspec54.f 行 17288-17297）
+    # DATA NNN29/.../ (original synspec54.f lines 17288-17297)
     NNN29 = np.array([0] + [
         343147532, 645887142, 115314793, 183322063, 257729373, 1167000, 343147532, 645887142, 115314793, 183322063,
         257729373, 2000000, 222635002, 542276772, 100312353, 145716713, 187020703, 602000, 222635002, 542276772,
@@ -18076,7 +18128,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         400448073, 1193000, 265934782, 497877532, 120517733, 245032063, 400448073, 2000000, 800381111, 87510702,
         147621462, 310343462, 585475982, 618000,
     ], dtype=np.int64)
-    # DATA NNN30/.../（原 synspec54.f 行 17298-17307）
+    # DATA NNN30/.../ (original synspec54.f lines 17298-17307)
     NNN30 = np.array([0] + [
         156718872, 279244452, 678196342, 128316243, 197823443, 1205000, 93517192, 364666132, 103414613, 192624193,
         293334613, 2370000, 100010011, 101310651, 118613951, 169120661, 250629971, 625000, 200120901, 270345231,
@@ -18085,7 +18137,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         380850742, 1389900, 323948621, 661297271, 158626482, 426865032, 93712843, 1900000, 659294081, 128016962,
         222528952, 372047062, 585171462, 700000,
     ], dtype=np.int64)
-    # DATA NNN31/.../（原 synspec54.f 行 17308-17317）
+    # DATA NNN31/.../ (original synspec54.f lines 17308-17317)
     NNN31 = np.array([0] + [
         99117882, 274638812, 520867322, 84410313, 123314453, 1489900, 187427702, 343739872, 448049452, 539358282,
         625266642, 2329900, 65210892, 171325762, 373552252, 705192012, 116414343, 787900, 192837842, 600784802,
@@ -18094,7 +18146,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         262130233, 1770000, 192837842, 600784792, 111113823, 165419233, 218524383, 2500000, 600963001, 75910412,
         150121572, 301940972, 539168952, 787000,
     ], dtype=np.int64)
-    # DATA NNN32/.../（原 synspec54.f 行 17318-17327）
+    # DATA NNN32/.../ (original synspec54.f lines 17318-17327)
     NNN32 = np.array([0] + [
         73710852, 190731262, 464964142, 83810503, 127315053, 1660000, 131429482, 523279952, 111414623, 183422233,
         262130233, 2600000, 110815502, 216829732, 398752322, 672484682, 104612673, 850000, 168225972, 362046562,
@@ -18103,7 +18155,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         104612673, 2000000, 168225972, 362046562, 566766422, 757484612, 93010103, 2800000, 158918512, 207523002,
         254328242, 316335762, 407246582, 900000,
     ], dtype=np.int64)
-    # DATA NNN33/.../（原 synspec54.f 行 17328-17338）
+    # DATA NNN33/.../ (original synspec54.f lines 17328-17338)
     NNN33 = np.array([0] + [
         98115462, 224930742, 401150612, 623475412, 89910583, 1855900, 146323292, 354651802, 74810923, 161723953,
         348749363, 3322700, 203222611, 265731251, 364042301, 494958601, 702084731, 922000, 120521331, 357753801,
@@ -18112,7 +18164,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         111416912, 1875000, 104012871, 186129471, 458664151, 82410072, 119013732, 3420000, 200420711, 222424271,
         265429161, 325637371, 442853911, 610500,
     ], dtype=np.int64)
-    # DATA NNN34/.../（原 synspec54.f 行 17339-17348）
+    # DATA NNN34/.../ (original synspec54.f lines 17339-17348)
     NNN34 = np.array([0] + [
         100010021, 101910801, 121414641, 189525811, 358949721, 2041900, 200020311, 216624611, 296337451, 489064791,
         85711212, 2979900, 103411711, 147819101, 244331781, 434862751, 93113762, 741404, 204122231, 248227841,
@@ -18121,7 +18173,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         108314772, 1667900, 205523051, 264830231, 345439921, 469156001, 675281671, 2555900, 500950661, 518153561,
         559058941, 628968071, 748483501, 843000,
     ], dtype=np.int64)
-    # DATA NNN35/.../（原 synspec54.f 行 17349-17358）
+    # DATA NNN35/.../ (original synspec54.f lines 17349-17358)
     NNN35 = np.array([0] + [
         443756241, 696282451, 95411012, 128615262, 182922012, 1900000, 336953201, 682481011, 93810882, 127915272,
         184622442, 2700000, 402841621, 431544771, 463148311, 520059491, 734896851, 930000, 576168741, 788387631,
@@ -18130,7 +18182,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         734996851, 2000000, 576168741, 788387631, 96910642, 116012552, 135014462, 3000000, 200020011, 201220591,
         218124481, 296538611, 488859141, 400000,
     ], dtype=np.int64)
-    # DATA NNN36/.../（原 synspec54.f 行 17359-17368）
+    # DATA NNN36/.../ (original synspec54.f lines 17359-17368)
     NNN36 = np.array([0] + [
         100010001, 100010031, 102311051, 133018071, 264539401, 2200000, 421645151, 477449611, 511852711, 542455761,
         572958821, 3300000, 100010041, 105212131, 153220271, 270435641, 460258111, 527600, 201221791, 258131471,
@@ -18139,7 +18191,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         448152402, 1210000, 723989131, 103511752, 130814352, 155416652, 177018682, 2000000, 620099241, 162725772,
         391457072, 80110833, 141818023, 600000,
     ], dtype=np.int64)
-    # DATA NNN37/.../（原 synspec54.f 行 17369-17378）
+    # DATA NNN37/.../ (original synspec54.f lines 17369-17378)
     NNN37 = np.array([0] + [
         620099241, 162725772, 391457072, 80110833, 141818023, 1200000, 620099251, 162725772, 391457072, 80110833,
         141818023, 2000000, 347877992, 129318323, 240730533, 380546863, 570368573, 600000, 347877992, 129318323,
@@ -18148,7 +18200,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         318839893, 1200000, 209530092, 450866762, 96613623, 186524763, 318839893, 2000000, 209530092, 450866762,
         96613623, 186524763, 318839893, 600000,
     ], dtype=np.int64)
-    # DATA NNN38/.../（原 synspec54.f 行 17379-17388）
+    # DATA NNN38/.../ (original synspec54.f lines 17379-17388)
     NNN38 = np.array([0] + [
         209530092, 450866762, 96613623, 186524763, 318839893, 1200000, 209530092, 450866762, 96613623, 186524763,
         318839893, 2000000, 209530092, 450866762, 96613623, 186524763, 318839893, 600000, 209530092, 450866762,
@@ -18157,7 +18209,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         318839893, 1200000, 209530092, 450866762, 96613623, 186524763, 318839893, 2000000, 209530092, 450866762,
         96613623, 186524763, 318839893, 600000,
     ], dtype=np.int64)
-    # DATA NNN39/.../（原 synspec54.f 行 17389-17398）
+    # DATA NNN39/.../ (original synspec54.f lines 17389-17398)
     NNN39 = np.array([0] + [
         209530092, 450866762, 96613623, 186524763, 318839893, 1200000, 209530092, 450866762, 96613623, 186524763,
         318839893, 2000000, 209530092, 450866762, 96613623, 186524763, 318839893, 600000, 209530092, 450866762,
@@ -18166,18 +18218,18 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         318839893, 1200000, 209530092, 450866762, 96613623, 186524763, 318839893, 2000000, 209530092, 450866762,
         96613623, 186524763, 318839893, 600000,
     ], dtype=np.int64)
-    # DATA NNN40/.../（原 synspec54.f 行 17399-17401）
+    # DATA NNN40/.../ (original synspec54.f lines 17399-17401)
     NNN40 = np.array([0] + [
         209530092, 450866762, 96613623, 186524763, 318839893, 1200000, 209530092, 450866762, 96613623, 186524763,
         318839893, 2000000,
     ], dtype=np.int64)
-    # DATA SCALE/.../（原 synspec54.f 行 17402-17402）
+    # DATA SCALE/.../ (original synspec54.f lines 17402-17402)
     SCALE = np.array([0] + [
         .001, .01, .1, 1.,
     ], dtype=float)
     # DIMENSION NNN(6*218)
     NNN = np.zeros(6 * 218 + 1, dtype=np.int64)
-    # EQUIVALENCE：NNN16..NNN40 依次覆盖 NNN(1:1308)（原偏移 = 下式+810）
+    # EQUIVALENCE: NNN16..NNN40 successively overlay NNN(1:1308) (original offset = the formula below +810)
     NNN[1:55] = NNN16[1:55]  # EQUIVALENCE (NNN( 811-810),NNN16(1))
     NNN[55:109] = NNN17[1:55]  # EQUIVALENCE (NNN( 865-810),NNN17(1))
     NNN[109:163] = NNN18[1:55]  # EQUIVALENCE (NNN( 919-810),NNN18(1))
@@ -18233,7 +18285,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         N = N + 1
         nnn6n = NNN[6 + 6 * (N - 1)]
         # nnn6n=nnn(6,n)
-        NNN100 = idiv(nnn6n, 100)  # Fortran 整数除法
+        NNN100 = idiv(nnn6n, 100)  # Fortran integer division
         XN1 = NNN100
         IP[ION] = XN1 * 1.e-3
         IG = nnn6n - NNN100 * 100
@@ -18243,12 +18295,12 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
         XIT = IT
         DT = t / T2000 - XIT - HALF
         PMIN = ONE
-        I = idiv(IT + 1, 2)  # Fortran 整数除法
+        I = idiv(IT + 1, 2)  # Fortran integer division
         nnnin = NNN[I + 6 * (N - 1)]
         # nnnin=nnn(i,n)
-        K1 = idiv(nnnin, 100000)  # Fortran 整数除法
+        K1 = idiv(nnnin, 100000)  # Fortran integer division
         K2 = nnnin - K1 * 100000
-        K3 = idiv(K2, 10)  # Fortran 整数除法
+        K3 = idiv(K2, 10)  # Fortran integer division
         xk1 = K1
         xk3 = K3
         KSCALE = K2 - K3 * 10
@@ -18259,7 +18311,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
             P1 = xk3 * SCALE[KSCALE]
             nnni1n = NNN[I + 1 + 6 * (N - 1)]
             # nnni1n=nnn(i+1,n)
-            K1 = idiv(nnni1n, 100000)  # Fortran 整数除法
+            K1 = idiv(nnni1n, 100000)  # Fortran integer division
             KSCALE = imod(nnni1n, 10)
             xk1 = K1
             P2 = xk1 * SCALE[KSCALE]
@@ -18272,7 +18324,7 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
                 # IF(KP1.NE. INT(P2+.5))GO TO 13
                 if KP1 == int(P2 + .5):
                     PMIN = KP1
-                # GO TO 13（落入下一句）
+                # GO TO 13 (falls into the next statement)
         # 13
         PART[ION] = max(PMIN, P1 + (P2 - P1) * DT)
         if GGG == 0. or POTLO[ION] < .1 or t < T2000 * 4.:
@@ -18292,18 +18344,18 @@ def pfheav(IIZ, JNION, MODE, t, ane, u):
 
 # c
 # c ******************************************************************
-# c  （synspec54.f 行 17480-17482，分片结束）
+# c  (synspec54.f lines 17480-17482, end of chunk)
 # -*- coding: utf-8 -*-
-# chunk14: synspec54.f 第 17483–19178 行的逐行直译
-# 包含: frac1, fractn, dwnfr0, dwnfr1, chckab, molini, inmoli, molset,
+# chunk14: line-by-line literal translation of synspec54.f lines 17483-19178
+# Contains: frac1, fractn, dwnfr0, dwnfr1, chckab, molini, inmoli, molset,
 #       iniblm, idmtab, molop, sbfhmi, sffhmi, mpartf, moleq
-# 本分片禁止 import;np / math / C / params 常量 / fortran 辅助函数由组装模块头部提供。
+# This chunk must not import; np / math / C / params constants / fortran helper functions are provided by the assembling module header.
 
 
-# ---------------------------------------------------------------- 本分片私有解析辅助
+# ---------------------------------------------------------------- chunk-private parsing helpers
 
 def _c14_rdf(s):
-    """按 Fortran 数值场语义解析浮点数:允许 D/d 指数,空白按 0 处理。"""
+    """Parse a float with Fortran numeric-field semantics: D/d exponents allowed, blanks treated as 0."""
     s = str(s).strip()
     if s == "":
         return 0.0
@@ -18311,7 +18363,7 @@ def _c14_rdf(s):
 
 
 def _c14_rdi(s):
-    """按 Fortran 整数场语义解析整数:空白按 0 处理。"""
+    """Parse an integer with Fortran integer-field semantics: blanks treated as 0."""
     s = str(s).strip()
     if s == "":
         return 0
@@ -18319,10 +18371,10 @@ def _c14_rdi(s):
 
 
 def _c14_unf_record(unit):
-    """读一条 g77/gfortran 无格式顺序记录,返回 real*8 的 numpy 数组。
+    """Read one g77/gfortran unformatted sequential record, returning a numpy array of real*8.
 
-    记录结构: 4 字节长度标记 + 数据 + 4 字节长度标记。
-    TODO(port): 假定记录标记为 4 字节 little-endian(gfortran 默认)。
+    Record structure: 4-byte length marker + data + 4-byte length marker.
+    TODO(port): assumes 4-byte little-endian record markers (gfortran default).
     """
     fh = funits[unit]
     hdr = fh.read(4)
@@ -18332,48 +18384,48 @@ def _c14_unf_record(unit):
     data = fh.read(nb)
     if len(data) < nb:
         raise EOFError("unit %d: truncated unformatted record" % unit)
-    fh.read(4)   # 尾部记录标记
+    fh.read(4)   # trailing record marker
     return np.frombuffer(data, dtype=np.float64)
 
 
-# ---------------------------------------------------------------- SAVE / DATA 提升变量
+# ---------------------------------------------------------------- SAVE / DATA promoted variables
 
-_save_molset_imlast = 0                          # MOLSET: SAVE IMLAST(无 DATA,按 0 初始化)
+_save_molset_imlast = 0                          # MOLSET: SAVE IMLAST (no DATA, initialized to 0)
 
-_save_sffhmi_istart = 0                          # SFFHMI: DATA ISTART/0/,之后置 1
-_save_sffhmi_fflog = np.zeros((23, 12))          # SFFHMI: FFLOG(22,11),首次调用计算后需保持
-_save_sffhmi_wfflog = np.zeros(23)               # SFFHMI: WFFLOG(22),同上
+_save_sffhmi_istart = 0                          # SFFHMI: DATA ISTART/0/, set to 1 afterwards
+_save_sffhmi_fflog = np.zeros((23, 12))          # SFFHMI: FFLOG(22,11), must persist after being computed on first call
+_save_sffhmi_wfflog = np.zeros(23)               # SFFHMI: WFFLOG(22), same as above
 
 _save_mpartf_iread = 0                           # MPARTF: DATA iread/0/(SAVE)
 _save_mpartf_a = np.zeros((7, 4, 93))            # MPARTF: SAVE a(6,3,92)
 _save_mpartf_am = np.zeros((7, 501))             # MPARTF: SAVE am(6,500)
-# TODO(port): irw(500) 在原文中无 SAVE,但只在首次调用时赋值、之后一直使用,
-# 依赖编译器保留局部数组;为保证语义正确提升为模块级。
+# TODO(port): irw(500) has no SAVE in the original, but is only assigned on the first call and used ever after,
+# relying on the compiler preserving the local array; promoted to module level to guarantee correct semantics.
 _save_mpartf_irw = np.zeros(501, dtype=np.int64)
 
-_save_moleq_iread = 1                            # MOLEQ: DATA iread/1/,之后置 0
+_save_moleq_iread = 1                            # MOLEQ: DATA iread/1/, set to 0 afterwards
 
 
 # ******************************************************************
 
 def frac1():
-    """对应 synspec54.f 行 17483–17570(SUBROUTINE FRAC1,原无头注释)。"""
-    mtemp = 100; melec = 60; mion1 = 30   # 局部 PARAMETER(仅用于说明,数组用 MDEPTH)
+    """Corresponds to synspec54.f lines 17483-17570 (SUBROUTINE FRAC1, no header comment in the original)."""
+    mtemp = 100; melec = 60; mion1 = 30   # local PARAMETERs (documentation only; arrays use MDEPTH)
     xxt = np.zeros(MDEPTH + 1)
     xxe = np.zeros(MDEPTH + 1)
     kt0 = np.zeros(MDEPTH + 1, dtype=np.int64)
     kn0 = np.zeros(MDEPTH + 1, dtype=np.int64)
-    # common/fracop/frac,fracm,itemp,ntt → C.frac 等
+    # common/fracop/frac,fracm,itemp,ntt -> C.frac etc.
 
     for id in range(1, C.ND + 1):
         xxt[id] = math.log10(C.TEMP[id])
-        kt0[id] = 2 * int(20.0 * xxt[id])      # INT 向零截断 = Python int()
+        kt0[id] = 2 * int(20.0 * xxt[id])      # INT truncates toward zero = Python int()
         xxe[id] = math.log10(C.ELEC[id])
         kn0[id] = int(2.0 * xxe[id])
 
     for iat in range(1, 31):                   # DO 20 IAT=1,30
         iatnum = iat
-        iatnum = fractn(iatnum)                # FRACTN 修改标量哑元 iatnum
+        iatnum = fractn(iatnum)                # FRACTN modifies scalar dummy argument iatnum
         if iatnum <= 0:
             continue                           # GO TO 20
         for id in range(1, C.ND + 1):
@@ -18439,13 +18491,13 @@ def frac1():
 # ******************************************************************
 
 def fractn(iatnum):
-    """对应 synspec54.f 行 17574–17728(SUBROUTINE FRACTN,原无头注释)。
+    """Corresponds to synspec54.f lines 17574-17728 (SUBROUTINE FRACTN, no header comment in the original).
 
-    修改标量哑元 iatnum(数据不存在时置 -1),按约定返回全部标量哑元。
+    Modifies scalar dummy argument iatnum (set to -1 when the data do not exist); by convention all scalar dummy arguments are returned.
     """
-    mtemp = 100; melec = 60; mion1 = 30; mdat = 17   # 局部 PARAMETER
-    inp = 71                                          # 局部 PARAMETER
-    # frac0(-1:mion1)、z0(-1:mion1)、ioo(-1:mion1):下标 i 映射为 i+1
+    mtemp = 100; melec = 60; mion1 = 30; mdat = 17   # local PARAMETERs
+    inp = 71                                          # local PARAMETER
+    # frac0(-1:mion1), z0(-1:mion1), ioo(-1:mion1): index i is mapped to i+1
     frac0 = np.zeros(mion1 + 2)
     ioo = np.zeros(mion1 + 2, dtype=np.int64)
     z0 = np.zeros(mion1 + 2)
@@ -18462,13 +18514,13 @@ def fractn(iatnum):
                 7, 8, 9, 10, 0, 11, 0, 12, 0, 13,
                 0, 0, 0, 14, 15, 16, 0, 17, 0, 0]
 
-    # DATA gg/.../(30x17,按列填充;保留原文的 n*0 重复记法)
+    # DATA gg/.../ (30x17, filled column-wise; the original n*0 repeat notation is preserved)
     gg_flat = (
-        [2.] + [0.]*29 +                                  # 第 1 列
-        [2., 1.] + [0.]*28 +                              # 第 2 列
-        [2., 1., 2., 1., 6., 9.] + [0.]*24 +              # 第 3 列
-        [2., 1., 2., 1., 6., 9., 4.] + [0.]*23 +          # 第 4 列
-        [2., 1., 2., 1., 6., 9., 4., 9.] + [0.]*22 +      # 第 5 列
+        [2.] + [0.]*29 +                                  # column 1
+        [2., 1.] + [0.]*28 +                              # column 2
+        [2., 1., 2., 1., 6., 9.] + [0.]*24 +              # column 3
+        [2., 1., 2., 1., 6., 9., 4.] + [0.]*23 +          # column 4
+        [2., 1., 2., 1., 6., 9., 4., 9.] + [0.]*22 +      # column 5
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1.] + [0.]*20 +
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2.] + [0.]*19 +
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1.] + [0.]*18 +
@@ -18476,9 +18528,9 @@ def fractn(iatnum):
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1., 6., 9.] + [0.]*16 +
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1., 6., 9., 4., 9.] + [0.]*14 +
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1., 6., 9., 4., 9.,
-         6., 1.] + [0.]*12 +                              # 第 12 列
+         6., 1.] + [0.]*12 +                              # column 12
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1., 6., 9., 4., 9.,
-         6., 1., 2., 1.] + [0.]*10 +                      # 第 13 列
+         6., 1., 2., 1.] + [0.]*10 +                      # column 13
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1.,
          6., 9., 4., 9., 6., 1., 10., 21., 28., 25., 6., 7.] + [0.]*6 +
         [2., 1., 2., 1., 6., 9., 4., 9., 6., 1., 2., 1., 6., 9., 4., 9.,
@@ -18495,7 +18547,7 @@ def fractn(iatnum):
     uu[1, 2] = 198.3108
     uu[2, 2] = 438.9089
     # EQUIVALENCE (u6(1),uu(1,3)),(u7(1),uu(1,4)),...,(u28(1),uu(1,17)):
-    # u6..u28 分别是 uu 第 3..17 列的前若干个元素;DATA 直接写入 uu 对应列。
+    # u6..u28 are the first few elements of uu columns 3..17; the DATA statements write directly into the corresponding uu columns.
     uu[1:7, 3] = [90.82, 196.665, 386.241, 520.178, 3162.395, 3952.061]          # u6
     uu[1:8, 4] = [117.225, 238.751, 382.704, 624.866, 789.537, 4452.758,
                   5380.089]                                                     # u7
@@ -18559,7 +18611,7 @@ def fractn(iatnum):
                 C.frac[it, ie, ion] = 0.0
 
     read_line(inp)                         # read(inp,*)
-    # read(inp,*) it0,it1,itstp(自由格式)
+    # read(inp,*) it0,it1,itstp (free format)
     _tk = read_line(inp).replace(',', ' ').split()
     it0 = int(_c14_rdf(_tk[0])); it1 = int(_c14_rdf(_tk[1])); itstp = int(_c14_rdf(_tk[2]))
     C.ntt = idiv(it1 - it0, itstp) + 1
@@ -18618,7 +18670,7 @@ def fractn(iatnum):
 def dwnfr0(id):
     """Auxiliary quantities for dissolved fractions
 
-    对应 synspec54.f 行 17735–17758(SUBROUTINE DWNFR0)。
+    Corresponds to synspec54.f lines 17735-17758 (SUBROUTINE DWNFR0).
     """
     UN = 1.0; SIXTH = UN / 6.0; CCOR = 0.09          # PARAMETER
     p1 = 0.1402; p2 = 0.1285; p3 = UN; p4 = 3.15; p5 = 4.0
@@ -18642,8 +18694,8 @@ def dwnfr0(id):
 def dwnfr1(fr, fr0, id, izz, dw1):
     """dissolved fraction for frequency FR
 
-    对应 synspec54.f 行 17764–17804(SUBROUTINE DWNFR1)。
-    修改标量哑元 DW1,按约定返回全部标量哑元。
+    Corresponds to synspec54.f lines 17764-17804 (SUBROUTINE DWNFR1).
+    Modifies scalar dummy argument DW1; by convention all scalar dummy arguments are returned.
     """
     UN = 1.0; TKN = 3.01; CKN = 5.33333333; CB = 8.59e14   # PARAMETER
     SQFRH = 5.734152e7
@@ -18688,7 +18740,7 @@ def chckab():
     summing all populations and upper sums
     The program stops if it finds discrepancy more than 10 %
 
-    对应 synspec54.f 行 17810–17858(SUBROUTINE CHCKAB)。
+    Corresponds to synspec54.f lines 17810-17858 (SUBROUTINE CHCKAB).
     """
     sumpop = np.zeros(MATOM + 1)
     sumiat = np.zeros(MATOM + 1)
@@ -18701,11 +18753,11 @@ def chckab():
             id = 46
         if id1 == 3:
             id = C.ND
-        wnstor(id)                # WNSTOR 不修改标量哑元
+        wnstor(id)                # WNSTOR does not modify scalar dummy arguments
         ane = C.ELEC[id]
-        sabolf(id)                # SABOLF 不修改标量哑元
+        sabolf(id)                # SABOLF does not modify scalar dummy arguments
         for iat in range(1, C.NATOM + 1):
-            sum_l = 0.0           # 原局部变量 SUM,改名避免遮蔽内建
+            sum_l = 0.0           # original local variable SUM, renamed to avoid shadowing the builtin
             sump = 0.0
             for i in range(C.N0A[iat], C.NKA[iat] + 1):
                 il = C.ILK[i]
@@ -18741,9 +18793,9 @@ def chckab():
 def molini():
     """Initialization of the molecular equilibrium
 
-    对应 synspec54.f 行 17864–17941(SUBROUTINE MOLINI)。
+    Corresponds to synspec54.f lines 17864-17941 (SUBROUTINE MOLINI).
     """
-    # common/moltst/... → C.pfmol 等
+    # common/moltst/... -> C.pfmol etc.
     hpo = np.zeros(MDEPTH + 1)
 
     aeinit = 1.0
@@ -18767,8 +18819,8 @@ def molini():
         aeinit = 0.1 * an
         if t < 4000.0:
             aeinit = 0.01 * an
-        # MOLEQ 修改标量哑元 ane,按约定解包全部标量哑元;
-        # ane 首次调用时尚未赋值,传 0.0;实参 0 对应 ipri
+        # MOLEQ modifies scalar dummy argument ane; unpack all scalar dummy arguments by convention;
+        # ane is not yet assigned on the first call, so pass 0.0; actual argument 0 corresponds to ipri
         id, t, an, aeinit, ane, _ipri = moleq(id, t, an, aeinit, 0.0, 0)
 
         # next initial guess will be the last ane determined for
@@ -18830,7 +18882,7 @@ def inmoli(ilist):
    GS      - gamma(Stark)
    GW      - gamma(VdW)
 
-    对应 synspec54.f 行 17947–18292(SUBROUTINE INMOLI)。
+    Corresponds to synspec54.f lines 17947-18292 (SUBROUTINE INMOLI).
     """
     x = np.zeros(10)
     PI4 = 7.95774715e-2                       # PARAMETER
@@ -18840,7 +18892,7 @@ def inmoli(ilist):
     AGR0 = 2.4734e-22; XEH = 13.595; XET = 8067.6; XNF = 25.0
     R02 = 2.5; R12 = 45.0; VW0 = 4.5e-9
 
-    # DATA INLSET /0/(已注释掉)
+    # DATA INLSET /0/ (commented out)
 
     if C.IMODE != -3 and C.TEMP[C.IDSTD] > C.TMOLIM:
         return
@@ -18894,7 +18946,7 @@ def inmoli(ilist):
     C.IVDWLI[ilist] = 0
     ibroad = 1
 
-    # 局部变量 np(每条记录的值数 9/7/4)改名为 np_l,避免遮蔽 numpy 别名
+    # local variable np (number of values per record, 9/7/4) renamed to np_l to avoid shadowing the numpy alias
     np_l = 0
 
     # text list
@@ -18902,7 +18954,7 @@ def inmoli(ilist):
     if C.IBIN[ilist] == 0:
         dum = read_line(iunit)                  # read(iunit,'(a80)') dum
         _tk = dum.replace(',', ' ').split()
-        # read(dum,*,iostat=kst1) (x(i),i=1,9) —— 内部文件自由格式读
+        # read(dum,*,iostat=kst1) (x(i),i=1,9) -- internal-file free-format read
         try:
             for i in range(1, 10):
                 x[i] = _c14_rdf(_tk[i - 1])
@@ -18926,27 +18978,27 @@ def inmoli(ilist):
             C.IVDWLI[ilist] = 1
     else:
         # binary list
-        # TODO(port): 原文用 read(...,err=110/120/130) 依次尝试 9/7/4 个值;
-        # 这里等价地按第一条记录的载荷长度判定 np_l(随后有 REWIND,尝试性
-        # 读取消费的记录不影响后续)。
+        # TODO(port): the original uses read(...,err=110/120/130) to try 9/7/4 values in turn;
+        # here np_l is equivalently determined from the payload length of the first record
+        # (a REWIND follows, so the record consumed by the trial read does not affect what follows).
         try:
             _rec = _c14_unf_record(iunit)       # read(iunit,err=110) (x(i),i=1,9)
             if len(_rec) >= 9:
                 np_l = 9
             elif len(_rec) >= 7:
-                np_l = 7                        # 标号 110: read(...) (x(i),i=1,7)
+                np_l = 7                        # label 110: read(...) (x(i),i=1,7)
             else:
-                np_l = 4                        # 标号 120: read(...) (x(i),i=1,4)
+                np_l = 4                        # label 120: read(...) (x(i),i=1,4)
                 ibroad = 0
             for i in range(1, np_l + 1):
                 x[i] = _rec[i - 1]
         except EOFError:
-            pass                                # 标号 130: 无操作
+            pass                                # label 130: no operation
         # 150 continue
         if np_l == 9:
             C.IVDWLI[ilist] = 1
         if np_l == 9:
-            C.IVDWLI[ilist] = 1                 # 原文重复两次(18087–18088)
+            C.IVDWLI[ilist] = 1                 # duplicated twice in the original (18087-18088)
     # =========================
 
     alast = CNM / C.FRLAST
@@ -18976,10 +19028,10 @@ def inmoli(ilist):
     alam = 0.0
     ijc = 2
 
-    # 标号 7:跳过波长小于 ALAM0-CUTOFF 的谱线
+    # label 7: skip lines with wavelength below ALAM0-CUTOFF
     if C.IBIN[ilist] == 0:
         while True:
-            _pos = funits[iunit].tell()         # 记录行首位置,供 BACKSPACE
+            _pos = funits[iunit].tell()         # remember the line-start position for BACKSPACE
             alam = _c14_rdf(read_line(iunit)[0:10])   # 510 FORMAT(F10.4)
             if not (alam < C.ALAM0 - cutoff):
                 break
@@ -18997,13 +19049,13 @@ def inmoli(ilist):
     # read the line list
 
     ill = 0
-    fr0 = 0.0   # TODO(port): 预防空表时标号 100 处引用 fr0(Fortran 中为残留值)
-    while True:                                 # 标号 8 / 标号 10
+    fr0 = 0.0   # TODO(port): guards against fr0 being referenced at label 100 for an empty list (a leftover value in Fortran)
+    while True:                                 # label 8 / label 10
         ill = ill + 1
-        # ivdwli(ilist)=1(已注释掉)
+        # ivdwli(ilist)=1 (commented out)
         try:
             if C.IBIN[ilist] == 0:
-                # if(ivdwli(ilist).ne.0) then(已注释掉)
+                # if(ivdwli(ilist).ne.0) then (commented out)
                 if np_l == 9:
                     # read(iunit,*,end=100) alam,anum,gf,excl,gr,gh2,xnh2,ghe,xnhe
                     _tk = read_line(iunit).replace(',', ' ').split()
@@ -19021,7 +19073,7 @@ def inmoli(ilist):
                         gr = _c14_rdf(_tk[4]); gs = _c14_rdf(_tk[5])
                         gw = _c14_rdf(_tk[6])
                     except (ValueError, IndexError):
-                        continue                # err=8 → 回到标号 8(下一轮)
+                        continue                # err=8 -> back to label 8 (next iteration)
                 else:
                     # read(iunit,*,end=100,err=8) alam,anum,gf,excl
                     try:
@@ -19034,7 +19086,7 @@ def inmoli(ilist):
                     gs = C.gsstd
                     gw = C.gwstd
             else:
-                # if(ivdwli(ilist).ne.0) then(已注释掉)
+                # if(ivdwli(ilist).ne.0) then (commented out)
                 _rec = _c14_unf_record(iunit)   # read(iunit,end=100) ...
                 if np_l == 9:
                     alam = _rec[0]; anum = _rec[1]; gf = _rec[2]; excl = _rec[3]
@@ -19070,7 +19122,7 @@ def inmoli(ilist):
         fr0 = CNM / alam
         icod = int(anum + TENM4)
 
-        # IF(ICOD.EQ.823) go to 10(已注释掉)
+        # IF(ICOD.EQ.823) go to 10 (commented out)
 
         imol = C.MOLIND[icod]
         if imol <= 0 or imol > C.NMOLEC:
@@ -19092,8 +19144,8 @@ def inmoli(ilist):
             for ijcn in range(ijc, C.NFREQC + 1):
                 if fr0 >= C.FREQC[ijcn]:
                     break                       # go to 12
-            # 12 continue(循环正常结束时 Fortran 中 ijcn=NFREQC+1,
-            # 下面的 ijc 截断到 NFREQC,结果一致)
+            # 12 continue (when the loop ends normally, ijcn=NFREQC+1 in Fortran;
+            # ijc below is truncated to NFREQC, so the result is the same)
             ijc = ijcn
             if ijc > C.NFREQC:
                 ijc = C.NFREQC
@@ -19147,7 +19199,7 @@ def inmoli(ilist):
         # store parameters for selected lines
 
         C.FREQM[il, ilist] = fr0
-        C.EXCLM[il, ilist] = float(epp)         # real(EPP):目标数组为 float32
+        C.EXCLM[il, ilist] = float(epp)         # real(EPP): the target array is float32
         C.GFM[il, ilist] = float(gfp)           # real(GFP)
         C.EXTINM[il, ilist] = float(extin0)     # real(EXTIN0)
         C.INDATM[il, ilist] = imol
@@ -19159,7 +19211,7 @@ def inmoli(ilist):
         C.GSM[il, ilist] = float(gs * PI4 * 3.125e-5)
         C.GWM[il, ilist] = float(gw * PI4)
 
-        # IF(imol.eq.30) gwm(il,ilist)=0.(已注释掉)
+        # IF(imol.eq.30) gwm(il,ilist)=0. (commented out)
 
         if C.IVDWLI[ilist] != 0:
             C.GVDWH2[il, ilist] = float(gh2)        # real(gh2)
@@ -19169,7 +19221,7 @@ def inmoli(ilist):
             C.GSM[il, ilist] = 0.0
             C.GWM[il, ilist] = 0.0
 
-        # GO TO 10 → 回到循环开头
+        # GO TO 10 -> back to the top of the loop
     # 100
     C.NLINM0[ilist] = il
     C.NLINMT[ilist] = C.NLINMT[ilist] + C.NLINM0[ilist]
@@ -19195,8 +19247,8 @@ def molset(ilist):
     """Selection of molecular lines that may contribute,
     set up auxiliary fields containing line parameters.
 
-    对应 synspec54.f 行 18298–18440(SUBROUTINE MOLSET)。
-    SAVE IMLAST → 模块级 _save_molset_imlast。
+    Corresponds to synspec54.f lines 18298-18440 (SUBROUTINE MOLSET).
+    SAVE IMLAST -> module-level _save_molset_imlast.
     """
     global _save_molset_imlast
     CNM = 2.997925e17                           # DATA CNM /2.997925D17/
@@ -19279,7 +19331,7 @@ def molset(ilist):
             print('nlinm,mlinm', nlinm, MLINM)
             quit('too many molecular lines in a set')
         C.INMLIN[nlinm, ilist] = il0
-        # GO TO 20 → 回到循环开头
+        # GO TO 20 -> back to the top of the loop
 
     # frequency indices of the line centers
 
@@ -19342,7 +19394,7 @@ def iniblm():
     """driving procedure for treating a partial molecular line list for the
     current wavelength region
 
-    对应 synspec54.f 行 18447–18477(SUBROUTINE INIBLM)。
+    Corresponds to synspec54.f lines 18447-18477 (SUBROUTINE INIBLM).
     """
     DP0 = 3.33564e-11; DP1 = 1.651e8; UN = 1.0      # PARAMETER
 
@@ -19369,7 +19421,7 @@ def iniblm():
 def idmtab():
     """output of selected molecular line parameters (identification table)
 
-    对应 synspec54.f 行 18482–18567(SUBROUTINE IDMTAB)。
+    Corresponds to synspec54.f lines 18482-18567 (SUBROUTINE IDMTAB).
     """
     C1 = 2.3025851; C2 = 4.2014672; C3 = 1.4387886  # PARAMETER
     # DATA APB,AP0,AP1,AP2,AP3,AP4 /'    ','   .','   *','  **',' ***','****'/
@@ -19405,14 +19457,14 @@ def idmtab():
         for il0 in range(1, C.NLINML[ilist] + 1):
             il = C.INMLIN[il0, ilist]
             alam = 2.997925e18 / C.FREQM[il, ilist]
-            # ID=IDSTD(已注释掉)
+            # ID=IDSTD (commented out)
             ijcn = C.IJCMTR[il0, ilist]
-            # IF(IJCN.GE.1.AND.IJCN.LE.NFREQS) ID=IREFD(IJCN)(已注释掉)
+            # IF(IJCN.GE.1.AND.IJCN.LE.NFREQS) ID=IREFD(IJCN) (commented out)
             imol = C.INDATM[il, ilist]
             dop1 = C.DOPMOL[imol, id]
             ane = C.ELEC[id]
-            # TODO(port): GVDW 在 commons.py 的 DECLS 中缺失(原文亦未见声明,
-            # 疑为 GVDW(MLINM0,MMLIST,MDEPTH) 一类的隐式公共数组)
+            # TODO(port): GVDW is missing from the DECLS in commons.py (no declaration seen in the original either;
+            # presumably an implicit common array such as GVDW(MLINM0,MMLIST,MDEPTH))
             agam = (C.GRM[il, ilist] + C.GSM[il, ilist] * ane +
                     gvdw(il, ilist, id)) * dop1
             abcnt = math.exp(C.GFM[il, ilist] - C.EXCLM[il, ilist] / C.TEMP[id]) * \
@@ -19432,7 +19484,7 @@ def idmtab():
                 if ww2 > ww1:
                     ww1 = ww2
             eqw = alam / C.FREQM[il, ilist] * 1.0e3 / dop1 * ww1
-            str_l = eqw * 10.0                      # 原局部变量 STR,改名避免歧义
+            str_l = eqw * 10.0                      # original local variable STR, renamed to avoid ambiguity
             apr = APB
             if str_l >= 1.0e0 and str_l < 1.0e1:
                 apr = AP0
@@ -19458,8 +19510,8 @@ def idmtab():
 def molop(id, ablin, emlin, avab, ilist):
     """Total molecular line opacity (ABLIN) and emissivity (EMLIN)
 
-    对应 synspec54.f 行 18574–18634(SUBROUTINE MOLOP)。
-    数组哑元 ABLIN/EMLIN 就地修改,不返回;不修改任何标量哑元。
+    Corresponds to synspec54.f lines 18574-18634 (SUBROUTINE MOLOP).
+    Array dummy arguments ABLIN/EMLIN are modified in place, not returned; no scalar dummy arguments are modified.
     """
     UN = 1.0; EXT0 = 3.17; TEN = 10.0               # PARAMETER
 
@@ -19482,7 +19534,7 @@ def molop(id, ablin, emlin, avab, ilist):
         il = C.INMLIN[i, ilist]
         imol = C.INDATM[il, ilist]
         dop1 = C.DOPMOL[imol, id]
-        # TODO(port): GVDW 在 commons.py 的 DECLS 中缺失(同 IDMTAB)
+        # TODO(port): GVDW is missing from the DECLS in commons.py (same as in IDMTAB)
         agam = (C.GRM[il, ilist] + C.GSM[il, ilist] * ane +
                 gvdw(il, ilist, id)) * dop1
         fr0 = C.FREQM[il, ilist]
@@ -19519,9 +19571,9 @@ def sbfhmi(fr):
 
     FROM MATHISEN (1984), AFTER WISHART(1979) AND BROAD AND REINHARDT (1976)
 
-    对应 synspec54.f 行 18640–18681(FUNCTION SBFHMI)。
+    Corresponds to synspec54.f lines 18640-18681 (FUNCTION SBFHMI).
     """
-    # DATA WBF/.../(85 个值,之后不再修改)
+    # DATA WBF/.../ (85 values, never modified afterwards)
     wbf = np.zeros(86)
     wbf[1:] = [
         18.00, 19.60, 21.40, 23.60, 26.40, 29.80, 34.30,
@@ -19535,7 +19587,7 @@ def sbfhmi(fr):
         1175.00, 1200.00, 1225.00, 1250.00, 1275.00, 1300.00, 1325.00, 1350.00,
         1375.00, 1400.00, 1425.00, 1450.00, 1475.00, 1500.00, 1525.00, 1550.00,
         1575.00, 1600.00, 1610.00, 1620.00, 1630.00, 1643.91]
-    # DATA BF/.../(85 个值)
+    # DATA BF/.../ (85 values)
     # Bell and Berrington J.Phys.B,vol. 20, 801-806,1987.
     bf = np.zeros(86)
     bf[1:] = [
@@ -19566,21 +19618,21 @@ def sffhmi(popi, fr, t):
 
     From Bell and Berrington J.Phys.B,vol. 20, 801-806,1987.
 
-    对应 synspec54.f 行 18688–18757(FUNCTION SFFHMI)。
-    DATA ISTART/0/ 之后被修改 → 模块级 _save_sffhmi_istart;
-    FFLOG/WFFLOG 只在首次调用计算、之后使用 → 模块级 _save_sffhmi_fflog/_wfflog。
+    Corresponds to synspec54.f lines 18688-18757 (FUNCTION SFFHMI).
+    DATA ISTART/0/ is modified afterwards -> module-level _save_sffhmi_istart;
+    FFLOG/WFFLOG are computed only on the first call and used thereafter -> module-level _save_sffhmi_fflog/_wfflog.
     """
     global _save_sffhmi_istart
     CONFF = 5040.0 * 1.380658e-16; CONTH = 5040.0   # PARAMETER
     # FFCS(11,22); EQUIVALENCE (FFCS(1,1),FFBEG(1,1)),(FFCS(1,12),FFEND(1,1)):
-    # FFCS 的第 1–11 列 = FFBEG,第 12–22 列 = FFEND(列主序)
+    # columns 1-11 of FFCS = FFBEG, columns 12-22 = FFEND (column-major order)
     wavek = np.zeros(23)
     wavek[1:] = [0.50, 0.40, 0.35, 0.30, 0.25, 0.20, 0.18, 0.16, 0.14, 0.12,
                  0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01,
                  0.008, 0.006]
     thetaff = np.zeros(12)
     thetaff[1:] = [0.5, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.8, 3.6]
-    # DATA FFBEG/(11x11,按列填充)
+    # DATA FFBEG/ (11x11, filled column-wise)
     ffbeg_flat = [
         .0178, .0222, .0308, .0402, .0498, .0596, .0695, .0795, .0896, .131, .172,
         .0228, .0280, .0388, .0499, .0614, .0732, .0851, .0972, .110, .160, .211,
@@ -19593,7 +19645,7 @@ def sffhmi(popi, fr, t):
         .154, .188, .249, .309, .367, .424, .482, .539, .597, .830, 1.07,
         .208, .250, .332, .409, .484, .557, .630, .702, .774, 1.06, 1.36,
         .293, .354, .468, .576, .677, .777, .874, .969, 1.06, 1.45, 1.83]
-    # DATA FFEND/(11x11,按列填充)
+    # DATA FFEND/ (11x11, filled column-wise)
     ffend_flat = [
         .358, .432, .572, .702, .825, .943, 1.06, 1.17, 1.28, 1.73, 2.17,
         .448, .539, .711, .871, 1.02, 1.16, 1.29, 1.43, 1.57, 2.09, 2.60,
@@ -19650,14 +19702,14 @@ def mpartf(jatom, ion, indmol, t, u):
     Output:
       u     = partf.(linear scale) for iat,ion, or indmol, and temperature t
 
-    对应 synspec54.f 行 18768–18901(SUBROUTINE MPARTF)。
-    修改标量哑元 u,按约定返回全部标量哑元。
-    save iread,a,am → 模块级 _save_mpartf_*(irw 一并提升,见模块级注释)。
+    Corresponds to synspec54.f lines 18768-18901 (SUBROUTINE MPARTF).
+    Modifies scalar dummy argument u; by convention all scalar dummy arguments are returned.
+    save iread,a,am -> module-level _save_mpartf_* (irw is promoted as well, see the module-level comment).
     """
     global _save_mpartf_iread
     aa = np.zeros(7)
 
-    # data indtsu(324 个值;原文另有两组被注释掉的旧版本)
+    # data indtsu (324 values; the original also has two older versions commented out)
     indtsu = np.zeros(325, dtype=np.int64)
     indtsu[1:] = ([2, 5, 12, 4, 8, 7, 6,
                    9, 11, 10, 29, 50, 59, 46, 133, 52, 19,
@@ -19668,7 +19720,7 @@ def mpartf(jatom, ion, indmol, t, u):
                    47, 65, 414, 61, 191, 62, 109, 40, 66, 214]
                   + [0] * 120 + [30] + [0] * 136)
 
-    # data iread /0/ → 模块级 _save_mpartf_iread
+    # data iread /0/ -> module-level _save_mpartf_iread
 
     # read data if first call:
 
@@ -19756,7 +19808,7 @@ def mpartf(jatom, ion, indmol, t, u):
                     tl * (_save_mpartf_am[6, indm]))))))
             u = math.exp(ulog)
             # if(t.gt.5128..and.t.lt.5129)
-            #     write(6,631) t,indmol,indm,u(已注释掉)
+            #     write(6,631) t,indmol,indm,u (commented out)
             # 631 format('mpartf',f10.1,2i5,f16.3)
     return jatom, ion, indmol, t, u
 
@@ -19784,13 +19836,13 @@ def moleq(id, tt, an, aein, ane, ipri):
     Input data for molecules  iven in the file
     tsuji.molec
 
-    对应 synspec54.f 行 18909–19170(SUBROUTINE MOLEQ)。
-    修改标量哑元 ane,按约定返回全部标量哑元 (id,tt,an,aein,ane,ipri)。
-    DATA iread/1/ 之后被修改 → 模块级 _save_moleq_iread。
+    Corresponds to synspec54.f lines 18909-19170 (SUBROUTINE MOLEQ).
+    Modifies scalar dummy argument ane; by convention all scalar dummy arguments are returned (id,tt,an,aein,ane,ipri).
+    DATA iread/1/ is modified afterwards -> module-level _save_moleq_iread.
     """
     global _save_moleq_iread
-    # 注意: COMMON/COMFH1/ 中的数组 C(600,5) 经 commons.py 访问为 C.C
-    #       ( commons 模块别名为 C,公共块变量名为 C,故写作 C.C[j,k] )
+    # Note: the array C(600,5) in COMMON/COMFH1/ is accessed via commons.py as C.C
+    #       (the commons module alias is C and the common-block variable is named C, hence C.C[j,k])
     natomm = np.zeros(6, dtype=np.int64)
     nelemm = np.zeros(6, dtype=np.int64)
     emass = np.zeros(101)
@@ -19801,10 +19853,10 @@ def moleq(id, tt, an, aein, ane, ipri):
     denso = np.zeros(MDEPTH + 1)
     eleco = np.zeros(MDEPTH + 1)
     wmmo = np.zeros(MDEPTH + 1)
-    nelemi = 0   # TODO(port): 见下文 aelem(99) 处对 nelemi 的引用
+    nelemi = 0   # TODO(port): see the reference to nelemi at aelem(99) below
 
-    # data nmetal/92/(初始化 COMFH1 公共块变量,见下)
-    # data iread/1/ → 模块级 _save_moleq_iread
+    # data nmetal/92/ (initializes a COMFH1 common-block variable, see below)
+    # data iread/1/ -> module-level _save_moleq_iread
 
     molec = 'data/tsuji.molec_bc2'                  # character*128 MOLEC
     if C.MOLTAB == 0:
@@ -19825,7 +19877,7 @@ def moleq(id, tt, an, aein, ane, ipri):
     # ---- data for atoms  ----------------
 
     if _save_moleq_iread == 1:
-        C.NMETAL = 92   # data nmetal/92/(COMFH1 公共块变量的 DATA 初始化)
+        C.NMETAL = 92   # data nmetal/92/ (DATA initialization of a COMFH1 common-block variable)
 
         for i in range(1, C.NMETAL + 1):
             ia = i
@@ -19884,9 +19936,9 @@ def moleq(id, tt, an, aein, ane, ipri):
             for m in range(1, mmaxj + 1):
                 C.NELEM[m, j] = nelemm[m]
                 C.NATO[m, j] = natomm[m]
-            # write(6,680) j,cmol(j)(已注释掉)
+            # write(6,680) j,cmol(j) (commented out)
             # 680 format(i5,a10)
-            # GO TO 10 → 回到循环开头
+            # GO TO 10 -> back to the top of the loop
         # 20
         C.NMOLEC = j - 1
         close_unit(26)
@@ -19907,16 +19959,16 @@ def moleq(id, tt, an, aein, ane, ipri):
     pglog = math.log10(pgas)
     pg = pgas
 
-    russel(tem, pg)             # CALL RUSSEL(TEM,PG);RUSSEL 不修改标量哑元
+    russel(tem, pg)             # CALL RUSSEL(TEM,PG); RUSSEL does not modify scalar dummy arguments
 
     pe = C.P[99]
     ane = pe * tk
     pelog = math.log10(pe)
     emass[99] = 5.486e-4
     uelem[99] = 2.0
-    # TODO(port): 原文此处引用局部变量 nelemi,但在 MOLEQ 内此时它从未被赋值
-    # (疑为原代码笔误,很可能本意是 emass(99));这里 nelemi=0,取数组未使用的
-    # 0 号槽(值为 0.0),与 Fortran 未初始化局部变量的不确定值同样可疑。
+    # TODO(port): the original references the local variable nelemi here, but within MOLEQ it has never been assigned
+    # at this point (presumably a typo in the original code, most likely meant to be emass(99)); here nelemi=0, so the
+    # unused slot 0 of the array (value 0.0) is taken -- as questionable as an uninitialized Fortran local variable.
     aelem[99] = pe * tk / (2.0 * sahcon * emass[nelemi]**1.5)
     ull[99] = math.log10(aelem[99])
 
@@ -19928,7 +19980,7 @@ def moleq(id, tt, an, aein, ane, ipri):
         fplog = math.log10(C.FP[nelemi])
         anden[i] = (C.P[nelemi] + 1.0e-70) * tk
         tmass = tmass + anden[i] * emass[nelemi]
-        # IRWPF 修改标量哑元 u,按约定解包;实参 1/0 对应 ion/indmol
+        # IRWPF modifies scalar dummy argument u; unpack by convention; actual arguments 1/0 correspond to ion/indmol
         nelemi, _ion_l, _ind_l, tt, u0 = irwpf(nelemi, 1, 0, tt, 0.0)
         uelem[nelemi] = u0
         aelem[nelemi] = anden[i] / (u0 * sahcon * emass[nelemi]**1.5)
@@ -19980,7 +20032,7 @@ def moleq(id, tt, an, aein, ane, ipri):
 
             um = 0.0
             if C.IPFEXO > 0 and tt <= 9000.0:
-                j, tt, um = exopf(j, tt, um)        # EXOPF 修改标量哑元 u
+                j, tt, um = exopf(j, tt, um)        # EXOPF modifies scalar dummy argument u
             if um > 0.0:
                 umoll = um
             else:
@@ -20040,16 +20092,16 @@ def moleq(id, tt, an, aein, ane, ipri):
 
     return id, tt, an, aein, ane, ipri
 # -*- coding: utf-8 -*-
-# chunk15: synspec54.f 行 19179–20743 的逐行直译
-# 子程序: RUSSEL, SETWIN, SETRAY, WGTJH1, TRIDAG, RESOLW, RTESCA, RTEWIN, VELSET
+# chunk15: line-by-line literal translation of synspec54.f lines 19179-20743
+# Subroutines: RUSSEL, SETWIN, SETRAY, WGTJH1, TRIDAG, RESOLW, RTESCA, RTEWIN, VELSET
 
 
 def russel(tem, pg):
     """      SUBROUTINE RUSSEL(TEM,PG)
     c     =========================
 
-    对应 synspec54.f 行 19179–19408。
-    RUSSEL 不修改标量哑元 TEM、PG，故无返回值约定。
+    Corresponds to synspec54.f lines 19179-19408.
+    RUSSEL does not modify scalar dummy arguments TEM, PG, so there is no return-value convention.
     """
     econst = 4.3426e-1
     #       ECONST=4.342945E-1
@@ -20065,7 +20117,7 @@ def russel(tem, pg):
 
     #    evaluation of log XKP(MOL)
     for j in range(1, C.NMOLEC + 1):
-        aplogj = C.C[j, 5]  # /COMFH1/ 的数组 C(600,5)，经 commons 别名记作 C.C
+        aplogj = C.C[j, 5]  # array C(600,5) of /COMFH1/, written as C.C via the commons alias
         for k in range(1, 5):
             km5 = 5 - k
             aplogj = aplogj * t + C.C[j, km5]
@@ -20078,7 +20130,7 @@ def russel(tem, pg):
 
     #  evaluation of the ionization constants
     tem25 = tem ** 2 * math.sqrt(tem)
-    # 局部数组（DATA 无，普通 DIMENSION）
+    # local arrays (no DATA, plain DIMENSION)
     fx = np.zeros(101)
     dfx = np.zeros(101)
     z = np.zeros(101)
@@ -20088,8 +20140,8 @@ def russel(tem, pg):
     for i in range(1, C.NMETAL + 1):
         nelemi = C.NELEMX[i]
         # calculation of the partition functions following Irwin (1981)
-        # irwpf 改写标量哑元 u（其余标量哑元不改），按约定返回全部标量哑元
-        g0 = 0.0  # u 为纯输出，传入值不被读取
+        # irwpf rewrites scalar dummy argument u (the other scalar dummy arguments are unchanged); all scalar dummy arguments are returned by convention
+        g0 = 0.0  # u is a pure output; the passed-in value is never read
         nelemi, _ion, _indmol, tem, g0 = irwpf(nelemi, 1, 0, tem, g0)
         g1 = 0.0
         nelemi, _ion, _indmol, tem, g1 = irwpf(nelemi, 2, 0, tem, g1)
@@ -20127,7 +20179,7 @@ def russel(tem, pg):
 
     #       Russell iterations
     iterat = 0
-    while True:  # 标号 10（GO TO 10 回到此处）
+    while True:  # label 10 (GO TO 10 returns here)
         f = ((u * x ** 2 + q) * x + r) * x + s
         df = 2.0 * (2.0 * u * x ** 2 + q) * x + r
         xr = x - f / df
@@ -20158,7 +20210,7 @@ def russel(tem, pg):
 
     #    Russell equations
     niterr = 0
-    while True:  # 标号 20（GO TO 20 回到此处）
+    while True:  # label 20 (GO TO 20 returns here)
         for i in range(1, C.NMETAL + 1):
             nelemi = C.NELEMX[i]
             #          FX(NELEMI)=-FP(NELEMI)+P(NELEMI)*(1.0+XKP(NELEMI)/PE)
@@ -20283,23 +20335,23 @@ def setwin():
     C
     C     Synspec version
 
-    对应 synspec54.f 行 19416–19485。
+    Corresponds to synspec54.f lines 19416-19485.
     """
     rsun = 6.96e10  # PARAMETER (RSUN=6.96D10)
 
-    def _f(s):  # 自由格式读入的浮点解析（容许 Fortran D 指数）
+    def _f(s):  # float parsing for free-format input (Fortran D exponents allowed)
         return float(s.replace('D', 'E').replace('d', 'e'))
 
     #     Read data for spherical atmosphere and velocity law
-    # READ(8,*,END=9,ERR=9)：文件结束或读错误 → 标号 9（RETURN）
+    # READ(8,*,END=9,ERR=9): end of file or read error -> label 9 (RETURN)
     try:
         _toks = []
-        while len(_toks) < 6:  # 自由格式读可跨记录续行
+        while len(_toks) < 6:  # a free-format read may continue across records
             _toks.extend(read_line(8).replace(',', ' ').split())
         C.RCORE = _f(_toks[0])
-        ndrad = int(_f(_toks[1]))  # 局部量（不属于任何 COMMON 块）
+        ndrad = int(_f(_toks[1]))  # local quantity (not part of any COMMON block)
         C.NRCORE = int(_f(_toks[2]))
-        inrv = int(_f(_toks[3]))   # 局部量，读入后未被使用
+        inrv = int(_f(_toks[3]))   # local quantity, unused after being read
         C.NFIRY = int(_f(_toks[4]))
         C.NDF = int(_f(_toks[5]))
     except (EOFError, ValueError):
@@ -20355,7 +20407,7 @@ def setray():
     C     Setup impact rays and angles
     C      (assumes one impact ray tangent to every depth layer)
 
-    对应 synspec54.f 行 19491–19701。
+    Corresponds to synspec54.f lines 19491-19701.
     """
     pi4 = 4.0 * 3.141592654  # PARAMETER (PI4=4.*3.141592654)
     un = 1.0
@@ -20439,7 +20491,7 @@ def setray():
         for id in range(1, C.NUD[iu] - 1 + 1):
             vz1 = C.DFRQ[iu, id] * CL
             vz2 = C.DFRQ[iu, id + 1] * CL
-            # Fortran INT：向零截断，Python int() 同为向零截断
+            # Fortran INT truncates toward zero; Python int() also truncates toward zero
             nfg = int((vz1 - vz2) / C.DVD[id]) + 1
             xfg = (vz1 - vz2) / float(nfg)
             iv0 = C.NUDF[iu]
@@ -20482,7 +20534,7 @@ def setray():
         idk = 1
         for id in range(2, C.NUDF[iu] + 1):
             # DO WHILE (RDX(ID).GE.DENSF(IDK).and.idk.le.ndf)
-            # （调整条件顺序以避免 idk=NDF+1 时越界，逻辑等价）
+            # (condition order adjusted to avoid out-of-bounds when idk=NDF+1; logically equivalent)
             while idk <= C.NDF and rdx[id] >= C.DENSF[idk]:
                 idk = idk + 1
             #          IDK=IDK+1
@@ -20504,7 +20556,7 @@ def setray():
         C.DRAY[iu, 1] = 0.0
         idk = 1
         for id in range(2, C.NUDF[iu] + 1):
-            # DO WHILE (DENS(ID).GE.DENSF(IDK).and.idk.le.ndf)（条件顺序同上）
+            # DO WHILE (DENS(ID).GE.DENSF(IDK).and.idk.le.ndf) (condition order as above)
             while idk <= C.NDF and C.DENS[id] >= C.DENSF[idk]:
                 idk = idk + 1
             #          IDK=IDK+1
@@ -20548,7 +20600,7 @@ def wgtjh1():
     C     The present version of this routine assumes that there are
     C      impact rays tangent to every depth layers (i.e. NREXT=ND)
 
-    对应 synspec54.f 行 19707–19808。
+    Corresponds to synspec54.f lines 19707-19808.
     """
     un = 1.0
     two = 2.0
@@ -20610,8 +20662,8 @@ def wgtjh1():
             wtu[iu - 1] = ah1 / ahh[iu, 1]
             wtd[iu] = -six / ahh[iu, 1] / ahh[iu + 1, 1]
         nmud = C.KMU - id + 1
-        # TODO(port): 原文按数组基址传 WSL/WSD/WSU/WBJ/WUU（而非 WSL(ID) 起的
-        # 偏移），TRIDAG 内部从下标 1 起用；此处按原文直译。
+        # TODO(port): the original passes WSL/WSD/WSU/WBJ/WUU by array base address (rather than
+        # an offset starting at WSL(ID)); TRIDAG uses them from index 1; translated literally as in the original.
         tridag(wsl, wsd, wsu, wbj, wuu, nmud)
         C.WMUJ[id, id] = waj[id] + wtd[id] * wuu[id] + wtu[id] * wuu[id + 1]
         C.WMUJ[C.KMU, id] = waj[C.KMU] + wtl[C.KMU] * wuu[C.KMU - 1] + \
@@ -20622,7 +20674,7 @@ def wgtjh1():
 
         #     Weights for emergent flux H
         if id > 1:
-            continue  # IF(ID.GT.1) GO TO 100 → 进入下一循环步
+            continue  # IF(ID.GT.1) GO TO 100 -> proceed to the next loop step
         wah[id] = half * bmuh[id + 1] - c03 * ahh[id + 1, 2]
         wah[C.KMU] = half * bmuhp[C.KMU] + c03 * ahh[C.KMU, 2]
         wbh[id] = ahh[id + 1, 3] * (c45 * ahh[id + 1, 1] -
@@ -20666,8 +20718,8 @@ def tridag(a, b, c, r, u, n):
     C     Solve tridiagonal system of equations
     C      from Numerical Recipes (standard Gaussian elimination)
 
-    对应 synspec54.f 行 19814–19837。
-    TRIDAG 不修改标量哑元 N，故无返回值约定。
+    Corresponds to synspec54.f lines 19814-19837.
+    TRIDAG does not modify scalar dummy argument N, so there is no return-value convention.
     """
     gtrid = np.zeros(MKU + 1)
 
@@ -20692,7 +20744,7 @@ def resolw():
     C     Setup opacities for a given frequency set
     C     Oversample in radial and frequency space for later interpolation
 
-    对应 synspec54.f 行 19843–20029。
+    Corresponds to synspec54.f lines 19843-20029.
     """
     un = 1.0
     # PARAMETER (UN=1., TWO=2., HALF=0.5)
@@ -20722,7 +20774,7 @@ def resolw():
     vxs = C.SPACE0 * C.FREQ[1] * C.FREQ[1] * clv * 1.0e-7
     #     DVX=MAX(VXD,VXS)
     dvx = vxs
-    C.NOPAC = int((fq1 - fq2) / dvx) + 1  # INT 向零截断
+    C.NOPAC = int((fq1 - fq2) / dvx) + 1  # INT truncates toward zero
     dvx = (fq1 - fq2) / float(C.NOPAC)
     C.NOPAC = C.NOPAC + 3
     C.NOPAC = C.NFREQ
@@ -20732,7 +20784,7 @@ def resolw():
           '                  %5d radial (density) points' % (C.NOPAC, C.NDF))
     if C.NOPAC > MOPAC:
         quit('Too many freqs in fine grid')
-    ijc = 1  # TODO(port): Fortran 中 IJC 未赋初值即用作下面 DO 循环初值；取 1
+    ijc = 1  # TODO(port): in Fortran, IJC is used uninitialized as the initial value of the DO loop below; 1 is taken
     for ij in range(1, C.NOPAC + 1):
         C.FFQ[ij] = fq1 - float(ij - 1) * dvx
         #         freq(ij)=ffq(ij)
@@ -20759,7 +20811,7 @@ def resolw():
 
     #     the continuum opacities and radiation field - done only once
     #     -----------------------------------
-    r2f = 1.0  # TODO(port): Fortran 中仅 iblank<=1 时赋值；此处给安全初值
+    r2f = 1.0  # TODO(port): in Fortran it is only assigned when iblank<=1; a safe initial value is given here
     if C.IBLANK <= 1:
         #     determine the "core" radius and the factor that multiplies
         #     H_nu at ID=1 to get physical flux there (R2F)
@@ -20855,7 +20907,7 @@ def rtesca():
     C     Discontinuous Finite Element method
     C     Castor, Dykema, Klein, 1992, ApJ 387, 561.
 
-    对应 synspec54.f 行 20035–20275。
+    Corresponds to synspec54.f lines 20035-20275.
     """
     un = 1.0
     two = 2.0
@@ -20905,7 +20957,7 @@ def rtesca():
 
         #     Loop over electron scattering
         itrali = 0
-        while True:  # 标号 10（GO TO 10 回到此处）
+        while True:  # label 10 (GO TO 10 returns here)
             itrali = itrali + 1
             C.FLUXC[ij] = 0.0
 
@@ -20926,7 +20978,7 @@ def rtesca():
                 for id in range(1, C.ND + 1):
                     abc1[id] = C.CHC[ij, id]
                     stc1[id] = C.ETC[ij, id] / C.CHC[ij, id]
-                    # TODO(port): 原文下标为 ij（频率索引），疑为 id 之笔误，按原文直译
+                    # TODO(port): the original subscript is ij (the frequency index), presumably a typo for id; translated literally as in the original
                     scc01[ij] = C.SCC[ij, id]
                 interp(C.DENS, abc1, C.DENSF, abc0, C.ND, C.NDF, 4, 1, 0)
                 interp(C.DENS, stc1, C.DENSF, stc0, C.ND, C.NDF, 4, 1, 0)
@@ -21100,8 +21152,8 @@ def rtewin(iu):
     C     Version including velocity field and extension
     C      radiative transfer along ray IU
 
-    对应 synspec54.f 行 20281–20528。
-    RTEWIN 不修改标量哑元 IU，故无返回值约定。
+    Corresponds to synspec54.f lines 20281-20528.
+    RTEWIN does not modify scalar dummy IU, so there is no return-value convention.
     """
     un = 1.0
     two = 2.0
@@ -21120,7 +21172,7 @@ def rtewin(iu):
         iud = 2 * C.NUDF[iu] - 1
     if iud == 1:
         return
-    dlama0 = 0.0  # TODO(port): Fortran 中仅 NFREQ>1 时赋值，否则未定义
+    dlama0 = 0.0  # TODO(port): in Fortran assigned only when NFREQ>1, otherwise undefined
     if C.NFREQ > 1:
         dlama0 = (C.WLOBS[C.NFROBS] - C.WLOBS[1]) / (C.NFROBS - 1)
 
@@ -21152,7 +21204,7 @@ def rtewin(iu):
                 ij1 = C.NFREQ
             else:
                 xijap = (wlcom - C.WLAM[3]) / dlama0
-                ijap = int(xijap)  # INT 向零截断
+                ijap = int(xijap)  # INT truncation toward zero
                 ijap = max(ijap, 1)
                 ijap = min(ijap, C.NFREQ)
                 wlap = C.WLAM[ijap]
@@ -21341,7 +21393,7 @@ def velset():
     C     NDRAD   - Number of layers
     C     NRCORE  - Number of core rays
 
-    对应 synspec54.f 行 20534–20737。
+    Corresponds to synspec54.f lines 20534-20737.
     """
     #      parameter (un=1.,two=2.)
     zz = np.zeros(MDEPTH + 1)
@@ -21361,24 +21413,24 @@ def velset():
     un = 1.0
     two = 2.0
 
-    def _f(s):  # 自由格式读入的浮点解析（容许 Fortran D 指数）
+    def _f(s):  # float parsing for free-format reads (allows Fortran D exponents)
         return float(s.replace('D', 'E').replace('d', 'e'))
 
-    # read(55,*,err=100,end=100)：文件结束或读错误 → 标号 100（return）
+    # read(55,*,err=100,end=100): end-of-file or read error -> label 100 (return)
     try:
         _toks = []
-        while len(_toks) < 10:  # 自由格式读可跨记录续行
+        while len(_toks) < 10:  # free-format reads may continue across records
             _toks.extend(read_line(55).replace(',', ' ').split())
         rstar = _f(_toks[0])
         rmax = _f(_toks[1])
         amloss = _f(_toks[2])
         C.VINF = _f(_toks[3])
         beta = _f(_toks[4])
-        ndrad = int(_f(_toks[5]))  # 局部量（不属于任何 COMMON 块）
+        ndrad = int(_f(_toks[5]))  # local variable (not in any COMMON block)
         C.NRCORE = int(_f(_toks[6]))
         C.NFIRY = int(_f(_toks[7]))
         C.NDF = int(_f(_toks[8]))
-        nda = int(_f(_toks[9]))    # 局部量
+        nda = int(_f(_toks[9]))    # local variable
     except (EOFError, ValueError):
         return  # err=100 / end=100 → 100 continue → return
     rstr = rstar
@@ -21418,8 +21470,8 @@ def velset():
             rrel[id] = 1.0 / (1.0 - rlo)
             C.RD[id] = rrel[id] * rstr
 
-    # TODO(port): idc/rc/r0/r00/numid0/v2 在 Fortran 中依赖下面循环内赋值，
-    # 若循环不执行或提前 GO TO 10 则未定义；此处给安全初值。
+    # TODO(port): idc/rc/r0/r00/numid0/v2 in Fortran depend on assignment inside the loop below;
+    # if the loop does not execute or exits early via GO TO 10 they are undefined; safe initial values given here.
     numid0 = 0
     idc = 0
     rc = 0.0
@@ -21447,7 +21499,7 @@ def velset():
                 rsum = rsum + rrel[id1]
                 isum = isum + id1
         rc = rsum / numid
-        idc = idiv(isum, numid)  # Fortran 整数除法
+        idc = idiv(isum, numid)  # Fortran integer division
         numid0 = numid
         r00 = r0
     #   10 continue
@@ -21552,26 +21604,26 @@ def velset():
     return
 # -*- coding: utf-8 -*-
 """
-fragments/chunk16.py — synspec54.f 第 20744–22329 行的逐行直译。
+fragments/chunk16.py - line-by-line literal translation of synspec54.f lines 20744-22329.
 
-包含子程序/函数：
+Contains subroutines/functions:
   RADTEM, SBFCH, SBFOH, XENINI, INTXEN, GOMINI, GHYDOP, INGRID,
   OUGRID, FINGRD, ABNCHN
 """
 
 
 # ---------------------------------------------------------------------------
-# SBFCH / SBFOH 的跨调用保持变量（Fortran 局部变量在 RETURN 后仍保持其值：
-# FREQ1 为 DATA 初始化且之后被修改，隐含 SAVE；N、CROSSCHT/CROSSOHT 在
-# FR.EQ.FREQ1 的 GO TO 30 分支上被读取，因此也必须跨调用保持）
+# Cross-call preserved variables for SBFCH / SBFOH (Fortran local variables keep
+# their values after RETURN: FREQ1 is DATA-initialized and later modified, implying
+# SAVE; N, CROSSCHT/CROSSOHT are read on the GO TO 30 branch for FR.EQ.FREQ1, so they must also persist across calls)
 _save_sbfch_freq1 = 0.0              # DATA FREQ1/0./
-_save_sbfch_n = 0                    # 上次调用时的频率索引 N
-_save_sbfch_crosscht = np.zeros(16)  # CROSSCHT(15)，1 基
+_save_sbfch_n = 0                    # frequency index N from the previous call
+_save_sbfch_crosscht = np.zeros(16)  # CROSSCHT(15), 1-based
 _save_sbfoh_freq1 = 0.0              # DATA FREQ1/0./
 _save_sbfoh_n = 0
-_save_sbfoh_crossoht = np.zeros(16)  # CROSSOHT(15)，1 基
+_save_sbfoh_crossoht = np.zeros(16)  # CROSSOHT(15), 1-based
 
-# ABNCHN: DATA iread/1/，之后被置 0，隐含 SAVE
+# ABNCHN: DATA iread/1/, later set to 0, implied SAVE
 _save_abnchn_iread = 1
 
 
@@ -21581,7 +21633,7 @@ def radtem():
     determination of the radiation temperatures
     after Schmutz (1991); inversion done by Newton-Raphson
 
-    对应 synspec54.f 行 20744–20798
+    Corresponds to synspec54.f lines 20744-20798
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR' / 'WINCOM.FOR'
     # common/velaux/velmax,iemoff,nltoff,itrad
@@ -21612,7 +21664,7 @@ def radtem():
                     aa = aa * C.G[ii] / C.G[jj] / C.WDIL[id] / math.sqrt(C.TEMP[id])
                     tr = C.TEMP[id]
                     iter = 0
-                    # 标号 10：Newton-Raphson 迭代（GO TO 10 → while True）
+                    # label 10: Newton-Raphson iteration (GO TO 10 -> while True)
                     while True:
                         iter += 1
                         xx = C.ENION[ii] / BOLK / tr
@@ -21620,7 +21672,7 @@ def radtem():
                         dtrr = dtr / tr
                         tr = tr + dtr
                         if not (abs(dtrr) > 1.0e-3 and iter < 100):
-                            break  # IF(... ) GO TO 10 条件不成立，退出迭代
+                            break  # IF(... ) GO TO 10 condition false, exit iteration
                     C.TRAD[itrd, id] = tr
     # 600 format(/' radiation temperatures/')
     print()
@@ -21639,7 +21691,7 @@ def sbfch(fr, t):
 
     from Kurucz ATLAS9
 
-    对应 synspec54.f 行 20804–21082
+    Corresponds to synspec54.f lines 20804-21082
     """
     # INCLUDE 'PARAMS.FOR'
     fihu = 500.0
@@ -21656,7 +21708,7 @@ def sbfch(fr, t):
     # EQUIVALENCE (CROSSCH(1,61),C7(1)),(CROSSCH(1,71),C8(1))
     # EQUIVALENCE (CROSSCH(1,81),C9(1)),(CROSSCH(1,91),C10(1))
     # EQUIVALENCE (CROSSCH(1,101),C11(1))
-    # DATA C1/.../（150 个值，原样保留）
+    # DATA C1/.../(150 values, kept verbatim)
     c1 = [
         -38.000, -38.000, -38.000, -38.000, -38.000, -38.000, -38.000, -38.000,
         -38.000, -38.000, -38.000, -38.000, -38.000, -38.000, -38.000, -32.727,
@@ -21678,7 +21730,7 @@ def sbfch(fr, t):
         -26.210, -25.241, -24.572, -24.088, -23.728, -23.451, -23.235, -23.063,
         -22.923, -22.808, -22.713, -22.633, -22.565, -22.507,
     ]
-    # DATA C2/.../（150 个值，原样保留）
+    # DATA C2/.../(150 values, kept verbatim)
     c2 = [
         -27.475, -26.000, -25.043, -24.382, -23.905, -23.548, -23.275, -23.062,
         -22.891, -22.753, -22.640, -22.546, -22.467, -22.400, -22.343, -27.221,
@@ -21700,7 +21752,7 @@ def sbfch(fr, t):
         -23.222, -22.650, -22.246, -21.948, -21.722, -21.546, -21.407, -21.296,
         -21.205, -21.131, -21.070, -21.018, -20.974, -20.937,
     ]
-    # DATA C3/.../（150 个值，原样保留）
+    # DATA C3/.../(150 values, kept verbatim)
     c3 = [
         -23.850, -23.018, -22.472, -22.088, -21.805, -21.590, -21.422, -21.289,
         -21.182, -21.095, -21.024, -20.964, -20.914, -20.872, -20.835, -23.136,
@@ -21722,7 +21774,7 @@ def sbfch(fr, t):
         -19.364, -19.189, -19.074, -18.996, -18.943, -18.906, -18.881, -18.863,
         -18.852, -18.844, -18.839, -18.837, -18.836, -18.836,
     ]
-    # DATA C4/.../（150 个值，原样保留）
+    # DATA C4/.../(150 values, kept verbatim)
     c4 = [
         -19.333, -19.092, -18.939, -18.838, -18.770, -18.725, -18.695, -18.675,
         -18.662, -18.655, -18.651, -18.649, -18.649, -18.651, -18.653, -19.070,
@@ -21744,7 +21796,7 @@ def sbfch(fr, t):
         -19.378, -19.382, -19.380, -19.372, -19.359, -19.341, -19.321, -19.300,
         -19.280, -19.261, -19.243, -19.227, -19.212, -19.199,
     ]
-    # DATA C5/.../（150 个值，原样保留）
+    # DATA C5/.../(150 values, kept verbatim)
     c5 = [
         -19.780, -19.777, -19.763, -19.732, -19.686, -19.631, -19.573, -19.517,
         -19.465, -19.419, -19.379, -19.344, -19.314, -19.288, -19.265, -20.151,
@@ -21766,7 +21818,7 @@ def sbfch(fr, t):
         -19.734, -19.461, -19.272, -19.136, -19.035, -18.960, -18.902, -18.858,
         -18.824, -18.797, -18.775, -18.759, -18.745, -18.735,
     ]
-    # DATA C6/.../（150 个值，原样保留）
+    # DATA C6/.../(150 values, kept verbatim)
     c6 = [
         -19.941, -19.544, -19.288, -19.114, -18.992, -18.903, -18.837, -18.788,
         -18.751, -18.723, -18.701, -18.684, -18.671, -18.661, -18.654, -19.657,
@@ -21788,7 +21840,7 @@ def sbfch(fr, t):
         -17.686, -17.686, -17.691, -17.698, -17.708, -17.718, -17.729, -17.740,
         -17.750, -17.761, -17.771, -17.781, -17.790, -17.798,
     ]
-    # DATA C7/.../（150 个值，原样保留）
+    # DATA C7/.../(150 values, kept verbatim)
     c7 = [
         -17.374, -17.384, -17.400, -17.420, -17.440, -17.462, -17.483, -17.503,
         -17.523, -17.541, -17.558, -17.575, -17.590, -17.603, -17.616, -17.169,
@@ -21810,7 +21862,7 @@ def sbfch(fr, t):
         -18.243, -18.096, -17.991, -17.915, -17.860, -17.821, -17.792, -17.772,
         -17.757, -17.746, -17.738, -17.733, -17.730, -17.728,
     ]
-    # DATA C8/.../（150 个值，原样保留）
+    # DATA C8/.../(150 values, kept verbatim)
     c8 = [
         -18.474, -18.262, -18.111, -18.004, -17.926, -17.869, -17.826, -17.795,
         -17.771, -17.753, -17.740, -17.730, -17.722, -17.717, -17.713, -18.387,
@@ -21832,7 +21884,7 @@ def sbfch(fr, t):
         -16.724, -16.756, -16.789, -16.823, -16.856, -16.888, -16.919, -16.949,
         -16.976, -17.002, -17.026, -17.048, -17.069, -17.088,
     ]
-    # DATA C9/.../（150 个值，原样保留）
+    # DATA C9/.../(150 values, kept verbatim)
     c9 = [
         -16.935, -16.951, -16.971, -16.993, -17.016, -17.040, -17.064, -17.088,
         -17.111, -17.132, -17.153, -17.172, -17.190, -17.206, -17.222, -17.200,
@@ -21854,7 +21906,7 @@ def sbfch(fr, t):
         -19.756, -19.606, -19.501, -19.425, -19.370, -19.330, -19.300, -19.278,
         -19.262, -19.250, -19.241, -19.235, -19.230, -19.227,
     ]
-    # DATA C10/.../（150 个值，原样保留）
+    # DATA C10/.../(150 values, kept verbatim)
     c10 = [
         -20.445, -20.158, -19.958, -19.815, -19.711, -19.633, -19.574, -19.528,
         -19.493, -19.465, -19.442, -19.425, -19.410, -19.398, -19.389, -20.980,
@@ -21876,7 +21928,7 @@ def sbfch(fr, t):
         -22.561, -22.288, -22.092, -21.945, -21.832, -21.743, -21.672, -21.616,
         -21.570, -21.533, -21.503, -21.477, -21.457, -21.439,
     ]
-    # DATA C11/.../（75 个值，原样保留）
+    # DATA C11/.../(75 values, kept verbatim)
     c11 = [
         -24.001, -23.527, -23.199, -22.957, -22.772, -22.629, -22.516, -22.427,
         -22.355, -22.297, -22.250, -22.212, -22.180, -22.153, -22.131, -24.233,
@@ -21889,7 +21941,7 @@ def sbfch(fr, t):
         -23.065, -22.948, -22.866, -22.809, -22.770, -22.743, -22.724, -22.713,
         -22.706, -22.703, -22.702,
     ]
-    # DATA PARTCH/.../（41 个值，原样保留）
+    # DATA PARTCH/.../(41 values, kept verbatim)
     _partch = [
         203.741, 249.643, 299.341, 353.477, 412.607, 477.237, 547.817, 624.786,
         708.543, 799.463, 897.912, 1004.227, 1118.738, 1241.761, 1373.588, 1514.481,
@@ -21898,23 +21950,23 @@ def sbfch(fr, t):
         5397.593, 5709.948, 6030.401, 6358.646, 6694.379, 7037.313, 7387.147, 7743.579,
         8106.313,
     ]
-    # EQUIVALENCE 的实现：C1..C11 依次是 CROSSCH 的列主序存储
-    # （C1↔CROSSCH(1,1) 起 150 个 = 第 1–10 列，C11↔CROSSCH(1,101) 起 75 个）
+    # Implementation of EQUIVALENCE: C1..C11 are the column-major storage of CROSSCH
+    # (C1<->CROSSCH(1,1) starting 150 values = columns 1-10, C11<->CROSSCH(1,101) starting 75 values)
     _flat = c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 + c10 + c11
     crossch = np.zeros((16, 106))
     crossch[1:16, 1:106] = np.array(_flat).reshape(15, 105, order='F')
-    partch = np.array([0.0] + _partch)  # DATA PARTCH/.../，1 基索引
+    partch = np.array([0.0] + _partch)  # DATA PARTCH/.../, 1-based indexing
 
     global _save_sbfch_freq1, _save_sbfch_n, _save_sbfch_crosscht
     crosscht = _save_sbfch_crosscht
 
     sbfch = 0.0
-    # IF(FR.EQ.FREQ1) GO TO 30 —— 频率未变则跳过截面插值，直接到标号 30
+    # IF(FR.EQ.FREQ1) GO TO 30 -- if the frequency is unchanged, skip the cross-section interpolation and go straight to label 30
     if fr != _save_sbfch_freq1:
         _save_sbfch_freq1 = fr
         waveno = fr / 2.99792458e10
         evolt = waveno / 8065.479
-        n = int(evolt * 10.0)        # INT 向零截断
+        n = int(evolt * 10.0)        # INT truncation toward zero
         _save_sbfch_n = n
         en = float(n) * 0.1
         if n < 20:
@@ -21925,8 +21977,8 @@ def sbfch(fr, t):
             crosscht[it] = (crossch[it, n] + (crossch[it, n + 1] - crossch[it, n])
                             * (evolt - en) * 10.0)
 
-    # 标号 30：interpolate to obtain partition function
-    n = _save_sbfch_n  # GO TO 30 进入时沿用上次调用的 N（跨调用保持）
+    # label 30: interpolate to obtain partition function
+    n = _save_sbfch_n  # when entering via GO TO 30, reuse N from the previous call (persisted across calls)
     if t >= 9000.0:
         return sbfch
     if n < 20:
@@ -21944,8 +21996,8 @@ def sbfch(fr, t):
     if it < 1:
         it = 1
     tn = float(it) * fihu + 1500.0
-    # 原源码中下一行续行 `c    *     (T-TN)*fihui)*tenl)*PART` 以 c 开头是注释，
-    # 因此 *PART 不参与计算（part 算出后未使用，按原文直译）
+    # In the original source the next continuation line `c    *     (T-TN)*fihui)*tenl)*PART` starts with c, i.e. it is a comment,
+    # so *PART does not enter the computation (part is computed but unused, translated literally as in the original)
     sbfch = math.exp((crosscht[it] + (crosscht[it + 1] - crosscht[it])
                       * (t - tn) * fihui) * tenl)
     return sbfch
@@ -21958,7 +22010,7 @@ def sbfoh(fr, t):
 
     from Kurucz ATLAS9
 
-    对应 synspec54.f 行 21089–21416
+    Corresponds to synspec54.f lines 21089-21416
     """
     # INCLUDE 'PARAMS.FOR'
     fihu = 500.0
@@ -21977,7 +22029,7 @@ def sbfoh(fr, t):
     # EQUIVALENCE (CROSSOH(1,101),C11(1))
     # EQUIVALENCE (CROSSOH(1,111),C12(1))
     # EQUIVALENCE (CROSSOH(1,121),C13(1))
-    # DATA C1/.../（150 个值，原样保留）
+    # DATA C1/.../(150 values, kept verbatim)
     c1 = [
         -30.855, -29.121, -27.976, -27.166, -26.566, -26.106, -25.742, -25.448,
         -25.207, -25.006, -24.836, -24.691, -24.566, -24.457, -24.363, -30.494,
@@ -21999,7 +22051,7 @@ def sbfoh(fr, t):
         -26.681, -25.574, -24.779, -24.186, -23.729, -23.368, -23.076, -22.836,
         -22.636, -22.467, -22.322, -22.198, -22.090, -21.996,
     ]
-    # DATA C2/.../（150 个值，原样保留）
+    # DATA C2/.../(150 values, kept verbatim)
     c2 = [
         -27.993, -26.470, -25.388, -24.602, -24.014, -23.560, -23.200, -22.909,
         -22.669, -22.470, -22.301, -22.157, -22.033, -21.925, -21.831, -27.698,
@@ -22021,7 +22073,7 @@ def sbfoh(fr, t):
         -24.350, -23.603, -23.038, -22.596, -22.241, -21.950, -21.710, -21.508,
         -21.337, -21.190, -21.064, -20.954, -20.858, -20.774,
     ]
-    # DATA C3/.../（150 个值，原样保留）
+    # DATA C3/.../(150 values, kept verbatim)
     c3 = [
         -25.076, -24.111, -23.396, -22.853, -22.429, -22.088, -21.809, -21.578,
         -21.384, -21.220, -21.078, -20.957, -20.851, -20.758, -20.676, -24.779,
@@ -22043,7 +22095,7 @@ def sbfoh(fr, t):
         -21.835, -21.452, -21.147, -20.899, -20.693, -20.520, -20.373, -20.247,
         -20.139, -20.046, -19.964, -19.892, -19.830, -19.774,
     ]
-    # DATA C4/.../（150 个值，原样保留）
+    # DATA C4/.../(150 values, kept verbatim)
     c4 = [
         -22.049, -21.584, -21.230, -20.950, -20.721, -20.531, -20.372, -20.236,
         -20.119, -20.019, -19.931, -19.855, -19.788, -19.729, -19.676, -21.768,
@@ -22065,7 +22117,7 @@ def sbfoh(fr, t):
         -19.642, -19.467, -19.337, -19.236, -19.155, -19.089, -19.034, -18.987,
         -18.946, -18.912, -18.881, -18.854, -18.831, -18.810,
     ]
-    # DATA C5/.../（150 个值，原样保留）
+    # DATA C5/.../(150 values, kept verbatim)
     c5 = [
         -19.705, -19.472, -19.309, -19.190, -19.098, -19.025, -18.966, -18.917,
         -18.876, -18.840, -18.810, -18.783, -18.760, -18.739, -18.721, -19.527,
@@ -22087,7 +22139,7 @@ def sbfoh(fr, t):
         -18.290, -18.261, -18.239, -18.223, -18.211, -18.201, -18.192, -18.185,
         -18.179, -18.174, -18.169, -18.165, -18.162, -18.159,
     ]
-    # DATA C6/.../（150 个值，原样保留）
+    # DATA C6/.../(150 values, kept verbatim)
     c6 = [
         -18.190, -18.168, -18.154, -18.143, -18.135, -18.129, -18.124, -18.120,
         -18.116, -18.112, -18.109, -18.106, -18.104, -18.102, -18.100, -18.055,
@@ -22109,7 +22161,7 @@ def sbfoh(fr, t):
         -17.594, -17.608, -17.620, -17.630, -17.640, -17.650, -17.658, -17.667,
         -17.675, -17.682, -17.690, -17.697, -17.704, -17.711,
     ]
-    # DATA C7/.../（150 个值，原样保留）
+    # DATA C7/.../(150 values, kept verbatim)
     c7 = [
         -17.613, -17.626, -17.639, -17.649, -17.659, -17.669, -17.677, -17.686,
         -17.694, -17.701, -17.709, -17.716, -17.723, -17.730, -17.737, -17.663,
@@ -22131,7 +22183,7 @@ def sbfoh(fr, t):
         -18.112, -18.103, -18.095, -18.087, -18.079, -18.072, -18.066, -18.060,
         -18.055, -18.050, -18.046, -18.042, -18.039, -18.036,
     ]
-    # DATA C8/.../（150 个值，原样保留）
+    # DATA C8/.../(150 values, kept verbatim)
     c8 = [
         -18.083, -18.078, -18.071, -18.064, -18.057, -18.050, -18.044, -18.037,
         -18.032, -18.026, -18.022, -18.017, -18.014, -18.010, -18.007, -18.025,
@@ -22153,7 +22205,7 @@ def sbfoh(fr, t):
         -17.702, -17.689, -17.679, -17.672, -17.667, -17.663, -17.660, -17.659,
         -17.659, -17.659, -17.660, -17.661, -17.663, -17.665,
     ]
-    # DATA C9/.../（150 个值，原样保留）
+    # DATA C9/.../(150 values, kept verbatim)
     c9 = [
         -17.713, -17.695, -17.681, -17.670, -17.662, -17.656, -17.653, -17.650,
         -17.649, -17.649, -17.649, -17.650, -17.651, -17.653, -17.655, -17.705,
@@ -22175,7 +22227,7 @@ def sbfoh(fr, t):
         -17.403, -17.412, -17.420, -17.429, -17.437, -17.444, -17.451, -17.458,
         -17.464, -17.470, -17.476, -17.481, -17.487, -17.492,
     ]
-    # DATA C10/.../（150 个值，原样保留）
+    # DATA C10/.../(150 values, kept verbatim)
     c10 = [
         -17.344, -17.355, -17.366, -17.377, -17.387, -17.396, -17.405, -17.413,
         -17.420, -17.427, -17.434, -17.440, -17.446, -17.452, -17.458, -17.295,
@@ -22197,7 +22249,7 @@ def sbfoh(fr, t):
         -17.211, -17.227, -17.241, -17.254, -17.266, -17.277, -17.288, -17.298,
         -17.308, -17.317, -17.327, -17.336, -17.345, -17.353,
     ]
-    # DATA C11/.../（150 个值，原样保留）
+    # DATA C11/.../(150 values, kept verbatim)
     c11 = [
         -17.239, -17.256, -17.271, -17.284, -17.297, -17.309, -17.320, -17.330,
         -17.340, -17.350, -17.359, -17.369, -17.378, -17.387, -17.395, -17.299,
@@ -22219,7 +22271,7 @@ def sbfoh(fr, t):
         -18.393, -18.403, -18.413, -18.422, -18.430, -18.438, -18.447, -18.455,
         -18.463, -18.471, -18.479, -18.487, -18.495, -18.503,
     ]
-    # DATA C12/.../（150 个值，原样保留）
+    # DATA C12/.../(150 values, kept verbatim)
     c12 = [
         -18.625, -18.638, -18.650, -18.660, -18.669, -18.678, -18.687, -18.695,
         -18.703, -18.711, -18.719, -18.726, -18.734, -18.742, -18.750, -18.912,
@@ -22241,7 +22293,7 @@ def sbfoh(fr, t):
         -21.549, -21.580, -21.609, -21.635, -21.658, -21.678, -21.696, -21.713,
         -21.728, -21.742, -21.755, -21.767, -21.779, -21.790,
     ]
-    # DATA C13/.../（150 个值，原样保留）
+    # DATA C13/.../(150 values, kept verbatim)
     c13 = [
         -21.651, -21.681, -21.711, -21.738, -21.763, -21.785, -21.804, -21.821,
         -21.837, -21.851, -21.864, -21.876, -21.887, -21.898, -21.908, -21.810,
@@ -22263,7 +22315,7 @@ def sbfoh(fr, t):
         -24.787, -24.369, -24.077, -23.865, -23.705, -23.582, -23.484, -23.407,
         -23.344, -23.292, -23.249, -23.214, -23.185, -23.160,
     ]
-    # DATA PARTOH/.../（41 个值，原样保留）
+    # DATA PARTOH/.../(41 values, kept verbatim)
     _partoh = [
         145.979, 178.033, 211.618, 247.053, 284.584, 324.398, 366.639, 411.425,
         458.854, 509.012, 561.976, 617.823, 676.626, 738.448, 803.363, 871.437,
@@ -22272,12 +22324,12 @@ def sbfoh(fr, t):
         2565.283, 2698.103, 2834.571, 2974.627, 3118.242, 3265.366, 3415.912, 3569.837,
         3727.077,
     ]
-    # EQUIVALENCE 的实现：C1..C13 依次是 CROSSOH 的列主序存储（每列 15 个）
+    # Implementation of EQUIVALENCE: C1..C13 are the column-major storage of CROSSOH (15 values per column)
     _flat = (c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 + c10
              + c11 + c12 + c13)
     crossoh = np.zeros((16, 131))
     crossoh[1:16, 1:131] = np.array(_flat).reshape(15, 130, order='F')
-    partoh = np.array([0.0] + _partoh)  # DATA PARTOH/.../，1 基索引
+    partoh = np.array([0.0] + _partoh)  # DATA PARTOH/.../, 1-based indexing
 
     global _save_sbfoh_freq1, _save_sbfoh_n, _save_sbfoh_crossoht
     crossoht = _save_sbfoh_crossoht
@@ -22288,7 +22340,7 @@ def sbfoh(fr, t):
         _save_sbfoh_freq1 = fr
         waveno = fr / 2.99792458e10
         evolt = waveno / 8065.479
-        n = int(evolt * 10.0 - 20.0)     # INT 向零截断
+        n = int(evolt * 10.0 - 20.0)     # INT truncation toward zero
         _save_sbfoh_n = n
         en = float(n) * 0.1 + 2.0
         if n <= 0:
@@ -22299,7 +22351,7 @@ def sbfoh(fr, t):
             crossoht[it] = (crossoh[it, n] + (crossoh[it, n + 1] - crossoh[it, n])
                             * (evolt - en) * 10.0)
 
-    # 标号 30：interpolate to obtain partition function
+    # label 30: interpolate to obtain partition function
     n = _save_sbfoh_n
     if t >= 9000.0:
         return sbfoh
@@ -22318,7 +22370,7 @@ def sbfoh(fr, t):
     if it < 1:
         it = 1
     tn = float(it) * fihu + 1500.0
-    # 同 SBFCH：`*PART` 所在续行是注释，part 未参与最终结果（按原文直译）
+    # As in SBFCH: the continuation line containing `*PART` is a comment; part does not enter the final result (translated literally as in the original)
     sbfoh = math.exp((crossoht[it] + (crossoht[it + 1] - crossoht[it])
                       * (t - tn) * fihui) * tenl)
     return sbfoh
@@ -22330,7 +22382,7 @@ def xenini():
     Initializes necessary arrays for evaluating hydrogen line profiles
     from the XENOMORPH tables
 
-    对应 synspec54.f 行 21422–21541
+    Corresponds to synspec54.f lines 21422-21541
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR'
     for i in range(1, 5):
@@ -22338,7 +22390,7 @@ def xenini():
             C.ILXEN[i, j] = 0
     if C.IHXENB > 0:
         C.IHXENB = 23
-        # TODO(port): IHXENR 不在 commons.py 的 DECLS 中（/XENPRF/ 应有此变量）
+        # TODO(port): IHXENR is not in the DECLS of commons.py (/XENPRF/ should have this variable)
         ihxenr = C.IHXENB + 1
         open_unit(C.IHXENB, 'xenomorph.blue.dat', 'r')   # status='old'
         open_unit(ihxenr, 'xenomorph.red.dat', 'r')    # status='old'
@@ -22391,7 +22443,7 @@ def xenini():
         for ili in range(1, nlxen + 1):
             ilne = ilineb + ili
             nwl = C.NWLXEN[ilne]
-            read_line(C.IHXENB)  # READ(IHXENB,500)；500 FORMAT(1X) —— 跳过一行
+            read_line(C.IHXENB)  # READ(IHXENB,500); 500 FORMAT(1X) -- skip one line
             for ine in range(1, C.NEHXEN[ilne] + 1):
                 for it in range(1, C.NTHXEN[ilne] + 1):
                     # READ(IHXENB,*) QLT,(PRFXB(ILNE,IWL,IT,INE),IWL=1,NWL)
@@ -22399,7 +22451,7 @@ def xenini():
                     qlt = float(_t[0])
                     _v = _t[1:]
                     while len(_v) < nwl:
-                        # 自由格式 READ 一条记录不够时续读下一条记录
+                        # free-format READ: when one record is not enough, continue with the next record
                         _v += read_line(C.IHXENB).split()
                     for iwl in range(1, nwl + 1):
                         C.PRFXB[ilne, iwl, it, ine] = float(_v[iwl - 1])
@@ -22416,7 +22468,7 @@ def xenini():
         for ili in range(1, nlxen + 1):
             iline += 1
             # READ(IHXENR,*) I,J,ALMIN,ANEMIN,TMIN,DLA,DLE,DLT,NWL,NE,NT
-            # （读入但不存储，按原文直译）
+            # (read but not stored, translated literally as in the original)
             _t = read_line(ihxenr).split()
             i = int(_t[0])
             j = int(_t[1])
@@ -22433,7 +22485,7 @@ def xenini():
         for ili in range(1, nlxen + 1):
             ilne = ilineb + ili
             nwl = C.NWLXEN[ilne]
-            read_line(ihxenr)  # READ(IHXENR,500)；500 FORMAT(1X)
+            read_line(ihxenr)  # READ(IHXENR,500);500 FORMAT(1X)
             for ine in range(1, C.NEHXEN[ilne] + 1):
                 for it in range(1, C.NTHXEN[ilne] + 1):
                     # READ(IHXENR,*) QLT,(PRFXR(ILNE,IWL,IT,INE),IWL=1,NWL)
@@ -22456,12 +22508,12 @@ def xenini():
             iline = ilineb + ili
             nwl = C.NWLXEN[iline]
             for iwl in range(1, nwl + 1):
-                # INTXEN 修改标量哑元 W0B,W0R → 按约定解包全部标量哑元
+                # INTXEN modifies scalar dummies W0B,W0R -> unpack all scalar dummies by convention
                 prfb0, prfr0, tl, anel, iwl, iline = \
                     intxen(prfb0, prfr0, tl, anel, iwl, iline)
                 C.PRFB[iline, id, iwl] = prfb0
-                # TODO(port): 原文为 prfr(iline,id,iwl)=prfb0（疑似应为 prfr0），
-                # 按原文直译
+                # TODO(port): the original reads prfr(iline,id,iwl)=prfb0 (probably should be prfr0),
+                # translated literally as in the original
                 C.PRFR[iline, id, iwl] = prfb0
     close_unit(ihxenr)
     return
@@ -22474,8 +22526,8 @@ def intxen(w0b, w0r, x0, z0, iwl, iline):
     Xenomorph tables for hydrogen lines to the actual valus of
     temperature and electron density
 
-    修改标量哑元 W0B、W0R → 返回全部标量哑元 (w0b, w0r, x0, z0, iwl, iline)。
-    对应 synspec54.f 行 21547–21595
+    Modifies scalar dummies W0B, W0R -> returns all scalar dummies (w0b, w0r, x0, z0, iwl, iline).
+    Corresponds to synspec54.f lines 21547-21595
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR'
     zz = np.zeros(4)    # DIMENSION ZZ(3),XX(3),WXB(3),WZB(3),WXR(3),WZR(3)
@@ -22490,13 +22542,13 @@ def intxen(w0b, w0r, x0, z0, iwl, iline):
     nt = C.NTHXEN[iline]
     ne = C.NEHXEN[iline]
 
-    ipz = 0  # 若 NE-1<1 则 DO 10 不执行，Fortran 中 IPZ 未定义；此处先置 0
+    ipz = 0  # if NE-1<1 the DO 10 loop does not execute and IPZ is undefined in Fortran; preset to 0 here
     for izz in range(1, ne):        # DO 10 IZZ=1,NE-1
         ipz = izz
         if z0 <= C.XNEXEN[izz + 1, iline]:
             break                   # GO TO 20
-    # 标号 20
-    n0z = ipz - idiv(nz, 2) + 1     # Fortran 整数除法 NZ/2
+    # label 20
+    n0z = ipz - idiv(nz, 2) + 1     # Fortran integer division NZ/2
     if n0z < 1:
         n0z = 1
     if n0z > ne - nz + 1:
@@ -22506,12 +22558,12 @@ def intxen(w0b, w0r, x0, z0, iwl, iline):
     for izz in range(n0z, n1z + 1):
         i0z = izz - n0z + 1
         zz[i0z] = C.XNEXEN[izz, iline]
-        ipx = 0  # 同上，循环不执行时 Fortran 中 IPX 未定义
+        ipx = 0  # as above, IPX is undefined in Fortran when the loop does not execute
         for ix in range(1, nt):     # DO 30 IX=1,NT-1
             ipx = ix
             if x0 <= C.XTXEN[ix + 1, iline]:
                 break               # GO TO 40
-        # 标号 40
+        # label 40
         n0x = ipx - idiv(nx, 2) + 1
         if n0x < 1:
             n0x = 1
@@ -22544,7 +22596,7 @@ def gomini():
     table:  absorptive opacities in cm^2/gm
     (NOTE:  Quantities in absorption.tab are in log_e)
 
-    对应 synspec54.f 行 21601–21695
+    Corresponds to synspec54.f lines 21601-21695
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR'
     # COMMON/GOMOPA/frgtab(mfhtab),wlgtab(mfhtab),hydopg(mfhtab,mdepth),nugfreq
@@ -22563,7 +22615,7 @@ def gomini():
     C.nugfreq = int(_t[0])
     nugtemp = int(_t[1])
     nugele = int(_t[2])
-    read_line(53)                       # read(53,*) —— 跳过一行
+    read_line(53)                       # read(53,*) -- skip one line
     # read(53,*) (temvec(i),i=1,nugtemp)
     _v = []
     while len(_v) < nugtemp:
@@ -22588,7 +22640,7 @@ def gomini():
     tgtab2 = temvec[nugtemp]
 
     for k in range(1, C.nugfreq + 1):
-        # read(53,501) eneev；501 format(40x,f17.14)
+        # read(53,501) eneev;501 format(40x,f17.14)
         eneev = float(read_line(53)[40:57])
         C.frgtab[k] = 3.28805e15 / 13.595 * eneev
         C.wlgtab[k] = 2.997925e18 / C.frgtab[k]
@@ -22613,7 +22665,7 @@ def gomini():
         tl = math.log(C.TEMP[id])
 
         deltar = (rl - egtab1) / (egtab2 - egtab1) * float(nugele - 1)
-        jr = 1 + int(dint(deltar))      # IDINT 截断取整
+        jr = 1 + int(dint(deltar))      # IDINT truncation to integer
         if jr < 1:
             jr = 1
         if jr > nugele - 1:
@@ -22653,8 +22705,8 @@ def ghydop(id, i0, i1, pj, absoh, emish):
 
     hydrogen opacity -- lines + pseudocontinuum from Gomez tables
 
-    数组哑元 absoh、emish 就地修改；标量哑元不修改，无返回。
-    对应 synspec54.f 行 21700–21749
+    Array dummies absoh, emish are modified in place; scalar dummies unmodified, no return.
+    Corresponds to synspec54.f lines 21700-21749
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR' / 'SYNTHP.FOR'
     # COMMON/GOMOPA/frgtab(mfhtab),wlgtab(mfhtab),hydopg(mfhtab,mdepth),nugfreq
@@ -22672,7 +22724,7 @@ def ghydop(id, i0, i1, pj, absoh, emish):
 
         if ij == i0:
             igf = C.nugfreq
-        # 标号 10：if(wla.gt.wlgtab(igf)) igf=igf-1; go to 10
+        # label 10: if(wla.gt.wlgtab(igf)) igf=igf-1; go to 10
         while wla > C.wlgtab[igf]:
             igf -= 1
         ig0 = igf
@@ -22716,14 +22768,14 @@ def ingrid(mode, inext, igrd):
                  > 0 - density parameter is mass density
                  < 0 - density parameter is gas pressure
 
-    修改标量哑元 INEXT → 返回全部标量哑元 (mode, inext, igrd)。
-    对应 synspec54.f 行 21754–22087
+    Modifies scalar dummy INEXT -> returns all scalar dummies (mode, inext, igrd).
+    Corresponds to synspec54.f lines 21754-22087
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR' / 'LINDAT.FOR'
     un = 1.0                  # parameter (un=1.,ten15=1.e-15,c18=2.997925e18)
     ten15 = 1.0e-15
     c18 = 2.997925e18
-    # real*4 absgrd(mttab,mrtab,mfgrid) —— 属 common/fintab/，即 C.absgrd
+    # real*4 absgrd(mttab,mrtab,mfgrid) -- belongs to common/fintab/, i.e. C.absgrd
     # common/alsave/ALAM0s,ALASTs,CUTOF0s,CUTOFSs,RELOPs,SPACEs
     # common/gridp0/tempg,densg,elecgr,densg0,temp1,ntemp,ndens,nden
     # common/gridf0/wlgrid,nfgrid
@@ -22735,7 +22787,7 @@ def ingrid(mode, inext, igrd):
     # common/relabu/relabn(matom),popul0(mlevel,1)
     abgrd = np.zeros(MFGRID + 1)   # dimension abgrd(mfgrid)
     xli = np.zeros(4)              # dimension xli(3)
-    # character*(80) tabname；common/tabout/tabname,ibingr,idens
+    # character*(80) tabname;common/tabout/tabname,ibingr,idens
     templ = np.zeros(MTTAB + 1)    # dimension templ(mttab)
 
     # --------------
@@ -22900,7 +22952,7 @@ def ingrid(mode, inext, igrd):
 
         if C.temp1 <= 0.0:
             C.ELEC[1] = C.elecm[C.indext]
-        # densit 不修改标量哑元（已查 :22330 定义），直接调用
+        # densit does not modify scalar dummies (checked definition at :22330 ), call directly
         densit(C.densg[C.indext, C.indexn], idens0)
         if C.ntemp == 1 and C.ndens == 1:
             inext = 0
@@ -22916,7 +22968,7 @@ def ingrid(mode, inext, igrd):
     # ---------------------------------------------
     elif mode == 1:
         if C.IFEOS <= 0:
-            # timing 不修改标量哑元（已查 :22769 定义），直接调用
+            # timing does not modify scalar dummies (checked definition at :22769 ), call directly
             timing(1, igrd + 1)
 
             for i in range(1, 4):
@@ -22965,21 +23017,21 @@ def ingrid(mode, inext, igrd):
 
             if C.inttab == 1:
                 # c call interp(wltab,absop,wlgrid,abgrd,nfr,nfgrid,2,0,0)
-                # intrp 不修改标量哑元（已查 :14997 定义），直接调用
+                # intrp does not modify scalar dummies (checked definition at :14997 ), call directly
                 intrp(C.wltab, C.absop, C.wlgrid, abgrd, nfr, C.nfgrid)
             else:
                 ij = 0
                 ijgrd = 0
-                # GO TO 30/40/50 重构为 _label 状态分发
+                # GO TO 30/40/50 refactored into _label state dispatch
                 _label = 30
                 while True:
-                    if _label == 30:            # 标号 30
+                    if _label == 30:            # label 30
                         ijgrd += 1
                         wlgr = 0.5 * (C.wlgrid[ijgrd] + C.wlgrid[ijgrd + 1])
                         isum = 0
                         sum = 0.0
                         _label = 40
-                    if _label == 40:            # 标号 40
+                    if _label == 40:            # label 40
                         ij += 1
                         if ij > nfr:
                             _label = 50         # go to 50
@@ -23008,11 +23060,11 @@ def ingrid(mode, inext, igrd):
                             isum = 0
                             if ij < nfr:
                                 ij -= 1
-                            continue            # go to 40（_label 保持 40）
+                            continue            # go to 40 (_label stays 40)
                         else:
-                            _label = 50         # 落入 end if 之后的标号 50
+                            _label = 50         # fall through to label 50 after the end if
                             continue
-                    if _label == 50:            # 标号 50
+                    if _label == 50:            # label 50
                         break
 
             for ij in range(1, C.nfgrid + 1):
@@ -23073,7 +23125,7 @@ def ingrid(mode, inext, igrd):
         id = 1
         for i in range(1, 5):
             for j in range(i + 1, 23):
-                # hydtab 不修改标量哑元（已查 :7074 定义），直接调用
+                # hydtab does not modify scalar dummies (checked definition at :7074 ), call directly
                 hydtab(i, j, id)
 
     return mode, inext, igrd
@@ -23084,7 +23136,7 @@ def ougrid(abso):
 
     output of grid opacities
 
-    对应 synspec54.f 行 22093–22130
+    Corresponds to synspec54.f lines 22093-22130
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR' / 'SYNTHP.FOR'
     # common/prfrgr/ipfreq,indext,indexn
@@ -23122,12 +23174,12 @@ def fingrd():
 
     storing the complete, interpolated, opacity table
 
-    对应 synspec54.f 行 22136–22266
+    Corresponds to synspec54.f lines 22136-22266
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR' / 'SYNTHP.FOR'
-    # real*4 absgrd(mttab,mrtab,mfgrid) —— common/fintab/absgrd
-    # common/gridp0/...；common/gridf0/...；common/relabu/...
-    # character*(80) tabname；common/tabout/tabname,ibingr,idens
+    # real*4 absgrd(mttab,mrtab,mfgrid) -- common/fintab/absgrd
+    # common/gridp0/...;common/gridf0/...;common/relabu/...
+    # character*(80) tabname;common/tabout/tabname,ibingr,idens
 
     if C.IFEOS > 0:
         return
@@ -23231,8 +23283,8 @@ def fingrd():
                         write_line(53, ''.join(f"{x:14.6e}"
                                                for x in _v[_m:_m + 6]))
 
-    # TODO(port): 以下 WRITE(63) 原为无格式（二进制）顺序写，
-    # 此处按文本行写出各字段（空格分隔），仅保留数据内容
+    # TODO(port): the following WRITE(63) was originally an unformatted (binary) sequential write;
+    # here the fields are written as text lines (space-separated), preserving only the data content
     for iat in range(1, 93):
         write_line(63, f"{C.TYPAT[iat]} {C.ABND[iat]!r} "
                        f"{C.ABND[iat] * C.relabn[iat]!r}")
@@ -23289,8 +23341,8 @@ def abnchn(mode):
     changing abundances (eliminating) species for an
     evaluating an opacity table
 
-    不修改标量哑元 mode，无返回。
-    对应 synspec54.f 行 22272–22323
+    Does not modify scalar dummy mode, no return.
+    Corresponds to synspec54.f lines 22272-22323
     """
     # INCLUDE 'PARAMS.FOR' / 'MODELP.FOR'
     # common/relabu/relabn(matom),popul0(mlevel,1)
@@ -23299,14 +23351,14 @@ def abnchn(mode):
     if _save_abnchn_iread == 1:             # data iread/1/
         for ia in range(1, MATOM + 1):
             C.relabn[ia] = 1.0
-        # 标号 10：循环读相对丰度，err=20/end=20 退出
+        # label 10: loop reading relative abundances, exit on err=20/end=20
         while True:
             try:
                 _t = read_line(2).split()   # read(2,*,err=20,end=20) iatom,rela
                 iatom = int(_t[0])
                 rela = float(_t[1])
             except (EOFError, ValueError, IndexError):
-                break                       # → 标号 20
+                break                       # -> label 20
             C.relabn[iatom] = rela
             print('ABUNDANCES CHANGED (AT.NUMBER, ABUND):', iatom, rela)
         # 20 continue
@@ -23331,58 +23383,58 @@ def abnchn(mode):
             C.RRR[1, io, ia] = C.RRR[1, io, ia] * C.relabn[ia]
 
     return
-# chunk17: synspec54.f 行 22330–23917
-# DENSIT / TODENS / RHONEN / ELDENS / TIMING / EOSPRI / CIA 不透明度 /
+# chunk17: synspec54.f lines 22330-23917
+# DENSIT / TODENS / RHONEN / ELDENS / TIMING / EOSPRI / CIA opacities /
 # LOCATE / H2MINUS / H2OPF / VOPF / GVDW / EXOPF / IRWPF
 
 # ---------------------------------------------------------------------------
-# 模块级 SAVE 变量（Fortran DATA/SAVE 或依赖静态存储的局部数组，提升至此）
+# Module-level SAVE variables (Fortran DATA/SAVE or local arrays relying on static storage, hoisted here)
 # ---------------------------------------------------------------------------
 
-_save_timing_t0 = 0.0  # TIMING: DATA T0/0./ SAVE T0，之后被修改
+_save_timing_t0 = 0.0  # TIMING: DATA T0/0./ SAVE T0, modified afterwards
 
-_save_eospri_init = 1  # EOSPRI: DATA init/1/，之后被修改
+_save_eospri_init = 1  # EOSPRI: DATA init/1/, modified afterwards
 
-# cia_h2h2: DATA ifirst/0/ 被修改；freq/alpha 首次调用读入、后续调用重用（静态存储）
+# cia_h2h2: DATA ifirst/0/ modified; freq/alpha read on first call, reused on later calls (static storage)
 _save_cia_h2h2_ifirst = 0
 _save_cia_h2h2_freq = np.zeros(1001)          # freq(nlines=1000)
 _save_cia_h2h2_alpha = np.zeros((1001, 8))    # alpha(nlines,7)
 
-# cia_h2he: 同上
+# cia_h2he: same as above
 _save_cia_h2he_ifirst = 0
 _save_cia_h2he_freq = np.zeros(243)           # freq(nlines=242)
 _save_cia_h2he_alpha = np.zeros((243, 8))     # alpha(nlines,7)
 
-# cia_h2h: 同上
+# cia_h2h: same as above
 _save_cia_h2h_ifirst = 0
 _save_cia_h2h_freq = np.zeros(68)             # freq(nlines=67)
 _save_cia_h2h_alpha = np.zeros((68, 5))       # alpha(nlines,4)
 
-# cia_hhe: 同上
+# cia_hhe: same as above
 _save_cia_hhe_ifirst = 0
 _save_cia_hhe_freq = np.zeros(44)             # freq(nlines=43)
 _save_cia_hhe_alpha = np.zeros((44, 12))      # alpha(nlines,11)
 
-# h2opf: DATA init/1/ 被修改；ttab/pftab 首次调用读入后重用
+# h2opf: DATA init/1/ modified; ttab/pftab read on first call and reused afterwards
 _save_h2opf_init = 1
 _save_h2opf_ttab = np.zeros(10001)
 _save_h2opf_pftab = np.zeros(10001)
 
-# vopf: 同上
+# vopf: same as above
 _save_vopf_init = 1
 _save_vopf_ttab = np.zeros(10001)
 _save_vopf_pftab = np.zeros(10001)
 
-# exopf: DATA iread/1/ 被修改；ntemp 首次调用时被改写；pf 读入后重用
+# exopf: DATA iread/1/ modified; ntemp overwritten on first call; pf reused after being read
 _save_exopf_iread = 1
-_save_exopf_ntemp = np.array([0,  # 1 基索引，元素 0 不用
+_save_exopf_ntemp = np.array([0,  # 1-based indexing, element 0 unused
     9,  10,   8,   3,   9,   3,   3,   8,   3,  10,
     10,   5,   5,   3,   5,   9,   5,   5,   5,   5,
     5,   4,   5,   5,   9,   5,  48,   8,   8,  10,
     3,   5], dtype=np.int64)  # DATA ntemp/.../
 _save_exopf_pf = np.zeros((33, 10001))        # pf(nmol=32,10000)
 
-# irwpf: SAVE iread,a,am（显式 SAVE 语句）
+# irwpf: SAVE iread,a,am (explicit SAVE statement)
 _save_irwpf_iread = 0                          # DATA iread/0/
 _save_irwpf_a = np.zeros((7, 4, 93))           # a(6,3,92)
 _save_irwpf_am = np.zeros((7, 501))            # am(6,500)
@@ -23394,7 +23446,7 @@ C
 C     determining the state parameters for the opacity grid
 C     calculations
 
-    对应 synspec54.f 行 22330–22386
+    Corresponds to synspec54.f lines 22330-22386
     """
     # DIMENSION ES(MLEVEL,MLEVEL),BS(MLEVEL),POPLTE(MLEVEL)
     es = np.zeros((MLEVEL + 1, MLEVEL + 1))
@@ -23408,18 +23460,18 @@ C     calculations
     if idens == 0:
         C.ELEC[id] = rho
         ane = C.ELEC[id]
-        an = 0.0  # AN 未赋初值传入，TODENS 输出
-        id, _t, an, ane = todens(id, C.TEMP[id], an, ane)  # 哑元 T 对应 TEMP(ID)
+        an = 0.0  # AN passed uninitialized, output of TODENS
+        id, _t, an, ane = todens(id, C.TEMP[id], an, ane)  # dummy T corresponds to TEMP(ID)
         C.DENS[id] = (an - ane) * C.WMM[id]
-        p = an * BOLK * C.TEMP[id]  # p 之后未使用（原代码如此）
-        # WRITE(6,602) ID,TEMP(ID),DENS(ID),ELEC(ID)  （原代码已注释）
+        p = an * BOLK * C.TEMP[id]  # p unused afterwards (as in the original code)
+        # WRITE(6,602) ID,TEMP(ID),DENS(ID),ELEC(ID)  (commented out in the original code)
     elif idens < 0:
         an = rho / C.TEMP[id] / BOLK
-        ane = 0.0  # ANE 未赋初值传入，ELDENS 输出
+        ane = 0.0  # ANE passed uninitialized, output of ELDENS
         id, _t, an, ane = eldens(id, C.TEMP[id], an, ane)
         C.ELEC[id] = ane
         C.DENS[id] = C.WMM[id] * (an - C.ELEC[id])
-        # WRITE(6,601) ID,TEMP(ID),DENS(ID),ELEC(ID),ane0,an  （原代码已注释）
+        # WRITE(6,601) ID,TEMP(ID),DENS(ID),ELEC(ID),ane0,an  (commented out in the original code)
     elif idens == 1:
         C.DENS[id] = rho
         an = 0.0
@@ -23428,7 +23480,7 @@ C     calculations
         C.ELEC[id] = ane
         C.DENS[id] = rho
         rho0 = C.WMM[id] * (an - ane)
-        # WRITE(6,601) IDens,TEMP(ID),DENS(ID),ane,rho0,an  （原代码已注释）
+        # WRITE(6,601) IDens,TEMP(ID),DENS(ID),ane,rho0,an  (commented out in the original code)
     elif idens == 2:
         an = 0.0
         ane = 0.0
@@ -23436,7 +23488,7 @@ C     calculations
         C.DENS[id] = rho
         ane = C.ELEC[id]
         rho0 = C.WMM[id] * (an - ane)
-        # WRITE(6,601) idens,TEMP(ID),DENS(ID),ane,rho0,an  （原代码已注释）
+        # WRITE(6,601) idens,TEMP(ID),DENS(ID),ane,rho0,an  (commented out in the original code)
     # 601 FORMAT(' **densit** t,rho,ne,rho0,an',I3,0PF10.1,1P5D11.3)
     # 602 FORMAT(' **densit** t,rho,ne',I3,0PF10.1,1P5D11.3)
 
@@ -23468,8 +23520,8 @@ C     AHTOT - total hydrogen number density
 C     AHMOL - relative number of hydrogen molecules with respect to the
 C             total number of hydrogens
 
-    对应 synspec54.f 行 22393–22501
-    修改标量哑元 AN → 按约定返回全部标量哑元 (id, t, an, ane)
+    Corresponds to synspec54.f lines 22393-22501
+    Modifies scalar dummy AN -> returns all scalar dummies (id, t, an, ane) by convention
     """
     # common/hydmol/anhmi,ahmol → C.anhmi, C.ahmol
     # parameter (un=1.d0,two=2.d0,half=0.5d0)
@@ -23527,7 +23579,7 @@ C             total number of hydrogens
     g3 = qm * ane
     a = UN + g2 + g3
     d = g2 - g3
-    it = 0  # TODO(port): IT 在 TODENS 中从未赋值（疑遗漏），按静态零初值处理，IF(IT.LE.1) 恒真
+    it = 0  # TODO(port): IT is never assigned in TODENS (suspected omission); treat as static zero initial value, so IF(IT.LE.1) is always true
     if it <= 1:
         if ih2 == 0:
             f1 = UN / a
@@ -23557,9 +23609,9 @@ C             total number of hydrogens
     ah = anh * hhn
     an = ane + C.YTOT[id] * ah
 
-    ahtot = ah  # 局部变量（TODENS 未声明 common/hydato）
+    ahtot = ah  # local variable (TODENS does not declare common/hydato)
     C.ahmol = TWO * anh * (anh * q2 + anh / ane * qp) / ah
-    anp = anh / ane * qh  # 局部变量
+    anp = anh / ane * qh  # local variable
     return id, t, an, ane
 
 
@@ -23573,8 +23625,8 @@ C             RHO - mass density
 C     Output: AN  - total particle density
 C             ANE - elctron density
 
-    对应 synspec54.f 行 22507–22547
-    修改标量哑元 AN、ANE → 返回全部标量哑元 (id, t, rho, an, ane)
+    Corresponds to synspec54.f lines 22507-22547
+    Modifies scalar dummies AN, ANE -> returns all scalar dummies (id, t, rho, an, ane)
     """
     # common/nerela/anerel → C.anerel
 
@@ -23593,7 +23645,7 @@ C             ANE - elctron density
             C.anerel = 0.0001
         # if(t.lt.5000.) anerel=1.e-5
         # if(t.lt.4000.) anerel=1.e-6
-    while True:  # 标号 10 循环
+    while True:  # label 10 loop
         it += 1
         an = rho / C.WMM[id] / (1.0 - C.anerel)
         ane0 = C.anerel * an
@@ -23606,10 +23658,10 @@ C             ANE - elctron density
             break  # GO TO 20
         if it < 50:
             continue  # GO TO 10
-        break  # 迭代达 50 次未收敛，顺序落入标号 20
-        # write(6,601) an,ane,ane0  （原代码已注释）
+        break  # iteration not converged after 50 iterations, fall through sequentially to label 20
+        # write(6,601) an,ane,ane0  (commented out in the original code)
     # 601 format(/' slow convergence of RHONEN - N,Ne,Nep=',1p3e11.3)
-    # 标号 20:
+    # label 20:
 
     return id, t, rho, an, ane
 
@@ -23635,8 +23687,8 @@ C     AHMOL - relativer number of hydrogen molecules with respect to the
 C             total number of hydrogens
 C     ENERG - part of the internal energy: excitation and ionization
 
-    对应 synspec54.f 行 22552–22761
-    修改标量哑元 ANE → 返回全部标量哑元 (id, t, an, ane)
+    Corresponds to synspec54.f lines 22552-22761
+    Modifies scalar dummy ANE -> returns all scalar dummies (id, t, an, ane)
     """
     # common/hydmol/anhmi,ahmol  → C.anhmi, C.ahmol
     # common/hydato/ah,anh,anp   → C.ah, C.anh, C.anp
@@ -23653,7 +23705,7 @@ C     ENERG - part of the internal energy: excitation and ionization
     tk = BOLK * t
     if C.IFMOL > 0 and t < C.TMOLIM:
         aein = an * C.anerel
-        _ipri = 0  # 实参为字面量 0；moleq 修改标量哑元 ANE，返回全部标量哑元
+        _ipri = 0  # actual argument is literal 0; moleq modifies scalar dummy ANE and returns all scalar dummies
         id, t, an, aein, ane, _ipri = moleq(id, t, an, aein, ane, _ipri)
         C.anerel = ane / an
         return id, t, an, ane
@@ -23672,8 +23724,8 @@ C     ENERG - part of the internal energy: excitation and ionization
     # hydrogen molecule        - Q2
     # ion of hydrogen molecule - QP
 
-    qh0 = 0.0  # TODO(port): IATREF!=IATH 时 QH0 未赋值（隐式零初值），但下面无条件使用
-    ih2 = 0    # TODO(port): 同上（IATREF!=IATH 时未赋值）
+    qh0 = 0.0  # TODO(port): QH0 unassigned when IATREF!=IATH (implicit zero initial value), but used unconditionally below
+    ih2 = 0    # TODO(port): same as above (unassigned when IATREF!=IATH)
     if C.IATREF == C.IATH:
         qm = 1.0353e-16 / t / math.sqrt(t) * math.exp(8762.9 / t)
         qh0 = math.exp((15.38287 + 1.5 * math.log10(t) - 13.595 * thet) * 2.30258509299405)
@@ -23705,12 +23757,12 @@ C     ENERG - part of the internal energy: excitation and ionization
     # for the unknown vector P, consistiong of AH, ANH (neutral
     # hydrogen number density) and ANE.
 
-    # TODO(port): QREF、DQNR 在全程序中无任何声明与赋值（隐式局部量，
-    # 仅用于 IATREF!=IATH 分支），按静态零初值处理
+    # TODO(port): QREF, DQNR are never declared or assigned anywhere in the program (implicit locals,
+    # used only in the IATREF!=IATH branch); treat as static zero initial values
     qref = 0.0
     dqnr = 0.0
     delne = 0.0
-    while True:  # 标号 10: Newton-Raphson 迭代
+    while True:  # label 10: Newton-Raphson iteration
         it += 1
 
         # procedure STATE determines Q (and DQN) - the total charge (and its
@@ -23761,7 +23813,7 @@ C     ENERG - part of the internal energy: excitation and ionization
             # Matrix of the linearized system R, and the rhs vector S
 
             r[1, 1] = C.YTOT[id]
-            # R(1,2)=0.  （原代码已注释）
+            # R(1,2)=0.  (commented out in the original code)
             r[1, 2] = -TWO * (C.anh * q2 + gg)
             r[1, 3] = UN
             r[2, 1] = -q
@@ -23821,9 +23873,9 @@ C     ENERG - part of the internal energy: excitation and ionization
     # call of ELDENS
 
     C.anerel = ane / an
-    ahtot = C.ah  # 局部变量（ELDENS 未将 AHTOT 放入 COMMON）
+    ahtot = C.ah  # local variable (ELDENS does not put AHTOT into COMMON)
     if C.IATREF == C.IATH:
-        # AHMOL=TWO*ANH*(ANH*Q2+ANH/ANE*QP)/AH  （原代码已注释）
+        # AHMOL=TWO*ANH*(ANH*Q2+ANH/ANE*QP)/AH  (commented out in the original code)
         C.ahmol = C.anh * C.anh * q2
         C.anp = C.anh / ane * qh
         C.anhmi = C.anh * ane * qm
@@ -23838,20 +23890,20 @@ def timing(mod, iter):
 C
 C     Timing procedure (call machine dependent routine!!)
 
-    对应 synspec54.f 行 22769–22793
-    不修改标量哑元 → 无返回
+    Corresponds to synspec54.f lines 22769-22793
+    Does not modify scalar dummies -> no return
     """
     global _save_timing_t0
     # CHARACTER ROUT*6
     # dimension dummy(2)
     dummy = np.zeros(3)
 
-    # TODO(port): TIME=etime(dummy) —— etime 为机器相关例程，fortran.py 无对应实现，暂以 0.0 占位
+    # TODO(port): TIME=etime(dummy) -- etime is a machine-dependent routine with no counterpart in fortran.py; placeholder 0.0 for now
     time = 0.0
     dt = time - _save_timing_t0
     _save_timing_t0 = time
     ip = iter
-    rout = ''  # TODO(port): MOD 非 1/2 时 ROUT 未定义（隐式初值），置空串
+    rout = ''  # TODO(port): ROUT is undefined when MOD is not 1/2 (implicit initial value); set to empty string
     if mod == 1:
         rout = ' TABLE'
     elif mod == 2:
@@ -23867,29 +23919,29 @@ def eospri():
 c
 c     Outprint of Equation of State parameters
 
-    对应 synspec54.f 行 22799–23045
+    Corresponds to synspec54.f lines 22799-23045
     """
     global _save_eospri_init
-    # common/moltst/pfmol,anmol,pfato,anato,pfion,anion → C.pfmol 等
+    # common/moltst/pfmol,anmol,pfato,anato,pfion,anion -> C.pfmol etc.
     # common/hydmol/anhmi,ahmol → C.anhmi, C.ahmol
     # common/hydato/ah,anh,anp  → C.ah, C.anh, C.anp
     # common/ioniz2/anion2      → C.anion2
-    # dimension nelemx(38) —— DATA，之后不修改
-    nelemx = [0,  # 1 基索引
+    # dimension nelemx(38) -- DATA, not modified afterwards
+    nelemx = [0,  # 1-based indexing
         1, 2, 3, 4, 5, 6, 7, 8, 9,
         11, 12, 13, 14, 15, 16, 17, 19, 20,
         21, 22, 23, 24, 25, 26, 28, 29, 32,
         35, 37, 38, 39, 40, 41, 53, 56, 57, 58, 60]
-    # data amh2/.../ —— DATA，之后不修改
+    # data amh2/.../ -- DATA, not modified afterwards
     amh2 = [0.0, 1.13390e+01, -2.97499e+00, 4.10842e-02, -3.58550e-03,
             1.31844e-04]
-    # data insm/.../ —— DATA，之后不修改
+    # data insm/.../ -- DATA, not modified afterwards
     insm = [0, 2, 3, 4, 5, 6, 7, 8, 12, 17, 25, 29, 30, 32, 34, 122, 126, 134,
             179, 198, 214]
     xml = np.zeros(21)
-    # data init/1/ → 模块级 _save_eospri_init（隐含 SAVE，之后被修改）
+    # data init/1/ -> module-level _save_eospri_init (implied SAVE, modified afterwards)
 
-    # id=idstd （原代码已注释）
+    # id=idstd (commented out in the original code)
     istp = 1
     if C.IFEOS < 0:
         istp = -C.IFEOS
@@ -23902,7 +23954,7 @@ c     Outprint of Equation of State parameters
 
         if C.IFMOL == 0 or t > C.TMOLIM:
             it = 0
-            while True:  # 标号 10 循环
+            while True:  # label 10 loop
                 ann0 = ann
                 it += 1
                 id, t, ann, ane = eldens(id, t, ann, ane)
@@ -23919,14 +23971,14 @@ c     Outprint of Equation of State parameters
                         C.anion2[j, id] = C.anion2[j, id] * hpop
                 C.anato[1, id] = C.anh
                 C.anion[1, id] = C.anp
-                # wmm(id)=(wmy(id)+2.*anmol(2,id)/hpop)/ytot(id)*hmass  （原代码已注释）
+                # wmm(id)=(wmy(id)+2.*anmol(2,id)/hpop)/ytot(id)*hmass  (commented out in the original code)
                 C.WMM[id] = C.WMY[id] / (C.YTOT[id] - C.anmol[2, id] / hpop) * HMASS
                 ann = C.DENS[id] / C.WMM[id] + ane
                 if (ann - ann0) / ann0 > 1.0e-5:
                     continue  # GO TO 10
                 break
 
-        C.NMETAL = 38  # nmetal=38（COMMON /COMFH1/ 变量）
+        C.NMETAL = 38  # nmetal=38 (COMMON /COMFH1/ variable)
         print('')
         print('atomic number densities and partition functions')
         print('')
@@ -24079,7 +24131,7 @@ c     Outprint of Equation of State parameters
 
             _save_eospri_init = 0
 
-        # write(51,624) ...  （原代码已注释的版本略，见 624 format 注释）
+        # write(51,624) ...  (commented-out version in the original omitted, see 624 format comment)
         # 624 format(f8.1,1pe9.2,0pf8.5,1x,1p4e9.2,1x,0p4f8.5,1x,1p3e9.2,1x,
         #      3e9.2,1x,3e9.2)
         write_line(52, f"{t:8.1f}{C.DENS[id]:9.2e}{C.WMM[id] / HMASS:8.5f} "
@@ -24104,7 +24156,7 @@ c     Outprint of Equation of State parameters
             for i in range(1, 21):
                 im = insm[i]
                 xml[i] = math.log10(C.anmol[im, id] / htot)
-                # xml(i)=log10(anmol(im,id))  （原代码已注释）
+                # xml(i)=log10(anmol(im,id))  (commented out in the original code)
             write_line(54, f"{t:6.1f}{math.log10(C.DENS[id]):6.1f} " +
                        ''.join(f"{xml[i]:6.1f}" for i in range(1, 21)))
 
@@ -24117,19 +24169,19 @@ c
 c     CIA H2-H2 opacity
 c     data from Borysow A., Jorgensen U.G., Fu Y. 2001, JQSRT 68, 235
 
-    对应 synspec54.f 行 23052–23140
-    修改标量哑元 OPAC → 返回全部标量哑元 (t, ah2, ff, opac)
+    Corresponds to synspec54.f lines 23052-23140
+    Modifies scalar dummy OPAC -> returns all scalar dummies (t, ah2, ff, opac)
     """
     global _save_cia_h2h2_ifirst
     # IMPLICIT REAL*8(A-H,O-Z)
     nlines = 1000  # parameter (nlines=1000)
     ntemp = 7      # data ntemp /7/
-    # data temp / 1000.,2000.,3000.,4000.,5000.,6000.,7000. /（DATA，不修改）
+    # data temp / 1000.,2000.,3000.,4000.,5000.,6000.,7000. / (DATA, not modified)
     temp = np.array([0.0, 1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 7000.0])
     amagat = 2.6867774e+19  # parameter (amagat=2.6867774d+19,fac=1./amagat**2)
     fac = 1.0 / amagat ** 2
     cas = 2.997925e10  # PARAMETER (CAS=2.997925D10)
-    freq = _save_cia_h2h2_freq    # 模块级 SAVE 数组别名
+    freq = _save_cia_h2h2_freq    # module-level SAVE array alias
     alpha = _save_cia_h2h2_alpha
 
     # input frequency in Hz but needed wave numbers in cm^-1
@@ -24207,18 +24259,18 @@ c     data from Borysow A., Jorgensen U.G., Fu Y. 2001, JQSRT 68, 235
 
 def locate(xx, n, x, j, nxdim):
     """c     =================================
-    （二分查表定位例程）
+    (binary-search table location routine)
 
-    对应 synspec54.f 行 23149–23174
-    修改标量哑元 J → 返回全部标量哑元 (n, x, j, nxdim)
+    Corresponds to synspec54.f lines 23149-23174
+    Modifies scalar dummy J -> returns all scalar dummies (n, x, j, nxdim)
     """
     # IMPLICIT REAL*8(A-H,O-Z)
     # dimension xx(nxdim)
 
     jl = 0
     ju = n + 1
-    while ju - jl > 1:  # 标号 10 循环
-        jm = idiv(ju + jl, 2)  # Fortran 整数除法
+    while ju - jl > 1:  # label 10 loop
+        jm = idiv(ju + jl, 2)  # Fortran integer division
         if (xx[n] >= xx[1]) == (x >= xx[jm]):  # .EQV.
             jl = jm
         else:
@@ -24239,8 +24291,8 @@ c     CIA H2-He opacity
 c     data from Jorgensen U.G., Hammer D., Borysow A., Falkesgaard J., 2000,
 c     Astronomy & Astrophysics 361, 283
 
-    对应 synspec54.f 行 23182–23271
-    修改标量哑元 OPAC → 返回全部标量哑元 (t, ah2, ahe, ff, opac)
+    Corresponds to synspec54.f lines 23182-23271
+    Modifies scalar dummy OPAC -> returns all scalar dummies (t, ah2, ahe, ff, opac)
     """
     global _save_cia_h2he_ifirst
     nlines = 242  # parameter (nlines=242)
@@ -24329,8 +24381,8 @@ def cia_h2h(t, ah2, ah, ff, opac):
 c
 c     CIA H2-H opacity - data taken from TURBOSPEC
 
-    对应 synspec54.f 行 23278–23364
-    修改标量哑元 OPAC → 返回全部标量哑元 (t, ah2, ah, ff, opac)
+    Corresponds to synspec54.f lines 23278-23364
+    Modifies scalar dummy OPAC -> returns all scalar dummies (t, ah2, ah, ff, opac)
     """
     global _save_cia_h2h_ifirst
     nlines = 67  # parameter (nlines=67)
@@ -24420,8 +24472,8 @@ c
 c     CIA H-He opacity
 c     data from Gustafsson M., Frommhold, L. 2001, ApJ 546, 1168
 
-    对应 synspec54.f 行 23371–23459
-    修改标量哑元 OPAC → 返回全部标量哑元 (t, ah, ahe, ff, opac)
+    Corresponds to synspec54.f lines 23371-23459
+    Modifies scalar dummy OPAC -> returns all scalar dummies (t, ah, ahe, ff, opac)
     """
     global _save_cia_hhe_ifirst
     nlines = 43  # parameter (nlines=43)
@@ -24518,10 +24570,10 @@ C     The first row are names for each row corresponding to lambda (angstroms)
 C     The last row for 10.0 is linearly extrapolated
 C     The units of everything else is 10^26 cm4/dyn-1
 
-    对应 synspec54.f 行 23465–23563
-    修改标量哑元 OPH2M → 返回全部标量哑元 (t, anh2, ane, fr, oph2m)
+    Corresponds to synspec54.f lines 23465-23563
+    Modifies scalar dummy OPH2M → returns all scalar dummies (t, anh2, ane, fr, oph2m)
     """
-    # dimension FFthet(9),FFlamb(18),FFkapp(18,9) —— 全部 DATA，之后不修改
+    # dimension FFthet(9),FFlamb(18),FFkapp(18,9) - all DATA, never modified afterwards
     ffthet = np.array([0.0, 0.5, 0.8, 1.0, 1.2, 1.6, 2.0,
                        2.8, 3.6, 10.0])
     nthet = 9   # data nthet /9/
@@ -24530,7 +24582,7 @@ C     The units of everything else is 10^26 cm4/dyn-1
                        18226.0, 15188.0, 11391.0, 9113.0, 7594.0,
                        6509.0, 5696.0, 5063.0, 4142.0, 3505.0])
     nlamb = 18  # data nlamb /18/
-    # DATA FFkapp/.../ —— Fortran 按列优先填充，用 order='F' 保持 1 基索引语义
+    # DATA FFkapp/.../ - Fortran fills column-major; order='F' preserves 1-based indexing semantics
     ffkapp = np.zeros((19, 10))
     ffkapp[1:19, 1:10] = np.array([
         7.16e+01, 4.03e+01, 2.58e+01, 1.15e+01, 6.47e+00,
@@ -24585,7 +24637,7 @@ C     The units of everything else is 10^26 cm4/dyn-1
     nlamb, flamb, i, nlamb = locate(fflamb, nlamb, flamb, i, nlamb)
 
     # linearly interpolate in frequency and temperature
-    # TODO(port): 下面的 nlines 在本子程序中从未声明/赋值（疑为 nlamb 笔误），按隐式零初值处理
+    # TODO(port): nlines below is never declared/assigned in this subroutine (likely a typo for nlamb); treat as implicit zero initial value
     nlines = 0
     if j == nthet:
         # hold values constant if off high temperature end of table
@@ -24617,14 +24669,14 @@ def h2opf(t, pf):
     """c
 c     partition function for H2Ofrom EXOMOILA data
 
-    对应 synspec54.f 行 23569–23590
-    修改标量哑元 PF → 返回全部标量哑元 (t, pf)
+    Corresponds to synspec54.f lines 23569-23590
+    Modifies scalar dummy PF → returns all scalar dummies (t, pf)
     """
     global _save_h2opf_init
-    ttab = _save_h2opf_ttab    # dimension ttab(10000)，模块级 SAVE 别名
+    ttab = _save_h2opf_ttab    # dimension ttab(10000), module-level SAVE alias
     pftab = _save_h2opf_pftab
 
-    # data init /1/ → 模块级 _save_h2opf_init
+    # data init /1/ → module-level _save_h2opf_init
     if _save_h2opf_init == 1:
         open_unit(67, './data/h2o_exomol.pf', 'r')  # status='old'
         for i in range(1, 10001):
@@ -24634,7 +24686,7 @@ c     partition function for H2Ofrom EXOMOILA data
         close_unit(67)
         _save_h2opf_init = 0
 
-    itab = int(t)  # IFIX(REAL(T)) 向零截断
+    itab = int(t)  # IFIX(REAL(T)) truncation toward zero
     pf = pftab[itab] + (t - ttab[itab]) * (pftab[itab + 1] - pftab[itab])
     return t, pf
 
@@ -24643,8 +24695,8 @@ def vopf(t, pf):
     """c
 c     partition function for VO from EXOMOILA data
 
-    对应 synspec54.f 行 23597–23618
-    修改标量哑元 PF → 返回全部标量哑元 (t, pf)
+    Corresponds to synspec54.f lines 23597-23618
+    Modifies scalar dummy PF → returns all scalar dummies (t, pf)
     """
     global _save_vopf_init
     ttab = _save_vopf_ttab
@@ -24674,8 +24726,8 @@ c     ivdwli(ilist) - the mode of evaluation is the same for the whole line list
 c       = 0 - standard expression
 c       > 0 - evaluation using EXOMOL data, assuming breadening by H2 and He
 
-    对应 synspec54.f 行 23627–23658
-    不修改标量哑元 → 仅返回函数值
+    Corresponds to synspec54.f lines 23627-23658
+    Does not modify scalar dummies → returns only the function value
     """
     # COMMON/PRFQUA/DOPA1(MATOM,MDEPTH),VDWC(MDEPTH) → C.DOPA1, C.VDWC
 
@@ -24699,12 +24751,12 @@ def exopf(indmol, t, u):
 c
 c     oartition functions from EXOMOL for 32 molewcular species
 
-    对应 synspec54.f 行 23664–23741
-    修改标量哑元 U → 返回全部标量哑元 (indmol, t, u)
+    Corresponds to synspec54.f lines 23664-23741
+    Modifies scalar dummy U → returns all scalar dummies (indmol, t, u)
     """
     global _save_exopf_iread
     nmol = 32  # parameter (nmol=32)
-    # data filpf/.../ —— character*4，DATA，不修改（1 基索引）
+    # data filpf/.../ - character*4, DATA, not modified (1-based indexing)
     filpf = ['',
         ' AlO', '  C2', '  CH', '  CN', '  CO',
         '  CS', ' CaH', ' CaO', ' CrH', ' FeH',
@@ -24713,27 +24765,27 @@ c     oartition functions from EXOMOL for 32 molewcular species
         '  OH', '  PH', '  SH', ' SiH', ' SiO',
         ' SiS', ' TiH', ' TiO', '  VO',
         ' H2O', ' H2S', ' CO2']
-    # data indtsu/.../ —— DATA，不修改
+    # data indtsu/.../ - DATA, not modified
     indtsu = [0,
         134,   8,   5,   7,   6,  20,  34, 179, 198, 214,
           2,  36,  33,  32, 126,   9,  12,  11,  23, 122,
           4, 148,  16,  17,  25,  28, 315,  29,  30,   3,
          57,  44]
-    ntemp = _save_exopf_ntemp  # DATA 后被修改 → 模块级 SAVE 数组别名
-    pf = _save_exopf_pf        # pf(nmol,10000)，读入后重用
-    # data iread /1/ → 模块级 _save_exopf_iread
+    ntemp = _save_exopf_ntemp  # modified after DATA → module-level SAVE array alias
+    pf = _save_exopf_pf        # pf(nmol,10000), reused after being read in
+    # data iread /1/ → module-level _save_exopf_iread
 
     if _save_exopf_iread == 1:
         for i in range(1, nmol + 1):
             ntemp[i] = ntemp[i] * 1000
-        ntemp[27] = idiv(ntemp[27], 10)  # Fortran 整数除法
+        ntemp[27] = idiv(ntemp[27], 10)  # Fortran integer division
         for i in range(1, nmol + 1):
             fil = filpf[i] + '.pf'       # character*7
             fil1 = fil[1:7]              # character*6 = fil(2:)
             fil0 = fil1[0:1]             # character*1 = fil1(:1)
             if fil0 == ' ':
-                fil5 = 'data/EXOMOL/' + fil1[1:6]  # character*17 = fil1(2:)，右侧补空格
-                open_unit(67, fil5.rstrip(), 'r')  # status='old'；Fortran 打开文件时忽略尾部空格
+                fil5 = 'data/EXOMOL/' + fil1[1:6]  # character*17 = fil1(2:), right-padded with spaces
+                open_unit(67, fil5.rstrip(), 'r')  # status='old'; Fortran ignores trailing blanks when opening files
             else:
                 fil6 = fil1              # character*18
                 open_unit(67, ('data/EXOMOL/' + fil6).rstrip(), 'r')
@@ -24754,10 +24806,10 @@ c     oartition functions from EXOMOL for 32 molewcular species
 
     tmax = float(ntemp[ie])
     if t <= tmax:
-        j = int(t)  # INT(T) 向零截断
+        j = int(t)  # INT(T) truncation toward zero
         u = pf[ie, j]
     else:
-        # 实参含字面量 0,0；irwpf 修改标量哑元 U，返回全部标量哑元
+        # arguments contain literals 0,0; irwpf modifies scalar dummy U and returns all scalar dummies
         _jatom, _ion, indmol, tmax, umx = irwpf(0, 0, indmol, tmax, 0.0)
         _jatom, _ion, indmol, t, uirw = irwpf(0, 0, indmol, t, 0.0)
         u = pf[ie, ntemp[ie]] / umx * uirw
@@ -24783,17 +24835,17 @@ c     array IRWIND(I) - the Irwin index corresponding to Tsuji
 c           index I
 c           if =0 - molecule I has no data in the Irwin table
 
-    对应 synspec54.f 行 23749–23913
-    修改标量哑元 U → 返回全部标量哑元 (jatom, ion, indmol, t, u)
+    Corresponds to synspec54.f lines 23749-23913
+    Modifies scalar dummy U → returns all scalar dummies (jatom, ion, indmol, t, u)
     """
     global _save_irwpf_iread
     # real*8 a(6,3,92),aa(6),am(6,500),spec(500)
-    # save iread,a,am → 模块级 _save_irwpf_*
+    # save iread,a,am → module-level _save_irwpf_*
     a = _save_irwpf_a
     am = _save_irwpf_am
     aa = np.zeros(7)
     spec = np.zeros(501)
-    # data irwind/.../（含 5*0、4*0、7*0、10*0、3*0、16*0 重复计数，已展开；DATA 不修改）
+    # data irwind/.../ (includes 5*0, 4*0, 7*0, 10*0, 3*0, 16*0 repeat counts, expanded; DATA not modified)
     irwind = np.zeros(479, dtype=np.int64)
     irwind[1:] = [
         0,   1,  28,   4,   2,   7,   6,   5,   8,  10,
@@ -24842,9 +24894,9 @@ c           if =0 - molecule I has no data in the Irwin table
         88,  89,  90,  91, 130, 131, 132, 133, 134, 135,
         136, 137, 138, 139, 140, 141, 142, 143, 144, 145,
         146, 160, 161, 173, 174, 210, 220, 221, 222, 223,
-        224,   0,   0,   0,   0,   0,   0,   0,   0,   0,  # 16*0（开始）
+        224,   0,   0,   0,   0,   0,   0,   0,   0,   0,  # 16*0 (start)
         0,   0,   0,   0,   0,   0,   0,  56]
-    # data iread /0/ → 模块级 _save_irwpf_iread
+    # data iread /0/ → module-level _save_irwpf_iread
 
     # call old Irwin routine MPARTF if desired
 
@@ -24855,7 +24907,7 @@ c           if =0 - molecule I has no data in the Irwin table
     # read data if first call:
 
     if _save_irwpf_iread != 1:
-        if C.IRWTAB == 0:  # 死代码（上面已返回），按原文保留
+        if C.IRWTAB == 0:  # dead code (already returned above), kept as in the original
             open_unit(67, './data/irwin_orig.dat', 'r')
         else:
             open_unit(67, './data/irwin_bc.dat', 'r')
@@ -24864,15 +24916,15 @@ c           if =0 - molecule I has no data in the Irwin table
         for j in range(1, 93):
             for i in range(1, 4):
                 if j == 1 and i == 3:
-                    continue  # GO TO 10（H 的二次电离不存在，跳过读取）
-                sp = float(j) + float(i - 1) / 100.0  # sp 之后未使用（原代码如此）
+                    continue  # GO TO 10 (no second ionization of H; skip the read)
+                sp = float(j) + float(i - 1) / 100.0  # sp unused afterwards (as in the original code)
                 _p = read_line(67).split()  # read(67,*) spc,aa
                 spc = float(_p[0])
                 for k in range(1, 7):
                     aa[k] = float(_p[k])
                 for k in range(1, 7):
                     a[k, i, j] = aa[k]
-                # 标号 10 continue
+                # label 10 continue
 
         read_line(67)  # read(67,*)
         read_line(67)
@@ -24881,13 +24933,13 @@ c           if =0 - molecule I has no data in the Irwin table
             try:
                 _p = read_line(67).split()  # read(67,*,end=15) spec(i),aa
             except EOFError:
-                break  # END=15 → 标号 15
+                break  # END=15 → label 15
             spec[i] = float(_p[0])
             for k in range(1, 7):
                 aa[k] = float(_p[k])
             for j in range(1, 7):
                 am[j, i] = aa[j]
-        # 标号 15 continue
+        # label 15 continue
         close_unit(67)
         _save_irwpf_iread = 1
 
@@ -24912,8 +24964,8 @@ c           if =0 - molecule I has no data in the Irwin table
             tl * (a[6, ion, jatom]))))))
         if jatom == 5 and ion == 3:
             ulog = 1.0
-        # write(*,*) 'bor',ion,tl,ulog  （原代码已注释）
-        # 631  format('bor',i4,1p8e11.3)  （原代码已注释）
+        # write(*,*) 'bor',ion,tl,ulog  (commented out in the original code)
+        # 631  format('bor',i4,1p8e11.3)  (commented out in the original code)
         u = math.exp(ulog)
         return jatom, ion, indmol, t, u
 
@@ -24930,8 +24982,8 @@ c           if =0 - molecule I has no data in the Irwin table
             tl * (am[5, indm] +
             tl * (am[6, indm]))))))
         u = math.exp(ulog)
-        # if(t.gt.5128..and.t.lt.5129.) write(6,631) t,indmol,indm,u  （原代码已注释）
-        # 631   format('irwpf',f10.1,2i5,f16.3)  （原代码已注释）
+        # if(t.gt.5128..and.t.lt.5129.) write(6,631) t,indmol,indm,u  (commented out in the original code)
+        # 631   format('irwpf',f10.1,2i5,f16.3)  (commented out in the original code)
     return jatom, ion, indmol, t, u
 
 

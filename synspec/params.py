@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-params.py — SYNSPEC 全部 PARAMETER 常量。
+params.py — All PARAMETER constants of SYNSPEC.
 
-来源：PARAMS.FOR / LINDAT.FOR / WINCOM.FOR 中的 PARAMETER 语句
-（注释掉的 PARAMETER 不纳入）。注释保留英文原文。
+Source: PARAMETER statements in PARAMS.FOR / LINDAT.FOR / WINCOM.FOR
+(commented-out PARAMETERs are not included). Comments keep the original English.
 
-表达式型参数（如 MOPAC = MFRQ、MI1 = MION0-1）直接写成 Python 表达式。
-有依赖关系的常量按依赖顺序定义；Fortran 大小写不敏感，此处统一用规范大写拼写
-（源码中小写的 mfhtab/mtabth/mtabeh 在此记为 MFHTAB/MTABTH/MTABEH）。
+Expression-type parameters (e.g. MOPAC = MFRQ, MI1 = MION0-1) are written directly as Python expressions.
+Constants with dependencies are defined in dependency order; Fortran is case-insensitive, so canonical
+uppercase spelling is used here (lowercase mfhtab/mtabth/mtabeh in the source are MFHTAB/MTABTH/MTABEH here).
 """
 
 # ======================================================================
@@ -47,9 +47,9 @@ MFGRID   =   100000
 MTTAB    =       21
 MRTAB    =       20
 MSFTAB   =  6000000
-MFHTAB   =     1000  # 源码小写 mfhtab
-MTABTH   =       10  # 源码小写 mtabth
-MTABEH   =       10  # 源码小写 mtabeh
+MFHTAB   =     1000  # lowercase mfhtab in the source
+MTABTH   =       10  # lowercase mtabth in the source
+MTABEH   =       10  # lowercase mtabeh in the source
 
 # Basic physical constants
 H     = 6.6256e-27       # Planck constant     h

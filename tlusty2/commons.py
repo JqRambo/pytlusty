@@ -1,32 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-commons.py — TLUSTY 全部 COMMON 块变量的懒分配命名空间。
+commons.py — lazy-allocation namespace for all TLUSTY COMMON block variables.
 
-对应 7 个 include 文件（BASICS.FOR / ATOMIC.FOR / ARRAY1.FOR / ITERAT.FOR /
-MODELQ.FOR / ODFPAR.FOR / ALIPAR.FOR）中的全部 COMMON 块
-（含 ARRAY1.FOR 的无名 COMMON）。
+Covers all COMMON blocks from the 7 include files (BASICS.FOR / ATOMIC.FOR /
+ARRAY1.FOR / ITERAT.FOR / MODELQ.FOR / ODFPAR.FOR / ALIPAR.FOR),
+including the unnamed COMMON in ARRAY1.FOR.
 
-用法：
+Usage:
     import commons as C
-    C.ABSO[i] = 1.0      # 数组：首次访问时按 Fortran 声明维度（每维 +1）分配
-    C.NATOM = 5          # 标量：首次访问返回默认 0 / 0.0 / False / ''
+    C.ABSO[i] = 1.0      # array: allocated on first access to the Fortran declared dims (+1 per dim)
+    C.NATOM = 5          # scalar: first access returns default 0 / 0.0 / False / ''
 
-规则：
-- 保留 Fortran 1 基索引：数组每维多分配一个元素，索引 0 不使用。
-- 类型遵循 IMPLIC.FOR：IMPLICIT REAL*8 (A-H,O-Z), LOGICAL*1 (L)，
-  即首字母 I-N → int64、A-H/O-Z → float64、L 开头 → bool；显式声明优先：
-  INTEGER*2 → np.int16，REAL*4 → np.float32，CHARACTER*n → dtype=object（元素初值 ''）。
-- DECLS 记录 {名字: (种类, 维度表达式元组, dtype)}；模块级 __getattr__（PEP 562）
-  在首次访问时据此分配，并缓存到模块 globals()，后续访问走正常属性。
-- 维度表达式中的 PARAMETER 名取自 params.py（Fortran 大小写不敏感，此处用规范拼写）。
+Rules:
+- Keep Fortran 1-based indexing: each array dimension gets one extra element; index 0 is unused.
+- Types follow IMPLIC.FOR: IMPLICIT REAL*8 (A-H,O-Z), LOGICAL*1 (L),
+  i.e. leading letter I-N -> int64, A-H/O-Z -> float64, L -> bool; explicit declarations win:
+  INTEGER*2 -> np.int16, REAL*4 -> np.float32, CHARACTER*n -> dtype=object (initial value '').
+- DECLS records {name: (kind, dimension-expression tuple, dtype)}; the module-level __getattr__ (PEP 562)
+  allocates on first access accordingly and caches into module globals(); later accesses are normal attributes.
+- PARAMETER names in dimension expressions come from params.py (Fortran is case-insensitive; canonical spelling used here).
 """
 
 import numpy as np
 
 import params as P
 
-# {名字: (种类 "array"/"scalar", (维度表达式, ...), dtype)}
-# 每条注释注明来源：文件名 + COMMON 块名 + 原始维度声明。
+# {name: (kind "array"/"scalar", (dimension expression, ...), dtype)}
+# Each comment notes the source: file name + COMMON block name + original dimension declaration.
 DECLS = {
     # ===== BASICS.FOR : COMMON /BASNUM/ =====
     "NATOM": ("scalar", (), "np.int64"),  # BASICS.FOR /BASNUM/ NATOM
@@ -145,7 +145,7 @@ DECLS = {
     "INIT": ("scalar", (), "np.int64"),  # BASICS.FOR /RUNKEY/ INIT
     "LAC2": ("scalar", (), "bool"),  # BASICS.FOR /RUNKEY/ LAC2
     "LFIN": ("scalar", (), "bool"),  # BASICS.FOR /RUNKEY/ LFIN
-    "CHMX": ("scalar", (), "np.float64"),  # Python 新增: 当次迭代最大相对变化(SOLVE/SOLVES/RYBSOL 写入, 供 main 进度显示)
+    "CHMX": ("scalar", (), "np.float64"),  # Python addition: max relative change of the current iteration (written by SOLVE/SOLVES/RYBSOL, for main progress display)
 
     # ===== BASICS.FOR : COMMON /CONKEY/ =====
     "HMIX0": ("scalar", (), "np.float64"),  # BASICS.FOR /CONKEY/ HMIX0
@@ -272,6 +272,9 @@ DECLS = {
     "ipelch": ("scalar", (), "np.int64"),  # BASICS.FOR /iprkey/ ipelch
     "ipeldo": ("scalar", (), "np.int64"),  # BASICS.FOR /iprkey/ ipeldo
     "ipconf": ("scalar", (), "np.int64"),  # BASICS.FOR /iprkey/ ipconf
+
+    # ===== fork addition : COMMON /ADPLAM/ =====
+    "iadlam": ("scalar", (), "np.int64"),  # fork NSTPAR /ADPLAM/ IADLAM (adaptive lambda iteration)
 
     # ===== ATOMIC.FOR : COMMON /ATOPAR/ =====
     "AMASS": ("array", ("MATOM", ), "np.float64"),  # ATOMIC.FOR /ATOPAR/ AMASS(MATOM)
@@ -1262,535 +1265,535 @@ DECLS = {
 
 
     # ================================================================
-    # 内联 COMMON 补录：以下块只在 tlusty208.f 各子程序内部声明，
-    # 不在 7 个 include 文件中。由 /tmp 一次性脚本从 tlusty208.f 提取，
-    # 对照表见 INLINE_COMMONS.md。
+    # inline COMMON supplement: the following blocks are declared only inside
+    # individual subroutines of tlusty208.f, not in the 7 include files. Extracted
+    # from tlusty208.f by a one-off /tmp script; cross-reference table in INLINE_COMMONS.md.
     # ================================================================
 
-    # ===== 内联 COMMON /abntab/（补录） =====
-    # 出现: TABINI:44476; CHCTAB:44939
-    "abunt": ("array", ("MATOM", ), "np.float64"),  # 内联 /abntab/ abunt(matom)
-    "abuno": ("array", ("MATOM", ), "np.float64"),  # 内联 /abntab/ abuno(matom)
-    "tmolit": ("scalar", (), "np.float64"),  # 内联 /abntab/ tmolit
-    "iophmt": ("scalar", (), "np.int64"),  # 内联 /abntab/ iophmt
-    "ioph2t": ("scalar", (), "np.int64"),  # 内联 /abntab/ ioph2t
-    "iophet": ("scalar", (), "np.int64"),  # 内联 /abntab/ iophet
-    "iopcht": ("scalar", (), "np.int64"),  # 内联 /abntab/ iopcht
-    "iopoht": ("scalar", (), "np.int64"),  # 内联 /abntab/ iopoht
-    "ioh2mt": ("scalar", (), "np.int64"),  # 内联 /abntab/ ioh2mt
-    "ih2h2t": ("scalar", (), "np.int64"),  # 内联 /abntab/ ih2h2t
-    "ih2het": ("scalar", (), "np.int64"),  # 内联 /abntab/ ih2het
-    "ioh2ht": ("scalar", (), "np.int64"),  # 内联 /abntab/ ioh2ht
-    "iohhet": ("scalar", (), "np.int64"),  # 内联 /abntab/ iohhet
-    "ifmolt": ("scalar", (), "np.int64"),  # 内联 /abntab/ ifmolt
-
-    # ===== 内联 COMMON /ADCHAR/（补录） =====
-    # 出现: ELCOR:5727; BPOPC:18484; MOLEQ:45833
-    "QADD": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /ADCHAR/ QADD(MDEPTH)
-
-    # ===== 内联 COMMON /adiaba/（补录） =====
-    # 出现: NSTPAR:1681; TRMDER:27290
-    "grdad0": ("scalar", (), "np.float64"),  # 内联 /adiaba/ grdad0
-    "itgrad": ("scalar", (), "np.int64"),  # 内联 /adiaba/ itgrad
-
-    # ===== 内联 COMMON /auxcbc/（补录） =====
-    # 出现: COMSET:38062; RTECF0:38564; COMPT0:39589
-    "cden1m": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /auxcbc/ cden1m(mdepth)
-    "cden10": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /auxcbc/ cden10(mdepth)
-    "cden2m": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /auxcbc/ cden2m(mdepth)
-    "cden20": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /auxcbc/ cden20(mdepth)
-
-    # ===== 内联 COMMON /AUXRTE/（补录） =====
-    # 出现: RTECF0:38560; RTECOM:38767; RTECF1:38956; RTECMC:39403; RTECMU:39800
-    "COMA": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ COMA(MDEPTH)
-    "COMB": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ COMB(MDEPTH)
-    "COMC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ COMC(MDEPTH)
-    "VL": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ VL(MDEPTH)
-    "COME": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ COME(MDEPTH)
-    "U": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ U(MDEPTH)
-    "V": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ V(MDEPTH)
-    "BS": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ BS(MDEPTH)
-    "AL": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ AL(MDEPTH)
-    "BE": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ BE(MDEPTH)
-    "GA": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /AUXRTE/ GA(MDEPTH)
-
-    # ===== 内联 COMMON /callarda/（补录） =====
-    # 出现: GETLAL:43850; ALLARD:43976
-    "xlalp": ("array", ("1400", ), "np.float64"),  # 内联 /callarda/ xlalp(NXMAX)
-    "plalp": ("array", ("1400", "5", ), "np.float64"),  # 内联 /callarda/ plalp(NXMAX,NNMAX)
-    "stnnea": ("scalar", (), "np.float64"),  # 内联 /callarda/ stnnea
-    "stncha": ("scalar", (), "np.float64"),  # 内联 /callarda/ stncha
-    "vneua": ("scalar", (), "np.float64"),  # 内联 /callarda/ vneua
-    "vchaa": ("scalar", (), "np.float64"),  # 内联 /callarda/ vchaa
-    "nxalp": ("scalar", (), "np.int64"),  # 内联 /callarda/ nxalp
-    "iwarna": ("scalar", (), "np.int64"),  # 内联 /callarda/ iwarna
-
-    # ===== 内联 COMMON /callardb/（补录） =====
-    # 出现: GETLAL:43852; ALLARD:43978
-    "xlbet": ("array", ("1400", ), "np.float64"),  # 内联 /callardb/ xlbet(NXMAX)
-    "plbet": ("array", ("1400", "5", ), "np.float64"),  # 内联 /callardb/ plbet(NXMAX,NNMAX)
-    "stnneb": ("scalar", (), "np.float64"),  # 内联 /callardb/ stnneb
-    "stnchb": ("scalar", (), "np.float64"),  # 内联 /callardb/ stnchb
-    "vneub": ("scalar", (), "np.float64"),  # 内联 /callardb/ vneub
-    "vchab": ("scalar", (), "np.float64"),  # 内联 /callardb/ vchab
-    "nxbet": ("scalar", (), "np.int64"),  # 内联 /callardb/ nxbet
-    "iwarnb": ("scalar", (), "np.int64"),  # 内联 /callardb/ iwarnb
-
-    # ===== 内联 COMMON /callardc/（补录） =====
-    # 出现: GETLAL:43856; ALLARD:43982
-    "xlbal": ("array", ("1400", ), "np.float64"),  # 内联 /callardc/ xlbal(NXMAX)
-    "plbal": ("array", ("1400", "5", ), "np.float64"),  # 内联 /callardc/ plbal(NXMAX,NNMAX)
-    "stnnec": ("scalar", (), "np.float64"),  # 内联 /callardc/ stnnec
-    "stnchc": ("scalar", (), "np.float64"),  # 内联 /callardc/ stnchc
-    "vneuc": ("scalar", (), "np.float64"),  # 内联 /callardc/ vneuc
-    "vchac": ("scalar", (), "np.float64"),  # 内联 /callardc/ vchac
-    "nxbal": ("scalar", (), "np.int64"),  # 内联 /callardc/ nxbal
-    "iwarnc": ("scalar", (), "np.int64"),  # 内联 /callardc/ iwarnc
-
-    # ===== 内联 COMMON /callardg/（补录） =====
-    # 出现: GETLAL:43854; ALLARD:43980
-    "xlgam": ("array", ("1400", ), "np.float64"),  # 内联 /callardg/ xlgam(NXMAX)
-    "plgam": ("array", ("1400", "5", ), "np.float64"),  # 内联 /callardg/ plgam(NXMAX,NNMAX)
-    "stnneg": ("scalar", (), "np.float64"),  # 内联 /callardg/ stnneg
-    "stnchg": ("scalar", (), "np.float64"),  # 内联 /callardg/ stnchg
-    "vneug": ("scalar", (), "np.float64"),  # 内联 /callardg/ vneug
-    "vchag": ("scalar", (), "np.float64"),  # 内联 /callardg/ vchag
-    "nxgam": ("scalar", (), "np.int64"),  # 内联 /callardg/ nxgam
-    "iwarng": ("scalar", (), "np.int64"),  # 内联 /callardg/ iwarng
-
-    # ===== 内联 COMMON /calphatd/（补录） =====
-    # 出现: GETLAL:43858; ALLARD:43984; ALLARDT:44191
-    "xlalpd": ("array", ("1400", "6", ), "np.float64"),  # 内联 /calphatd/ xlalpd(NXMAX,NTAMAX)
-    "plalpd": ("array", ("1400", "5", "6", ), "np.float64"),  # 内联 /calphatd/ plalpd(NXMAX,NNMAX,NTAMAX)
-    "stnead": ("array", ("6", ), "np.float64"),  # 内联 /calphatd/ stnead(ntamax)
-    "stnchd": ("array", ("6", ), "np.float64"),  # 内联 /calphatd/ stnchd(ntamax)
-    "vneuad": ("array", ("6", ), "np.float64"),  # 内联 /calphatd/ vneuad(ntamax)
-    "vchaad": ("array", ("6", ), "np.float64"),  # 内联 /calphatd/ vchaad(ntamax)
-    "talpd": ("array", ("6", ), "np.float64"),  # 内联 /calphatd/ talpd(ntamax)
-    "nxalpd": ("array", ("6", ), "np.int64"),  # 内联 /calphatd/ nxalpd(ntamax)
-    "ntalpd": ("scalar", (), "np.int64"),  # 内联 /calphatd/ ntalpd
-
-    # ===== 内联 COMMON /CC/（补录） =====
-    # 出现: TRMDRT:45671
-    "DPDR": ("scalar", (), "np.float64"),  # 内联 /CC/ DPDR
-    "DPDT": ("scalar", (), "np.float64"),  # 内联 /CC/ DPDT
-    "DSDT": ("scalar", (), "np.float64"),  # 内联 /CC/ DSDT
-    "DSDR": ("scalar", (), "np.float64"),  # 内联 /CC/ DSDR
-    "CV": ("scalar", (), "np.float64"),  # 内联 /CC/ CV
-    "S": ("scalar", (), "np.float64"),  # 内联 /CC/ S
-    "GAMMA": ("scalar", (), "np.float64"),  # 内联 /CC/ GAMMA
-
-    # ===== 内联 COMMON /CMATZD/（补录） =====
-    # 出现: SOLVE:14472; SOLVES:14798; BHED:16679
-    "CZZ": ("scalar", (), "np.float64"),  # 内联 /CMATZD/ CZZ
-    "CZN": ("scalar", (), "np.float64"),  # 内联 /CMATZD/ CZN
-    "CZE": ("scalar", (), "np.float64"),  # 内联 /CMATZD/ CZE
-    "CZM": ("scalar", (), "np.float64"),  # 内联 /CMATZD/ CZM
-
-    # ===== 内联 COMMON /COLKUR/（补录） =====
-    # 出现: LEVCD:36492; INKUL:36763
-    "OMES": ("array", ("100", "100", ), "np.float64"),  # 内联 /COLKUR/ OMES(100,100)
-    "EKU": ("array", ("15000", ), "np.float64"),  # 内联 /COLKUR/ EKU(15000)
-    "GKU": ("array", ("15000", ), "np.float64"),  # 内联 /COLKUR/ GKU(15000)
-    "GST": ("scalar", (), "np.float64"),  # 内联 /COLKUR/ GST
-    "KKU": ("array", ("15000", ), "np.int64"),  # 内联 /COLKUR/ KKU(15000)
-
-    # ===== 内联 COMMON /COMFH1/（补录） =====
-    # 出现: MOLEQ:45821; RUSSEL:46119
-    "COMFH1_C": ("array", ("600", "5", ), "np.float64"),  # 内联 /COMFH1/ C(600,5)
-    "PPMOL": ("array", ("600", ), "np.float64"),  # 内联 /COMFH1/ PPMOL(600)
-    "APMLOG": ("array", ("600", ), "np.float64"),  # 内联 /COMFH1/ APMLOG(600)
-    "XIP": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ XIP(100)
-    "XIP2": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ XIP2(100)
-    "CCOMP": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ CCOMP(100)
-    "UIIDUI": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ UIIDUI(100)
-    "P": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ P(100)
-    "FP": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ FP(100)
-    "XKP": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ XKP(100)
-    "XK2": ("array", ("100", ), "np.float64"),  # 内联 /COMFH1/ XK2(100)
-    "EPS": ("scalar", (), "np.float64"),  # 内联 /COMFH1/ EPS
-    "SWITER": ("scalar", (), "np.float64"),  # 内联 /COMFH1/ SWITER
-    "NELEM": ("array", ("5", "600", ), "np.int64"),  # 内联 /COMFH1/ NELEM(5,600)
-    "NATO": ("array", ("5", "600", ), "np.int64"),  # 内联 /COMFH1/ NATO(5,600)
-    "MMAX": ("array", ("600", ), "np.int64"),  # 内联 /COMFH1/ MMAX(600)
-    "NELEMX": ("array", ("100", ), "np.int64"),  # 内联 /COMFH1/ NELEMX(100)
-    "NMETAL": ("scalar", (), "np.int64"),  # 内联 /COMFH1/ NMETAL
-    "NMOLEC": ("scalar", (), "np.int64"),  # 内联 /COMFH1/ NMOLEC
-    "NIMAX": ("scalar", (), "np.int64"),  # 内联 /COMFH1/ NIMAX
-
-    # ===== 内联 COMMON /comgfs/（补录） =====
-    # 出现: COMSET:38064; INICOM:38731; RTECOM:38771; RTECF1:38960; RTECMC:39407
-    "gfm": ("array", ("MFREQ", "MDEPTC", ), "np.float64"),  # 内联 /comgfs/ gfm(mfreq,mdeptc)
-    "gfp": ("array", ("MFREQ", "MDEPTC", ), "np.float64"),  # 内联 /comgfs/ gfp(mfreq,mdeptc)
-
-    # ===== 内联 COMMON /CONVOUT/（补录） =====
-    # 出现: TRMDRT:45672
-    "CFLX": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /CONVOUT/ CFLX(MDEPTH)
-    "VELCON": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /CONVOUT/ VELCON(MDEPTH)
-    "GRADAD": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /CONVOUT/ GRADAD(MDEPTH)
-    "ENT": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /CONVOUT/ ENT(MDEPTH)
-
-    # ===== 内联 COMMON /COOLCO/（补录） =====
-    # 出现: COOLRT:43047; OPACFA:43163
-    "ABSOTI": ("array", ("MION", "MDEPTH", ), "np.float64"),  # 内联 /COOLCO/ ABSOTI(MION,MDEPTH)
-    "EMISTI": ("array", ("MION", "MDEPTH", ), "np.float64"),  # 内联 /COOLCO/ EMISTI(MION,MDEPTH)
-    "ABSOC1": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /COOLCO/ ABSOC1(MDEPTH)
-    "EMISC1": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /COOLCO/ EMISC1(MDEPTH)
-
-    # ===== 内联 COMMON /CTIon/（补录） =====
-    # 出现: HCTION:11649; BLOCK_DATA@11672:11679
-    "CTIon": ("array", ("7", "4", "30", ), "np.float64"),  # 内联 /CTIon/ CTIon(7,4,30)
-
-    # ===== 内联 COMMON /CTRecomb/（补录） =====
-    # 出现: HCTRECOM:11615; BLOCK_DATA@11672:11684
-    "CTRecomb": ("array", ("6", "4", "30", ), "np.float64"),  # 内联 /CTRecomb/ CTRecomb(6,4,30)
-
-    # ===== 内联 COMMON /CTRTEMP/（补录） =====
-    # 出现: COLIS:11212; HCTRECOM:11614; HCTION:11648
-    "te": ("scalar", (), "np.float64"),  # 内联 /CTRTEMP/ te
-
-    # ===== 内联 COMMON /CUBCON/（补录） =====
-    # 出现: RHSGEN:22167; CONTMP:26343; CONTMD:26572; CONVEC:27142; CONVC1:27214; CUBIC:27368; CONOUT:27434; MATCON:27606; TEMCOR:27831; CONREF:27981; LTEGRD:40925; RYBENE:47249
-    "ACNV": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ ACNV/A
-    "BCNV": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ BCNV/B
-    "DEL": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ DEL/DDEL
-    "GRDADB": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ GRDADB
-    "DELMDE": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ DELMDE/DLT
-    "RHO": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ RHO
-    "FLXTOT": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ FLXTOT
-    "GRAVD": ("scalar", (), "np.float64"),  # 内联 /CUBCON/ GRAVD
-
-    # ===== 内联 COMMON /DEPTDR/（补录） =====
-    # 出现: PZEVLD:28377; DMDER:40712
-    "DDM": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDM(MDEPTH)
-    "DDP": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDP(MDEPTH)
-    "DD0": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DD0(MDEPTH)
-    "DDMIN": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDMIN(MDEPTH)
-    "DDPLU": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDPLU(MDEPTH)
-    "DDA": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDA(MDEPTH)
-    "DDC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDC(MDEPTH)
-    "DDB": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /DEPTDR/ DDB(MDEPTH)
-
-    # ===== 内联 COMMON /derdif/（补录） =====
-    # 出现: NSTPAR:1680; TRMDER:27288
-    "dift": ("scalar", (), "np.float64"),  # 内联 /derdif/ dift
-    "difp": ("scalar", (), "np.float64"),  # 内联 /derdif/ difp
-
-    # ===== 内联 COMMON /deridt/（补录） =====
-    # 出现: NSTPAR:1674; RYBENE:47254
-    "dert": ("scalar", (), "np.float64"),  # 内联 /deridt/ dert
-
-    # ===== 内联 COMMON /dsctva/（补录） =====
-    # 出现: OPACFD:18620; OPACTD:45423; RYBMAT:46856; OPACTR:47662
-    "dsct1": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /dsctva/ dsct1(mdepth)
-    "dscn1": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /dsctva/ dscn1(mdepth)
-
-    # ===== 内联 COMMON /eletab/（补录） =====
-    # 出现: TABINI:44480; ELDENC:49066
-    "elecgr": ("array", ("MTABT", "MTABR", ), "np.float64"),  # 内联 /eletab/ elecgr(mtabt,mtabr)
-
-    # ===== 内联 COMMON /entrop/（补录） =====
-    # 出现: MOLEQ:45830
-    "entato": ("array", ("100", ), "np.float64"),  # 内联 /entrop/ entato(100)
-    "ention": ("array", ("100", ), "np.float64"),  # 内联 /entrop/ ention(100)
-    "entmol": ("array", ("600", ), "np.float64"),  # 内联 /entrop/ entmol(600)
-
-    # ===== 内联 COMMON /eospar/（补录） =====
-    # 出现: INPMOD:3076; OPADD:23010; ELDENS:26729; RAYLEIGH:45194; MOLEQ:45826; ELDENC:49067
-    "anmol": ("array", ("600", "MDEPTH", ), "np.float64"),  # 内联 /eospar/ anmol(600,mdepth)
-    "anato": ("array", ("100", "MDEPTH", ), "np.float64"),  # 内联 /eospar/ anato(100,mdepth)
-    "anion": ("array", ("100", "MDEPTH", ), "np.float64"),  # 内联 /eospar/ anion(100,mdepth)
-
-    # ===== 内联 COMMON /EXTINT/（补录） =====
-    # 出现: RTECF1:38955; RTEANG:40008
-    "WANGLE": ("scalar", (), "np.float64"),  # 内联 /EXTINT/ WANGLE
-    "EXTIN": ("array", ("MFREQ", ), "np.float64"),  # 内联 /EXTINT/ EXTIN(MFREQ)
-
-    # ===== 内联 COMMON /FACTRS/（补录） =====
-    # 出现: LTEGRD:40921; TEMPER:41451; TLOCAL:41613; NEWDM:41728; NEWDMT:41921
-    "GAMJ": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /FACTRS/ GAMJ(MDEPTH)
-    "GAMH": ("scalar", (), "np.float64"),  # 内联 /FACTRS/ GAMH
-    "FAK0": ("scalar", (), "np.float64"),  # 内联 /FACTRS/ FAK0
-
-    # ===== 内联 COMMON /FLXAUX/（补录） =====
-    # 出现: NSTPAR:1669; LTEGRD:40924; TEMPER:41450; TLOCAL:41612; NEWDM:41729; NEWDMT:41922
-    "T4": ("scalar", (), "np.float64"),  # 内联 /FLXAUX/ T4
-    "PGAS": ("scalar", (), "np.float64"),  # 内联 /FLXAUX/ PGAS
-    "PRAD": ("scalar", (), "np.float64"),  # 内联 /FLXAUX/ PRAD
-    "PGM": ("scalar", (), "np.float64"),  # 内联 /FLXAUX/ PGM
-    "PRADM": ("scalar", (), "np.float64"),  # 内联 /FLXAUX/ PRADM
-    "ITGMAX": ("scalar", (), "np.int64"),  # 内联 /FLXAUX/ ITGMAX
-    "ITGMX0": ("scalar", (), "np.int64"),  # 内联 /FLXAUX/ ITGMX0
-
-    # ===== 内联 COMMON /freqcl/（补录） =====
-    # 出现: INITIA:159; NSTPAR:1670
-    "frmin": ("scalar", (), "np.float64"),  # 内联 /freqcl/ frmin
-    "frmax": ("scalar", (), "np.float64"),  # 内联 /freqcl/ frmax
-    "nfrecl": ("scalar", (), "np.int64"),  # 内联 /freqcl/ nfrecl
-
-    # ===== 内联 COMMON /grdpra/（补录） =====
-    # 出现: OUTPRI:14166; PZEVLD:28380; RYBCHN:47455; OPACTR:47664; RYBHEQ:47829; PGSET:47977
-    "GRD": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /grdpra/ GRD(MDEPTH)
-    "pra": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /grdpra/ pra(mdepth)
-    "pgs0": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /grdpra/ pgs0(mdepth)
-    "ANTP": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /grdpra/ ANTP(MDEPTH)
-
-    # ===== 内联 COMMON /hediff/（补录） =====
-    # 出现: START:122; NSTPAR:1672; HEDIF:44346
-    "hcmass": ("scalar", (), "np.float64"),  # 内联 /hediff/ hcmass
-    "radstr": ("scalar", (), "np.float64"),  # 内联 /hediff/ radstr
-
-    # ===== 内联 COMMON /hmolab/（补录） =====
-    # 出现: OPACF1:4819; OPACFD:18617; OPACF0:33407; OPACT1:45368; OPACTD:45424; MOLEQ:45831; OPACTR:47663; ELDENC:49070
-    "anh2": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /hmolab/ anh2(mdepth)
-    "anhm": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /hmolab/ anhm(mdepth)
-
-    # ===== 内联 COMMON /ichndm/（补录） =====
-    # 出现: NSTPAR:1677; CONTMP:26344
-    "ichanm": ("scalar", (), "np.int64"),  # 内联 /ichndm/ ichanm
-
-    # ===== 内联 COMMON /icnrsp/（补录） =====
-    # 出现: NSTPAR:1675; RESOLV:3737; PZEVAL:28319
-    "iconrs": ("scalar", (), "np.int64"),  # 内联 /icnrsp/ iconrs
-
-    # ===== 内联 COMMON /ifpzpa/（补录） =====
-    # 出现: NSTPAR:1682; PZEVLD:28381
-    "ifpzev": ("scalar", (), "np.int64"),  # 内联 /ifpzpa/ ifpzev
-
-    # ===== 内联 COMMON /ijflar/（补录） =====
-    # 出现: INIFRC:34029; INIFRT:34899
-    "ijfl": ("array", ("MLEVEL", ), "np.int64"),  # 内联 /ijflar/ ijfl(mlevel)
-
-    # ===== 内联 COMMON /imodlc/（补录） =====
-    # 出现: RDATA:1035; RYBSOL:46652
-    "imodl0": ("array", ("MLEVEL", ), "np.int64"),  # 内联 /imodlc/ imodl0(mlevel)
-
-    # ===== 内联 COMMON /imucnn/（补录） =====
-    # 出现: NSTPAR:1676; CONREF:27982
-    "imucon": ("scalar", (), "np.int64"),  # 内联 /imucnn/ imucon
-
-    # ===== 内联 COMMON /intcff/（补录） =====
-    # 出现: TABINI:44475; TABINT:44841
-    "INTCFF_YINT": ("array", ("MFREQ", ), "np.float64"),  # 内联 /intcff/ yint(mfreq)
-    "jint": ("array", ("MFREQ", ), "np.int64"),  # 内联 /intcff/ jint(mfreq)
-
-    # ===== 内联 COMMON /intcfg/（补录） =====
-    # 出现: GOMINI:48284; GHYDOP:48386
-    "INTCFG_YINT": ("array", ("MFREQ", ), "np.float64"),  # 内联 /intcfg/ yint(mfreq)
-    "jgint": ("array", ("MFREQ", ), "np.int64"),  # 内联 /intcfg/ jgint(mfreq)
-
-    # ===== 内联 COMMON /INUNIT/（补录） =====
-    # 出现: INITIA:158; RDATA:1034
-    "IUNIT": ("scalar", (), "np.int64"),  # 内联 /INUNIT/ IUNIT
-
-    # ===== 内联 COMMON /ioniz2/（补录） =====
-    # 出现: MOLEQ:45829
-    "anion2": ("array", ("30", "MDEPTH", ), "np.float64"),  # 内联 /ioniz2/ anion2(30,mdepth)
-
-    # ===== 内联 COMMON /ipricr/（补录） =====
-    # 出现: NSTPAR:1678; OPACF1:4820
-    "iprcrs": ("scalar", (), "np.int64"),  # 内联 /ipricr/ iprcrs
-    "nprcrs": ("scalar", (), "np.int64"),  # 内联 /ipricr/ nprcrs
-
-    # ===== 内联 COMMON /irwint/（补录） =====
-    # 出现: NSTPAR:1673; PARTF:23407
-    "iirwin": ("scalar", (), "np.int64"),  # 内联 /irwint/ iirwin
-
-    # ===== 内联 COMMON /LINED/（补录） =====
-    # 出现: IROSET:36279; INKUL:36765
-    "WAVE": ("array", ("MLINE", ), "np.float64"),  # 内联 /LINED/ WAVE(MLINE)
-    "VDOP": ("array", ("MLINE", "MDODF", ), "np.float32"),  # 内联 /LINED/ VDOP(MLINE,MDODF)
-    "AGAM": ("array", ("MLINE", "MDODF", ), "np.float32"),  # 内联 /LINED/ AGAM(MLINE,MDODF)
-    "SIG0": ("array", ("MLINE", "MDODF", ), "np.float32"),  # 内联 /LINED/ SIG0(MLINE,MDODF)
-    "JTR": ("array", ("MLINE", "2", ), "np.int64"),  # 内联 /LINED/ JTR(MLINE,2)
-
-    # ===== 内联 COMMON /moldat/（补录） =====
-    # 出现: NSTPAR:1683; MOLEQ:45834; MPARTF:46355
-    "moltab": ("scalar", (), "np.int64"),  # 内联 /moldat/ moltab
-    "irwtab": ("scalar", (), "np.int64"),  # 内联 /moldat/ irwtab
-
-    # ===== 内联 COMMON /OPTDPT/（补录） =====
-    # 出现: RTEDF1:31608; RTEFR1:32311; RTEINT:33057; RTECF0:38558; RTECOM:38766; RTECF1:38953; TAUFR1:39699; RTECMU:39799; RADTOT:42932
-    "DT": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /OPTDPT/ DT(MDEPTH)
-
-    # ===== 内联 COMMON /pfoptb/（补录） =====
-    # 出现: OPFRAC:25234
-    "pfop": ("array", ("100", "60", "258", ), "np.float64"),  # 内联 /pfoptb/ pfop(mtemp,melec,mstag)
-    "pfophm": ("array", ("100", "60", ), "np.float64"),  # 内联 /pfoptb/ pfophm(mtemp,melec)
-    "frac": ("array", ("100", "60", "258", ), "np.float64"),  # 内联 /pfoptb/ frac(mtemp,melec,mstag)
-    "frop": ("array", ("100", "60", "258", ), "np.float64"),  # 内联 /pfoptb/ frop(mtemp,melec,mstag)
-    "PFOPTB_ITEMP": ("array", ("100", ), "np.int64"),  # 内联 /pfoptb/ itemp(mtemp)
-
-    # ===== 内联 COMMON /PFSTDS/（补录） =====
-    # 出现: STATE:2255; PARTF:23406
-    "PFSTD": ("array", ("MATOM", "30", ), "np.float64"),  # 内联 /PFSTDS/ PFSTD(matom,30)
-    "MODPF": ("array", ("MATOM", ), "np.int64"),  # 内联 /PFSTDS/ MODPF(matom)
-
-    # ===== 内联 COMMON /POPSTR/（补录） =====
-    # 出现: STEQEQ:5254
-    "POPP": ("array", ("MLEVEL", ), "np.float64"),  # 内联 /POPSTR/ POPP(MLEVEL)
-    "POPP1": ("array", ("MLEVEL", ), "np.float64"),  # 内联 /POPSTR/ POPP1(MLEVEL)
-    "POPP2": ("array", ("MLEVEL", ), "np.float64"),  # 内联 /POPSTR/ POPP2(MLEVEL)
-    "POPP3": ("array", ("MLEVEL", ), "np.float64"),  # 内联 /POPSTR/ POPP3(MLEVEL)
-
-    # ===== 内联 COMMON /POPULS/（补录） =====
-    # 出现: ACCELP:29819
-    "POPUL1": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # 内联 /POPULS/ POPUL1(MLEVEL,MDEPTH)
-    "POPUL2": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # 内联 /POPULS/ POPUL2(MLEVEL,MDEPTH)
-    "POPUL3": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # 内联 /POPULS/ POPUL3(MLEVEL,MDEPTH)
-
-    # ===== 内联 COMMON /PPAPAR/（补录） =====
-    # 出现: STEQEQ:5256
-    "IPOPST": ("array", ("MATOM", ), "np.int64"),  # 内联 /PPAPAR/ IPOPST(MATOM)
-    "NTERST": ("scalar", (), "np.int64"),  # 内联 /PPAPAR/ NTERST
-    "ITERST": ("scalar", (), "np.int64"),  # 内联 /PPAPAR/ ITERST
-    "IACPPP": ("scalar", (), "np.int64"),  # 内联 /PPAPAR/ IACPPP
-    "IACPP0": ("scalar", (), "np.int64"),  # 内联 /PPAPAR/ IACPP0
-    "IACPPD": ("scalar", (), "np.int64"),  # 内联 /PPAPAR/ IACPPD
-    "LACPPP": ("scalar", (), "bool"),  # 内联 /PPAPAR/ LACPPP
-
-    # ===== 内联 COMMON /PRSAUX/（补录） =====
-    # 出现: CONTMD:26573; PZEVLD:28376; LTEGRD:40920; TEMPER:41449; NEWDM:41727; NEWDMT:41920; HESOLV:42106; HESOL6:42323
-    "VSND2": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /PRSAUX/ VSND2(MDEPTH)
-    "HG1": ("scalar", (), "np.float64"),  # 内联 /PRSAUX/ HG1
-    "HR1": ("scalar", (), "np.float64"),  # 内联 /PRSAUX/ HR1
-    "RR1": ("scalar", (), "np.float64"),  # 内联 /PRSAUX/ RR1
-
-    # ===== 内联 COMMON /quasun/（补录） =====
-    # 出现: NSTPAR:1671; PROFIL:8226; LINPRO:8946; QUASIM:43786; GETLAL:43849; ALLARD:43988
-    "tqmprf": ("scalar", (), "np.float64"),  # 内联 /quasun/ tqmprf
-    "iquasi": ("scalar", (), "np.int64"),  # 内联 /quasun/ iquasi
-    "nunalp": ("scalar", (), "np.int64"),  # 内联 /quasun/ nunalp
-    "nunbet": ("scalar", (), "np.int64"),  # 内联 /quasun/ nunbet
-    "nungam": ("scalar", (), "np.int64"),  # 内联 /quasun/ nungam
-    "nunbal": ("scalar", (), "np.int64"),  # 内联 /quasun/ nunbal
-
-    # ===== 内联 COMMON /RAYSCT/（补录） =====
-    # 出现: RAYLEIGH:45193
-    "RCS": ("array", ("MFREQ", ), "np.float64"),  # 内联 /RAYSCT/ RCS(MFREQ)
-    "RCHE": ("array", ("MFREQ", ), "np.float64"),  # 内联 /RAYSCT/ RCHE(MFREQ)
-    "RCH2": ("array", ("MFREQ", ), "np.float64"),  # 内联 /RAYSCT/ RCH2(MFREQ)
-
-    # ===== 内联 COMMON /relcor/（补录） =====
-    # 出现: INPDIS:40344; COLUMN:40532
-    "arh": ("scalar", (), "np.float64"),  # 内联 /relcor/ arh
-    "brh": ("scalar", (), "np.float64"),  # 内联 /relcor/ brh
-    "crh": ("scalar", (), "np.float64"),  # 内联 /relcor/ crh
-    "drh": ("scalar", (), "np.float64"),  # 内联 /relcor/ drh
-
-    # ===== 内联 COMMON /rhoder/（补录） =====
-    # 出现: OPACFD:18621; OPACTD:45421; SETDRT:45637
-    "drhodt": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /rhoder/ drhodt(mdepth)
-
-    # ===== 内联 COMMON /RYBMTX/（补录） =====
-    # 出现: RYBSOL:46648; RYBMAT:46852; RYBENE:47250
-    "RA": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ RA(MDEPTH)
-    "RB": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ RB(MDEPTH)
-    "RC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ RC(MDEPTH)
-    "VR": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ VR(MDEPTH)
-    "UA": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ UA(MDEPTH)
-    "UB": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ UB(MDEPTH)
-    "UC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ UC(MDEPTH)
-    "VA": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ VA(MDEPTH)
-    "VB": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ VB(MDEPTH)
-    "VC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ VC(MDEPTH)
-    "WR": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ WR(MDEPTH)
-    "WM": ("array", ("MDEPTH", "MDEPTH", ), "np.float64"),  # 内联 /RYBMTX/ WM(MDEPTH,MDEPTH)
-
-    # ===== 内联 COMMON /rybpgs/（补录） =====
-    # 出现: RYBCHN:47456; RYBHEQ:47830; PGSET:47978
-    "CS": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /rybpgs/ CS(MDEPTH)
-    "PRAD2D": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /rybpgs/ PRAD2D(MDEPTH)
-    "F1HE": ("scalar", (), "np.float64"),  # 内联 /rybpgs/ F1HE
-
-    # ===== 内联 COMMON /STFCR/（补录） =====
-    # 出现: ODFSET:29971
-    "OFR": ("array", ("MFODF", ), "np.float64"),  # 内联 /STFCR/ OFR(MFODF)
-    "OW": ("array", ("MFODF", ), "np.float64"),  # 内联 /STFCR/ OW(MFODF)
-    "OWSUB": ("array", ("MFODF", ), "np.float64"),  # 内联 /STFCR/ OWSUB(MFODF)
-    "ODFL0": ("array", ("MDODF", "MFODF", ), "np.float64"),  # 内联 /STFCR/ ODFL0(MDODF,MFODF)
-    "ODF2": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /STFCR/ ODF2(MDEPTH)
-    "IFTRA": ("array", ("MTRANS", ), "np.int64"),  # 内联 /STFCR/ IFTRA(MTRANS)
-    "IDODF": ("array", ("MDODF", ), "np.int64"),  # 内联 /STFCR/ IDODF(MDODF)
-    "NDODF": ("scalar", (), "np.int64"),  # 内联 /STFCR/ NDODF
-
-    # ===== 内联 COMMON /STOMAT/（补录） =====
-    # 出现: SOLVES:14796
-    "STOA": ("array", ("MSMX", "MSMX", "MDEPTH", ), "np.float64"),  # 内联 /STOMAT/ STOA(MSMX,MSMX,MDEPTH)
-    "STOB": ("array", ("MSMX", "MSMX", "MDEPTH", ), "np.float64"),  # 内联 /STOMAT/ STOB(MSMX,MSMX,MDEPTH)
-    "STOALF": ("array", ("MSMX", "MSMX", "MDEPTH", ), "np.float64"),  # 内联 /STOMAT/ STOALF(MSMX,MSMX,MDEPTH)
-
-    # ===== 内联 COMMON /STRPAR/（补录） =====
-    # 出现: INITIA:157; RDATA:1033
-    "IMER": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ IMER
-    "ITR": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ ITR
-    "IC": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ IC
-    "IL": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ IL
-    "IP": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ IP
-    "NLASTE": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ NLASTE
-    "NHOD": ("scalar", (), "np.int64"),  # 内联 /STRPAR/ NHOD
-    "LASV": ("scalar", (), "bool"),  # 内联 /STRPAR/ LASV
-
-    # ===== 内联 COMMON /SURFEX/（补录） =====
-    # 出现: BHED:16678; BHEZ:17020; RTECF1:38954; RTEANG:40009; RADTOT:42933
-    "EXTJ": ("array", ("MFREQ", ), "np.float64"),  # 内联 /SURFEX/ EXTJ(MFREQ)
-    "EXTH": ("array", ("MFREQ", ), "np.float64"),  # 内联 /SURFEX/ EXTH(MFREQ)
-
-    # ===== 内联 COMMON /TABLTD/（补录） =====
-    # 出现: SETTRM:45507; PRSENT:45733
-    "R1": ("scalar", (), "np.float64"),  # 内联 /TABLTD/ R1
-    "R2": ("scalar", (), "np.float64"),  # 内联 /TABLTD/ R2
-    "T1": ("scalar", (), "np.float64"),  # 内联 /TABLTD/ T1
-    "T2": ("scalar", (), "np.float64"),  # 内联 /TABLTD/ T2
-    "T12": ("scalar", (), "np.float64"),  # 内联 /TABLTD/ T12
-    "T22": ("scalar", (), "np.float64"),  # 内联 /TABLTD/ T22
-    "INDEX": ("scalar", (), "np.int64"),  # 内联 /TABLTD/ INDEX
-
-    # ===== 内联 COMMON /tdedge/（补录） =====
-    # 出现: SETTRM:45508; TRMDRT:45677; PRSENT:45734
-    "redge": ("scalar", (), "np.float64"),  # 内联 /tdedge/ redge
-    "pedge": ("array", ("100", ), "np.float64"),  # 内联 /tdedge/ pedge(100)
-    "sedge": ("array", ("100", ), "np.float64"),  # 内联 /tdedge/ sedge(100)
-    "cvedge": ("array", ("100", ), "np.float64"),  # 内联 /tdedge/ cvedge(100)
-    "cpedge": ("array", ("100", ), "np.float64"),  # 内联 /tdedge/ cpedge(100)
-    "gammaedge": ("array", ("100", ), "np.float64"),  # 内联 /tdedge/ gammaedge(100)
-    "tedge": ("array", ("100", ), "np.float64"),  # 内联 /tdedge/ tedge(100)
-
-    # ===== 内联 COMMON /tdflag/（补录） =====
-    # 出现: SETTRM:45510; TRMDRT:45679; PRSENT:45736
-    "JON": ("scalar", (), "np.int64"),  # 内联 /tdflag/ JON
-
-    # ===== 内联 COMMON /temlim/（补录） =====
-    # 出现: NSTPAR:1679; KURUCZ:3220
-    "tfloor": ("scalar", (), "np.float64"),  # 内联 /temlim/ tfloor
-
-    # ===== 内联 COMMON /terden/（补录） =====
-    # 出现: STATE:2256; ELDENS:26728; TRMDER:27289; MOLEQ:45832
-    "rhoter": ("scalar", (), "np.float64"),  # 内联 /terden/ rhoter
-    "anta": ("scalar", (), "np.float64"),  # 内联 /terden/ anta
-    "entrp": ("scalar", (), "np.float64"),  # 内联 /terden/ entrp
-
-    # ===== 内联 COMMON /THERM/（补录） =====
-    # 出现: SETTRM:45506; PRSENT:45732
-    "SL": ("array", ("330", "100", ), "np.float64"),  # 内联 /THERM/ SL(330,100)
-    "PL": ("array", ("330", "100", ), "np.float64"),  # 内联 /THERM/ PL(330,100)
-
-    # ===== 内联 COMMON /TOPB/（补录） =====
-    # 出现: TOPBAS:10708; OPDATA:10767
-    "SOP": ("array", ("15", "200", ), "np.float64"),  # 内联 /TOPB/ SOP(MOP,MMAXOP)
-    "XOP": ("array", ("15", "200", ), "np.float64"),  # 内联 /TOPB/ XOP(MOP,MMAXOP)
-    "NOP": ("array", ("200", ), "np.int64"),  # 内联 /TOPB/ NOP(MMAXOP)
-    "NTOTOP": ("scalar", (), "np.int64"),  # 内联 /TOPB/ NTOTOP
-    "IDLVOP": ("array", ("200", ), "object"),  # 内联 /TOPB/ IDLVOP(MMAXOP)
-    "LOPREA": ("scalar", (), "bool"),  # 内联 /TOPB/ LOPREA
-
-    # ===== 内联 COMMON /TOTJHK/（补录） =====
-    # 出现: LTEGRD:40922; RADTOT:42934
-    "TOTJ": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /TOTJHK/ TOTJ(MDEPTH)
-    "TOTH": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /TOTJHK/ TOTH(MDEPTH)
-    "TOTK": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /TOTJHK/ TOTK(MDEPTH)
-    "RDOPAC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /TOTJHK/ RDOPAC(MDEPTH)
-    "FLOPAC": ("array", ("MDEPTH", ), "np.float64"),  # 内联 /TOTJHK/ FLOPAC(MDEPTH)
+    # ===== inline COMMON /abntab/(supplemental) =====
+    # Appears in: TABINI:44476; CHCTAB:44939
+    "abunt": ("array", ("MATOM", ), "np.float64"),  # inline /abntab/ abunt(matom)
+    "abuno": ("array", ("MATOM", ), "np.float64"),  # inline /abntab/ abuno(matom)
+    "tmolit": ("scalar", (), "np.float64"),  # inline /abntab/ tmolit
+    "iophmt": ("scalar", (), "np.int64"),  # inline /abntab/ iophmt
+    "ioph2t": ("scalar", (), "np.int64"),  # inline /abntab/ ioph2t
+    "iophet": ("scalar", (), "np.int64"),  # inline /abntab/ iophet
+    "iopcht": ("scalar", (), "np.int64"),  # inline /abntab/ iopcht
+    "iopoht": ("scalar", (), "np.int64"),  # inline /abntab/ iopoht
+    "ioh2mt": ("scalar", (), "np.int64"),  # inline /abntab/ ioh2mt
+    "ih2h2t": ("scalar", (), "np.int64"),  # inline /abntab/ ih2h2t
+    "ih2het": ("scalar", (), "np.int64"),  # inline /abntab/ ih2het
+    "ioh2ht": ("scalar", (), "np.int64"),  # inline /abntab/ ioh2ht
+    "iohhet": ("scalar", (), "np.int64"),  # inline /abntab/ iohhet
+    "ifmolt": ("scalar", (), "np.int64"),  # inline /abntab/ ifmolt
+
+    # ===== inline COMMON /ADCHAR/(supplemental) =====
+    # Appears in: ELCOR:5727; BPOPC:18484; MOLEQ:45833
+    "QADD": ("array", ("MDEPTH", ), "np.float64"),  # inline /ADCHAR/ QADD(MDEPTH)
+
+    # ===== inline COMMON /adiaba/(supplemental) =====
+    # Appears in: NSTPAR:1681; TRMDER:27290
+    "grdad0": ("scalar", (), "np.float64"),  # inline /adiaba/ grdad0
+    "itgrad": ("scalar", (), "np.int64"),  # inline /adiaba/ itgrad
+
+    # ===== inline COMMON /auxcbc/(supplemental) =====
+    # Appears in: COMSET:38062; RTECF0:38564; COMPT0:39589
+    "cden1m": ("array", ("MDEPTH", ), "np.float64"),  # inline /auxcbc/ cden1m(mdepth)
+    "cden10": ("array", ("MDEPTH", ), "np.float64"),  # inline /auxcbc/ cden10(mdepth)
+    "cden2m": ("array", ("MDEPTH", ), "np.float64"),  # inline /auxcbc/ cden2m(mdepth)
+    "cden20": ("array", ("MDEPTH", ), "np.float64"),  # inline /auxcbc/ cden20(mdepth)
+
+    # ===== inline COMMON /AUXRTE/(supplemental) =====
+    # Appears in: RTECF0:38560; RTECOM:38767; RTECF1:38956; RTECMC:39403; RTECMU:39800
+    "COMA": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ COMA(MDEPTH)
+    "COMB": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ COMB(MDEPTH)
+    "COMC": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ COMC(MDEPTH)
+    "VL": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ VL(MDEPTH)
+    "COME": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ COME(MDEPTH)
+    "U": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ U(MDEPTH)
+    "V": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ V(MDEPTH)
+    "BS": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ BS(MDEPTH)
+    "AL": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ AL(MDEPTH)
+    "BE": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ BE(MDEPTH)
+    "GA": ("array", ("MDEPTH", ), "np.float64"),  # inline /AUXRTE/ GA(MDEPTH)
+
+    # ===== inline COMMON /callarda/(supplemental) =====
+    # Appears in: GETLAL:43850; ALLARD:43976
+    "xlalp": ("array", ("1400", ), "np.float64"),  # inline /callarda/ xlalp(NXMAX)
+    "plalp": ("array", ("1400", "5", ), "np.float64"),  # inline /callarda/ plalp(NXMAX,NNMAX)
+    "stnnea": ("scalar", (), "np.float64"),  # inline /callarda/ stnnea
+    "stncha": ("scalar", (), "np.float64"),  # inline /callarda/ stncha
+    "vneua": ("scalar", (), "np.float64"),  # inline /callarda/ vneua
+    "vchaa": ("scalar", (), "np.float64"),  # inline /callarda/ vchaa
+    "nxalp": ("scalar", (), "np.int64"),  # inline /callarda/ nxalp
+    "iwarna": ("scalar", (), "np.int64"),  # inline /callarda/ iwarna
+
+    # ===== inline COMMON /callardb/(supplemental) =====
+    # Appears in: GETLAL:43852; ALLARD:43978
+    "xlbet": ("array", ("1400", ), "np.float64"),  # inline /callardb/ xlbet(NXMAX)
+    "plbet": ("array", ("1400", "5", ), "np.float64"),  # inline /callardb/ plbet(NXMAX,NNMAX)
+    "stnneb": ("scalar", (), "np.float64"),  # inline /callardb/ stnneb
+    "stnchb": ("scalar", (), "np.float64"),  # inline /callardb/ stnchb
+    "vneub": ("scalar", (), "np.float64"),  # inline /callardb/ vneub
+    "vchab": ("scalar", (), "np.float64"),  # inline /callardb/ vchab
+    "nxbet": ("scalar", (), "np.int64"),  # inline /callardb/ nxbet
+    "iwarnb": ("scalar", (), "np.int64"),  # inline /callardb/ iwarnb
+
+    # ===== inline COMMON /callardc/(supplemental) =====
+    # Appears in: GETLAL:43856; ALLARD:43982
+    "xlbal": ("array", ("1400", ), "np.float64"),  # inline /callardc/ xlbal(NXMAX)
+    "plbal": ("array", ("1400", "5", ), "np.float64"),  # inline /callardc/ plbal(NXMAX,NNMAX)
+    "stnnec": ("scalar", (), "np.float64"),  # inline /callardc/ stnnec
+    "stnchc": ("scalar", (), "np.float64"),  # inline /callardc/ stnchc
+    "vneuc": ("scalar", (), "np.float64"),  # inline /callardc/ vneuc
+    "vchac": ("scalar", (), "np.float64"),  # inline /callardc/ vchac
+    "nxbal": ("scalar", (), "np.int64"),  # inline /callardc/ nxbal
+    "iwarnc": ("scalar", (), "np.int64"),  # inline /callardc/ iwarnc
+
+    # ===== inline COMMON /callardg/(supplemental) =====
+    # Appears in: GETLAL:43854; ALLARD:43980
+    "xlgam": ("array", ("1400", ), "np.float64"),  # inline /callardg/ xlgam(NXMAX)
+    "plgam": ("array", ("1400", "5", ), "np.float64"),  # inline /callardg/ plgam(NXMAX,NNMAX)
+    "stnneg": ("scalar", (), "np.float64"),  # inline /callardg/ stnneg
+    "stnchg": ("scalar", (), "np.float64"),  # inline /callardg/ stnchg
+    "vneug": ("scalar", (), "np.float64"),  # inline /callardg/ vneug
+    "vchag": ("scalar", (), "np.float64"),  # inline /callardg/ vchag
+    "nxgam": ("scalar", (), "np.int64"),  # inline /callardg/ nxgam
+    "iwarng": ("scalar", (), "np.int64"),  # inline /callardg/ iwarng
+
+    # ===== inline COMMON /calphatd/(supplemental) =====
+    # Appears in: GETLAL:43858; ALLARD:43984; ALLARDT:44191
+    "xlalpd": ("array", ("1400", "6", ), "np.float64"),  # inline /calphatd/ xlalpd(NXMAX,NTAMAX)
+    "plalpd": ("array", ("1400", "5", "6", ), "np.float64"),  # inline /calphatd/ plalpd(NXMAX,NNMAX,NTAMAX)
+    "stnead": ("array", ("6", ), "np.float64"),  # inline /calphatd/ stnead(ntamax)
+    "stnchd": ("array", ("6", ), "np.float64"),  # inline /calphatd/ stnchd(ntamax)
+    "vneuad": ("array", ("6", ), "np.float64"),  # inline /calphatd/ vneuad(ntamax)
+    "vchaad": ("array", ("6", ), "np.float64"),  # inline /calphatd/ vchaad(ntamax)
+    "talpd": ("array", ("6", ), "np.float64"),  # inline /calphatd/ talpd(ntamax)
+    "nxalpd": ("array", ("6", ), "np.int64"),  # inline /calphatd/ nxalpd(ntamax)
+    "ntalpd": ("scalar", (), "np.int64"),  # inline /calphatd/ ntalpd
+
+    # ===== inline COMMON /CC/(supplemental) =====
+    # Appears in: TRMDRT:45671
+    "DPDR": ("scalar", (), "np.float64"),  # inline /CC/ DPDR
+    "DPDT": ("scalar", (), "np.float64"),  # inline /CC/ DPDT
+    "DSDT": ("scalar", (), "np.float64"),  # inline /CC/ DSDT
+    "DSDR": ("scalar", (), "np.float64"),  # inline /CC/ DSDR
+    "CV": ("scalar", (), "np.float64"),  # inline /CC/ CV
+    "S": ("scalar", (), "np.float64"),  # inline /CC/ S
+    "GAMMA": ("scalar", (), "np.float64"),  # inline /CC/ GAMMA
+
+    # ===== inline COMMON /CMATZD/(supplemental) =====
+    # Appears in: SOLVE:14472; SOLVES:14798; BHED:16679
+    "CZZ": ("scalar", (), "np.float64"),  # inline /CMATZD/ CZZ
+    "CZN": ("scalar", (), "np.float64"),  # inline /CMATZD/ CZN
+    "CZE": ("scalar", (), "np.float64"),  # inline /CMATZD/ CZE
+    "CZM": ("scalar", (), "np.float64"),  # inline /CMATZD/ CZM
+
+    # ===== inline COMMON /COLKUR/(supplemental) =====
+    # Appears in: LEVCD:36492; INKUL:36763
+    "OMES": ("array", ("100", "100", ), "np.float64"),  # inline /COLKUR/ OMES(100,100)
+    "EKU": ("array", ("15000", ), "np.float64"),  # inline /COLKUR/ EKU(15000)
+    "GKU": ("array", ("15000", ), "np.float64"),  # inline /COLKUR/ GKU(15000)
+    "GST": ("scalar", (), "np.float64"),  # inline /COLKUR/ GST
+    "KKU": ("array", ("15000", ), "np.int64"),  # inline /COLKUR/ KKU(15000)
+
+    # ===== inline COMMON /COMFH1/(supplemental) =====
+    # Appears in: MOLEQ:45821; RUSSEL:46119
+    "COMFH1_C": ("array", ("600", "5", ), "np.float64"),  # inline /COMFH1/ C(600,5)
+    "PPMOL": ("array", ("600", ), "np.float64"),  # inline /COMFH1/ PPMOL(600)
+    "APMLOG": ("array", ("600", ), "np.float64"),  # inline /COMFH1/ APMLOG(600)
+    "XIP": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ XIP(100)
+    "XIP2": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ XIP2(100)
+    "CCOMP": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ CCOMP(100)
+    "UIIDUI": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ UIIDUI(100)
+    "P": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ P(100)
+    "FP": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ FP(100)
+    "XKP": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ XKP(100)
+    "XK2": ("array", ("100", ), "np.float64"),  # inline /COMFH1/ XK2(100)
+    "EPS": ("scalar", (), "np.float64"),  # inline /COMFH1/ EPS
+    "SWITER": ("scalar", (), "np.float64"),  # inline /COMFH1/ SWITER
+    "NELEM": ("array", ("5", "600", ), "np.int64"),  # inline /COMFH1/ NELEM(5,600)
+    "NATO": ("array", ("5", "600", ), "np.int64"),  # inline /COMFH1/ NATO(5,600)
+    "MMAX": ("array", ("600", ), "np.int64"),  # inline /COMFH1/ MMAX(600)
+    "NELEMX": ("array", ("100", ), "np.int64"),  # inline /COMFH1/ NELEMX(100)
+    "NMETAL": ("scalar", (), "np.int64"),  # inline /COMFH1/ NMETAL
+    "NMOLEC": ("scalar", (), "np.int64"),  # inline /COMFH1/ NMOLEC
+    "NIMAX": ("scalar", (), "np.int64"),  # inline /COMFH1/ NIMAX
+
+    # ===== inline COMMON /comgfs/(supplemental) =====
+    # Appears in: COMSET:38064; INICOM:38731; RTECOM:38771; RTECF1:38960; RTECMC:39407
+    "gfm": ("array", ("MFREQ", "MDEPTC", ), "np.float64"),  # inline /comgfs/ gfm(mfreq,mdeptc)
+    "gfp": ("array", ("MFREQ", "MDEPTC", ), "np.float64"),  # inline /comgfs/ gfp(mfreq,mdeptc)
+
+    # ===== inline COMMON /CONVOUT/(supplemental) =====
+    # Appears in: TRMDRT:45672
+    "CFLX": ("array", ("MDEPTH", ), "np.float64"),  # inline /CONVOUT/ CFLX(MDEPTH)
+    "VELCON": ("array", ("MDEPTH", ), "np.float64"),  # inline /CONVOUT/ VELCON(MDEPTH)
+    "GRADAD": ("array", ("MDEPTH", ), "np.float64"),  # inline /CONVOUT/ GRADAD(MDEPTH)
+    "ENT": ("array", ("MDEPTH", ), "np.float64"),  # inline /CONVOUT/ ENT(MDEPTH)
+
+    # ===== inline COMMON /COOLCO/(supplemental) =====
+    # Appears in: COOLRT:43047; OPACFA:43163
+    "ABSOTI": ("array", ("MION", "MDEPTH", ), "np.float64"),  # inline /COOLCO/ ABSOTI(MION,MDEPTH)
+    "EMISTI": ("array", ("MION", "MDEPTH", ), "np.float64"),  # inline /COOLCO/ EMISTI(MION,MDEPTH)
+    "ABSOC1": ("array", ("MDEPTH", ), "np.float64"),  # inline /COOLCO/ ABSOC1(MDEPTH)
+    "EMISC1": ("array", ("MDEPTH", ), "np.float64"),  # inline /COOLCO/ EMISC1(MDEPTH)
+
+    # ===== inline COMMON /CTIon/(supplemental) =====
+    # Appears in: HCTION:11649; BLOCK_DATA@11672:11679
+    "CTIon": ("array", ("7", "4", "30", ), "np.float64"),  # inline /CTIon/ CTIon(7,4,30)
+
+    # ===== inline COMMON /CTRecomb/(supplemental) =====
+    # Appears in: HCTRECOM:11615; BLOCK_DATA@11672:11684
+    "CTRecomb": ("array", ("6", "4", "30", ), "np.float64"),  # inline /CTRecomb/ CTRecomb(6,4,30)
+
+    # ===== inline COMMON /CTRTEMP/(supplemental) =====
+    # Appears in: COLIS:11212; HCTRECOM:11614; HCTION:11648
+    "te": ("scalar", (), "np.float64"),  # inline /CTRTEMP/ te
+
+    # ===== inline COMMON /CUBCON/(supplemental) =====
+    # Appears in: RHSGEN:22167; CONTMP:26343; CONTMD:26572; CONVEC:27142; CONVC1:27214; CUBIC:27368; CONOUT:27434; MATCON:27606; TEMCOR:27831; CONREF:27981; LTEGRD:40925; RYBENE:47249
+    "ACNV": ("scalar", (), "np.float64"),  # inline /CUBCON/ ACNV/A
+    "BCNV": ("scalar", (), "np.float64"),  # inline /CUBCON/ BCNV/B
+    "DEL": ("scalar", (), "np.float64"),  # inline /CUBCON/ DEL/DDEL
+    "GRDADB": ("scalar", (), "np.float64"),  # inline /CUBCON/ GRDADB
+    "DELMDE": ("scalar", (), "np.float64"),  # inline /CUBCON/ DELMDE/DLT
+    "RHO": ("scalar", (), "np.float64"),  # inline /CUBCON/ RHO
+    "FLXTOT": ("scalar", (), "np.float64"),  # inline /CUBCON/ FLXTOT
+    "GRAVD": ("scalar", (), "np.float64"),  # inline /CUBCON/ GRAVD
+
+    # ===== inline COMMON /DEPTDR/(supplemental) =====
+    # Appears in: PZEVLD:28377; DMDER:40712
+    "DDM": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDM(MDEPTH)
+    "DDP": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDP(MDEPTH)
+    "DD0": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DD0(MDEPTH)
+    "DDMIN": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDMIN(MDEPTH)
+    "DDPLU": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDPLU(MDEPTH)
+    "DDA": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDA(MDEPTH)
+    "DDC": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDC(MDEPTH)
+    "DDB": ("array", ("MDEPTH", ), "np.float64"),  # inline /DEPTDR/ DDB(MDEPTH)
+
+    # ===== inline COMMON /derdif/(supplemental) =====
+    # Appears in: NSTPAR:1680; TRMDER:27288
+    "dift": ("scalar", (), "np.float64"),  # inline /derdif/ dift
+    "difp": ("scalar", (), "np.float64"),  # inline /derdif/ difp
+
+    # ===== inline COMMON /deridt/(supplemental) =====
+    # Appears in: NSTPAR:1674; RYBENE:47254
+    "dert": ("scalar", (), "np.float64"),  # inline /deridt/ dert
+
+    # ===== inline COMMON /dsctva/(supplemental) =====
+    # Appears in: OPACFD:18620; OPACTD:45423; RYBMAT:46856; OPACTR:47662
+    "dsct1": ("array", ("MDEPTH", ), "np.float64"),  # inline /dsctva/ dsct1(mdepth)
+    "dscn1": ("array", ("MDEPTH", ), "np.float64"),  # inline /dsctva/ dscn1(mdepth)
+
+    # ===== inline COMMON /eletab/(supplemental) =====
+    # Appears in: TABINI:44480; ELDENC:49066
+    "elecgr": ("array", ("MTABT", "MTABR", ), "np.float64"),  # inline /eletab/ elecgr(mtabt,mtabr)
+
+    # ===== inline COMMON /entrop/(supplemental) =====
+    # Appears in: MOLEQ:45830
+    "entato": ("array", ("100", ), "np.float64"),  # inline /entrop/ entato(100)
+    "ention": ("array", ("100", ), "np.float64"),  # inline /entrop/ ention(100)
+    "entmol": ("array", ("600", ), "np.float64"),  # inline /entrop/ entmol(600)
+
+    # ===== inline COMMON /eospar/(supplemental) =====
+    # Appears in: INPMOD:3076; OPADD:23010; ELDENS:26729; RAYLEIGH:45194; MOLEQ:45826; ELDENC:49067
+    "anmol": ("array", ("600", "MDEPTH", ), "np.float64"),  # inline /eospar/ anmol(600,mdepth)
+    "anato": ("array", ("100", "MDEPTH", ), "np.float64"),  # inline /eospar/ anato(100,mdepth)
+    "anion": ("array", ("100", "MDEPTH", ), "np.float64"),  # inline /eospar/ anion(100,mdepth)
+
+    # ===== inline COMMON /EXTINT/(supplemental) =====
+    # Appears in: RTECF1:38955; RTEANG:40008
+    "WANGLE": ("scalar", (), "np.float64"),  # inline /EXTINT/ WANGLE
+    "EXTIN": ("array", ("MFREQ", ), "np.float64"),  # inline /EXTINT/ EXTIN(MFREQ)
+
+    # ===== inline COMMON /FACTRS/(supplemental) =====
+    # Appears in: LTEGRD:40921; TEMPER:41451; TLOCAL:41613; NEWDM:41728; NEWDMT:41921
+    "GAMJ": ("array", ("MDEPTH", ), "np.float64"),  # inline /FACTRS/ GAMJ(MDEPTH)
+    "GAMH": ("scalar", (), "np.float64"),  # inline /FACTRS/ GAMH
+    "FAK0": ("scalar", (), "np.float64"),  # inline /FACTRS/ FAK0
+
+    # ===== inline COMMON /FLXAUX/(supplemental) =====
+    # Appears in: NSTPAR:1669; LTEGRD:40924; TEMPER:41450; TLOCAL:41612; NEWDM:41729; NEWDMT:41922
+    "T4": ("scalar", (), "np.float64"),  # inline /FLXAUX/ T4
+    "PGAS": ("scalar", (), "np.float64"),  # inline /FLXAUX/ PGAS
+    "PRAD": ("scalar", (), "np.float64"),  # inline /FLXAUX/ PRAD
+    "PGM": ("scalar", (), "np.float64"),  # inline /FLXAUX/ PGM
+    "PRADM": ("scalar", (), "np.float64"),  # inline /FLXAUX/ PRADM
+    "ITGMAX": ("scalar", (), "np.int64"),  # inline /FLXAUX/ ITGMAX
+    "ITGMX0": ("scalar", (), "np.int64"),  # inline /FLXAUX/ ITGMX0
+
+    # ===== inline COMMON /freqcl/(supplemental) =====
+    # Appears in: INITIA:159; NSTPAR:1670
+    "frmin": ("scalar", (), "np.float64"),  # inline /freqcl/ frmin
+    "frmax": ("scalar", (), "np.float64"),  # inline /freqcl/ frmax
+    "nfrecl": ("scalar", (), "np.int64"),  # inline /freqcl/ nfrecl
+
+    # ===== inline COMMON /grdpra/(supplemental) =====
+    # Appears in: OUTPRI:14166; PZEVLD:28380; RYBCHN:47455; OPACTR:47664; RYBHEQ:47829; PGSET:47977
+    "GRD": ("array", ("MDEPTH", ), "np.float64"),  # inline /grdpra/ GRD(MDEPTH)
+    "pra": ("array", ("MDEPTH", ), "np.float64"),  # inline /grdpra/ pra(mdepth)
+    "pgs0": ("array", ("MDEPTH", ), "np.float64"),  # inline /grdpra/ pgs0(mdepth)
+    "ANTP": ("array", ("MDEPTH", ), "np.float64"),  # inline /grdpra/ ANTP(MDEPTH)
+
+    # ===== inline COMMON /hediff/(supplemental) =====
+    # Appears in: START:122; NSTPAR:1672; HEDIF:44346
+    "hcmass": ("scalar", (), "np.float64"),  # inline /hediff/ hcmass
+    "radstr": ("scalar", (), "np.float64"),  # inline /hediff/ radstr
+
+    # ===== inline COMMON /hmolab/(supplemental) =====
+    # Appears in: OPACF1:4819; OPACFD:18617; OPACF0:33407; OPACT1:45368; OPACTD:45424; MOLEQ:45831; OPACTR:47663; ELDENC:49070
+    "anh2": ("array", ("MDEPTH", ), "np.float64"),  # inline /hmolab/ anh2(mdepth)
+    "anhm": ("array", ("MDEPTH", ), "np.float64"),  # inline /hmolab/ anhm(mdepth)
+
+    # ===== inline COMMON /ichndm/(supplemental) =====
+    # Appears in: NSTPAR:1677; CONTMP:26344
+    "ichanm": ("scalar", (), "np.int64"),  # inline /ichndm/ ichanm
+
+    # ===== inline COMMON /icnrsp/(supplemental) =====
+    # Appears in: NSTPAR:1675; RESOLV:3737; PZEVAL:28319
+    "iconrs": ("scalar", (), "np.int64"),  # inline /icnrsp/ iconrs
+
+    # ===== inline COMMON /ifpzpa/(supplemental) =====
+    # Appears in: NSTPAR:1682; PZEVLD:28381
+    "ifpzev": ("scalar", (), "np.int64"),  # inline /ifpzpa/ ifpzev
+
+    # ===== inline COMMON /ijflar/(supplemental) =====
+    # Appears in: INIFRC:34029; INIFRT:34899
+    "ijfl": ("array", ("MLEVEL", ), "np.int64"),  # inline /ijflar/ ijfl(mlevel)
+
+    # ===== inline COMMON /imodlc/(supplemental) =====
+    # Appears in: RDATA:1035; RYBSOL:46652
+    "imodl0": ("array", ("MLEVEL", ), "np.int64"),  # inline /imodlc/ imodl0(mlevel)
+
+    # ===== inline COMMON /imucnn/(supplemental) =====
+    # Appears in: NSTPAR:1676; CONREF:27982
+    "imucon": ("scalar", (), "np.int64"),  # inline /imucnn/ imucon
+
+    # ===== inline COMMON /intcff/(supplemental) =====
+    # Appears in: TABINI:44475; TABINT:44841
+    "INTCFF_YINT": ("array", ("MFREQ", ), "np.float64"),  # inline /intcff/ yint(mfreq)
+    "jint": ("array", ("MFREQ", ), "np.int64"),  # inline /intcff/ jint(mfreq)
+
+    # ===== inline COMMON /intcfg/(supplemental) =====
+    # Appears in: GOMINI:48284; GHYDOP:48386
+    "INTCFG_YINT": ("array", ("MFREQ", ), "np.float64"),  # inline /intcfg/ yint(mfreq)
+    "jgint": ("array", ("MFREQ", ), "np.int64"),  # inline /intcfg/ jgint(mfreq)
+
+    # ===== inline COMMON /INUNIT/(supplemental) =====
+    # Appears in: INITIA:158; RDATA:1034
+    "IUNIT": ("scalar", (), "np.int64"),  # inline /INUNIT/ IUNIT
+
+    # ===== inline COMMON /ioniz2/(supplemental) =====
+    # Appears in: MOLEQ:45829
+    "anion2": ("array", ("30", "MDEPTH", ), "np.float64"),  # inline /ioniz2/ anion2(30,mdepth)
+
+    # ===== inline COMMON /ipricr/(supplemental) =====
+    # Appears in: NSTPAR:1678; OPACF1:4820
+    "iprcrs": ("scalar", (), "np.int64"),  # inline /ipricr/ iprcrs
+    "nprcrs": ("scalar", (), "np.int64"),  # inline /ipricr/ nprcrs
+
+    # ===== inline COMMON /irwint/(supplemental) =====
+    # Appears in: NSTPAR:1673; PARTF:23407
+    "iirwin": ("scalar", (), "np.int64"),  # inline /irwint/ iirwin
+
+    # ===== inline COMMON /LINED/(supplemental) =====
+    # Appears in: IROSET:36279; INKUL:36765
+    "WAVE": ("array", ("MLINE", ), "np.float64"),  # inline /LINED/ WAVE(MLINE)
+    "VDOP": ("array", ("MLINE", "MDODF", ), "np.float32"),  # inline /LINED/ VDOP(MLINE,MDODF)
+    "AGAM": ("array", ("MLINE", "MDODF", ), "np.float32"),  # inline /LINED/ AGAM(MLINE,MDODF)
+    "SIG0": ("array", ("MLINE", "MDODF", ), "np.float32"),  # inline /LINED/ SIG0(MLINE,MDODF)
+    "JTR": ("array", ("MLINE", "2", ), "np.int64"),  # inline /LINED/ JTR(MLINE,2)
+
+    # ===== inline COMMON /moldat/(supplemental) =====
+    # Appears in: NSTPAR:1683; MOLEQ:45834; MPARTF:46355
+    "moltab": ("scalar", (), "np.int64"),  # inline /moldat/ moltab
+    "irwtab": ("scalar", (), "np.int64"),  # inline /moldat/ irwtab
+
+    # ===== inline COMMON /OPTDPT/(supplemental) =====
+    # Appears in: RTEDF1:31608; RTEFR1:32311; RTEINT:33057; RTECF0:38558; RTECOM:38766; RTECF1:38953; TAUFR1:39699; RTECMU:39799; RADTOT:42932
+    "DT": ("array", ("MDEPTH", ), "np.float64"),  # inline /OPTDPT/ DT(MDEPTH)
+
+    # ===== inline COMMON /pfoptb/(supplemental) =====
+    # Appears in: OPFRAC:25234
+    "pfop": ("array", ("100", "60", "258", ), "np.float64"),  # inline /pfoptb/ pfop(mtemp,melec,mstag)
+    "pfophm": ("array", ("100", "60", ), "np.float64"),  # inline /pfoptb/ pfophm(mtemp,melec)
+    "frac": ("array", ("100", "60", "258", ), "np.float64"),  # inline /pfoptb/ frac(mtemp,melec,mstag)
+    "frop": ("array", ("100", "60", "258", ), "np.float64"),  # inline /pfoptb/ frop(mtemp,melec,mstag)
+    "PFOPTB_ITEMP": ("array", ("100", ), "np.int64"),  # inline /pfoptb/ itemp(mtemp)
+
+    # ===== inline COMMON /PFSTDS/(supplemental) =====
+    # Appears in: STATE:2255; PARTF:23406
+    "PFSTD": ("array", ("MATOM", "30", ), "np.float64"),  # inline /PFSTDS/ PFSTD(matom,30)
+    "MODPF": ("array", ("MATOM", ), "np.int64"),  # inline /PFSTDS/ MODPF(matom)
+
+    # ===== inline COMMON /POPSTR/(supplemental) =====
+    # Appears in: STEQEQ:5254
+    "POPP": ("array", ("MLEVEL", ), "np.float64"),  # inline /POPSTR/ POPP(MLEVEL)
+    "POPP1": ("array", ("MLEVEL", ), "np.float64"),  # inline /POPSTR/ POPP1(MLEVEL)
+    "POPP2": ("array", ("MLEVEL", ), "np.float64"),  # inline /POPSTR/ POPP2(MLEVEL)
+    "POPP3": ("array", ("MLEVEL", ), "np.float64"),  # inline /POPSTR/ POPP3(MLEVEL)
+
+    # ===== inline COMMON /POPULS/(supplemental) =====
+    # Appears in: ACCELP:29819
+    "POPUL1": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # inline /POPULS/ POPUL1(MLEVEL,MDEPTH)
+    "POPUL2": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # inline /POPULS/ POPUL2(MLEVEL,MDEPTH)
+    "POPUL3": ("array", ("MLEVEL", "MDEPTH", ), "np.float64"),  # inline /POPULS/ POPUL3(MLEVEL,MDEPTH)
+
+    # ===== inline COMMON /PPAPAR/(supplemental) =====
+    # Appears in: STEQEQ:5256
+    "IPOPST": ("array", ("MATOM", ), "np.int64"),  # inline /PPAPAR/ IPOPST(MATOM)
+    "NTERST": ("scalar", (), "np.int64"),  # inline /PPAPAR/ NTERST
+    "ITERST": ("scalar", (), "np.int64"),  # inline /PPAPAR/ ITERST
+    "IACPPP": ("scalar", (), "np.int64"),  # inline /PPAPAR/ IACPPP
+    "IACPP0": ("scalar", (), "np.int64"),  # inline /PPAPAR/ IACPP0
+    "IACPPD": ("scalar", (), "np.int64"),  # inline /PPAPAR/ IACPPD
+    "LACPPP": ("scalar", (), "bool"),  # inline /PPAPAR/ LACPPP
+
+    # ===== inline COMMON /PRSAUX/(supplemental) =====
+    # Appears in: CONTMD:26573; PZEVLD:28376; LTEGRD:40920; TEMPER:41449; NEWDM:41727; NEWDMT:41920; HESOLV:42106; HESOL6:42323
+    "VSND2": ("array", ("MDEPTH", ), "np.float64"),  # inline /PRSAUX/ VSND2(MDEPTH)
+    "HG1": ("scalar", (), "np.float64"),  # inline /PRSAUX/ HG1
+    "HR1": ("scalar", (), "np.float64"),  # inline /PRSAUX/ HR1
+    "RR1": ("scalar", (), "np.float64"),  # inline /PRSAUX/ RR1
+
+    # ===== inline COMMON /quasun/(supplemental) =====
+    # Appears in: NSTPAR:1671; PROFIL:8226; LINPRO:8946; QUASIM:43786; GETLAL:43849; ALLARD:43988
+    "tqmprf": ("scalar", (), "np.float64"),  # inline /quasun/ tqmprf
+    "iquasi": ("scalar", (), "np.int64"),  # inline /quasun/ iquasi
+    "nunalp": ("scalar", (), "np.int64"),  # inline /quasun/ nunalp
+    "nunbet": ("scalar", (), "np.int64"),  # inline /quasun/ nunbet
+    "nungam": ("scalar", (), "np.int64"),  # inline /quasun/ nungam
+    "nunbal": ("scalar", (), "np.int64"),  # inline /quasun/ nunbal
+
+    # ===== inline COMMON /RAYSCT/(supplemental) =====
+    # Appears in: RAYLEIGH:45193
+    "RCS": ("array", ("MFREQ", ), "np.float64"),  # inline /RAYSCT/ RCS(MFREQ)
+    "RCHE": ("array", ("MFREQ", ), "np.float64"),  # inline /RAYSCT/ RCHE(MFREQ)
+    "RCH2": ("array", ("MFREQ", ), "np.float64"),  # inline /RAYSCT/ RCH2(MFREQ)
+
+    # ===== inline COMMON /relcor/(supplemental) =====
+    # Appears in: INPDIS:40344; COLUMN:40532
+    "arh": ("scalar", (), "np.float64"),  # inline /relcor/ arh
+    "brh": ("scalar", (), "np.float64"),  # inline /relcor/ brh
+    "crh": ("scalar", (), "np.float64"),  # inline /relcor/ crh
+    "drh": ("scalar", (), "np.float64"),  # inline /relcor/ drh
+
+    # ===== inline COMMON /rhoder/(supplemental) =====
+    # Appears in: OPACFD:18621; OPACTD:45421; SETDRT:45637
+    "drhodt": ("array", ("MDEPTH", ), "np.float64"),  # inline /rhoder/ drhodt(mdepth)
+
+    # ===== inline COMMON /RYBMTX/(supplemental) =====
+    # Appears in: RYBSOL:46648; RYBMAT:46852; RYBENE:47250
+    "RA": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ RA(MDEPTH)
+    "RB": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ RB(MDEPTH)
+    "RC": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ RC(MDEPTH)
+    "VR": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ VR(MDEPTH)
+    "UA": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ UA(MDEPTH)
+    "UB": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ UB(MDEPTH)
+    "UC": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ UC(MDEPTH)
+    "VA": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ VA(MDEPTH)
+    "VB": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ VB(MDEPTH)
+    "VC": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ VC(MDEPTH)
+    "WR": ("array", ("MDEPTH", ), "np.float64"),  # inline /RYBMTX/ WR(MDEPTH)
+    "WM": ("array", ("MDEPTH", "MDEPTH", ), "np.float64"),  # inline /RYBMTX/ WM(MDEPTH,MDEPTH)
+
+    # ===== inline COMMON /rybpgs/(supplemental) =====
+    # Appears in: RYBCHN:47456; RYBHEQ:47830; PGSET:47978
+    "CS": ("array", ("MDEPTH", ), "np.float64"),  # inline /rybpgs/ CS(MDEPTH)
+    "PRAD2D": ("array", ("MDEPTH", ), "np.float64"),  # inline /rybpgs/ PRAD2D(MDEPTH)
+    "F1HE": ("scalar", (), "np.float64"),  # inline /rybpgs/ F1HE
+
+    # ===== inline COMMON /STFCR/(supplemental) =====
+    # Appears in: ODFSET:29971
+    "OFR": ("array", ("MFODF", ), "np.float64"),  # inline /STFCR/ OFR(MFODF)
+    "OW": ("array", ("MFODF", ), "np.float64"),  # inline /STFCR/ OW(MFODF)
+    "OWSUB": ("array", ("MFODF", ), "np.float64"),  # inline /STFCR/ OWSUB(MFODF)
+    "ODFL0": ("array", ("MDODF", "MFODF", ), "np.float64"),  # inline /STFCR/ ODFL0(MDODF,MFODF)
+    "ODF2": ("array", ("MDEPTH", ), "np.float64"),  # inline /STFCR/ ODF2(MDEPTH)
+    "IFTRA": ("array", ("MTRANS", ), "np.int64"),  # inline /STFCR/ IFTRA(MTRANS)
+    "IDODF": ("array", ("MDODF", ), "np.int64"),  # inline /STFCR/ IDODF(MDODF)
+    "NDODF": ("scalar", (), "np.int64"),  # inline /STFCR/ NDODF
+
+    # ===== inline COMMON /STOMAT/(supplemental) =====
+    # Appears in: SOLVES:14796
+    "STOA": ("array", ("MSMX", "MSMX", "MDEPTH", ), "np.float64"),  # inline /STOMAT/ STOA(MSMX,MSMX,MDEPTH)
+    "STOB": ("array", ("MSMX", "MSMX", "MDEPTH", ), "np.float64"),  # inline /STOMAT/ STOB(MSMX,MSMX,MDEPTH)
+    "STOALF": ("array", ("MSMX", "MSMX", "MDEPTH", ), "np.float64"),  # inline /STOMAT/ STOALF(MSMX,MSMX,MDEPTH)
+
+    # ===== inline COMMON /STRPAR/(supplemental) =====
+    # Appears in: INITIA:157; RDATA:1033
+    "IMER": ("scalar", (), "np.int64"),  # inline /STRPAR/ IMER
+    "ITR": ("scalar", (), "np.int64"),  # inline /STRPAR/ ITR
+    "IC": ("scalar", (), "np.int64"),  # inline /STRPAR/ IC
+    "IL": ("scalar", (), "np.int64"),  # inline /STRPAR/ IL
+    "IP": ("scalar", (), "np.int64"),  # inline /STRPAR/ IP
+    "NLASTE": ("scalar", (), "np.int64"),  # inline /STRPAR/ NLASTE
+    "NHOD": ("scalar", (), "np.int64"),  # inline /STRPAR/ NHOD
+    "LASV": ("scalar", (), "bool"),  # inline /STRPAR/ LASV
+
+    # ===== inline COMMON /SURFEX/(supplemental) =====
+    # Appears in: BHED:16678; BHEZ:17020; RTECF1:38954; RTEANG:40009; RADTOT:42933
+    "EXTJ": ("array", ("MFREQ", ), "np.float64"),  # inline /SURFEX/ EXTJ(MFREQ)
+    "EXTH": ("array", ("MFREQ", ), "np.float64"),  # inline /SURFEX/ EXTH(MFREQ)
+
+    # ===== inline COMMON /TABLTD/(supplemental) =====
+    # Appears in: SETTRM:45507; PRSENT:45733
+    "R1": ("scalar", (), "np.float64"),  # inline /TABLTD/ R1
+    "R2": ("scalar", (), "np.float64"),  # inline /TABLTD/ R2
+    "T1": ("scalar", (), "np.float64"),  # inline /TABLTD/ T1
+    "T2": ("scalar", (), "np.float64"),  # inline /TABLTD/ T2
+    "T12": ("scalar", (), "np.float64"),  # inline /TABLTD/ T12
+    "T22": ("scalar", (), "np.float64"),  # inline /TABLTD/ T22
+    "INDEX": ("scalar", (), "np.int64"),  # inline /TABLTD/ INDEX
+
+    # ===== inline COMMON /tdedge/(supplemental) =====
+    # Appears in: SETTRM:45508; TRMDRT:45677; PRSENT:45734
+    "redge": ("scalar", (), "np.float64"),  # inline /tdedge/ redge
+    "pedge": ("array", ("100", ), "np.float64"),  # inline /tdedge/ pedge(100)
+    "sedge": ("array", ("100", ), "np.float64"),  # inline /tdedge/ sedge(100)
+    "cvedge": ("array", ("100", ), "np.float64"),  # inline /tdedge/ cvedge(100)
+    "cpedge": ("array", ("100", ), "np.float64"),  # inline /tdedge/ cpedge(100)
+    "gammaedge": ("array", ("100", ), "np.float64"),  # inline /tdedge/ gammaedge(100)
+    "tedge": ("array", ("100", ), "np.float64"),  # inline /tdedge/ tedge(100)
+
+    # ===== inline COMMON /tdflag/(supplemental) =====
+    # Appears in: SETTRM:45510; TRMDRT:45679; PRSENT:45736
+    "JON": ("scalar", (), "np.int64"),  # inline /tdflag/ JON
+
+    # ===== inline COMMON /temlim/(supplemental) =====
+    # Appears in: NSTPAR:1679; KURUCZ:3220
+    "tfloor": ("scalar", (), "np.float64"),  # inline /temlim/ tfloor
+
+    # ===== inline COMMON /terden/(supplemental) =====
+    # Appears in: STATE:2256; ELDENS:26728; TRMDER:27289; MOLEQ:45832
+    "rhoter": ("scalar", (), "np.float64"),  # inline /terden/ rhoter
+    "anta": ("scalar", (), "np.float64"),  # inline /terden/ anta
+    "entrp": ("scalar", (), "np.float64"),  # inline /terden/ entrp
+
+    # ===== inline COMMON /THERM/(supplemental) =====
+    # Appears in: SETTRM:45506; PRSENT:45732
+    "SL": ("array", ("330", "100", ), "np.float64"),  # inline /THERM/ SL(330,100)
+    "PL": ("array", ("330", "100", ), "np.float64"),  # inline /THERM/ PL(330,100)
+
+    # ===== inline COMMON /TOPB/(supplemental) =====
+    # Appears in: TOPBAS:10708; OPDATA:10767
+    "SOP": ("array", ("15", "200", ), "np.float64"),  # inline /TOPB/ SOP(MOP,MMAXOP)
+    "XOP": ("array", ("15", "200", ), "np.float64"),  # inline /TOPB/ XOP(MOP,MMAXOP)
+    "NOP": ("array", ("200", ), "np.int64"),  # inline /TOPB/ NOP(MMAXOP)
+    "NTOTOP": ("scalar", (), "np.int64"),  # inline /TOPB/ NTOTOP
+    "IDLVOP": ("array", ("200", ), "object"),  # inline /TOPB/ IDLVOP(MMAXOP)
+    "LOPREA": ("scalar", (), "bool"),  # inline /TOPB/ LOPREA
+
+    # ===== inline COMMON /TOTJHK/(supplemental) =====
+    # Appears in: LTEGRD:40922; RADTOT:42934
+    "TOTJ": ("array", ("MDEPTH", ), "np.float64"),  # inline /TOTJHK/ TOTJ(MDEPTH)
+    "TOTH": ("array", ("MDEPTH", ), "np.float64"),  # inline /TOTJHK/ TOTH(MDEPTH)
+    "TOTK": ("array", ("MDEPTH", ), "np.float64"),  # inline /TOTJHK/ TOTK(MDEPTH)
+    "RDOPAC": ("array", ("MDEPTH", ), "np.float64"),  # inline /TOTJHK/ RDOPAC(MDEPTH)
+    "FLOPAC": ("array", ("MDEPTH", ), "np.float64"),  # inline /TOTJHK/ FLOPAC(MDEPTH)
 }
 
 _DTYPES = {
@@ -1813,12 +1816,12 @@ _SCALAR_DEFAULTS = {
 
 
 def _dim(expr):
-    """求值维度表达式（标识符取自 params.py）。"""
+    """Evaluate a dimension expression (identifiers taken from params.py)."""
     return int(eval(expr, {"__builtins__": {}}, dict(vars(P))))
 
 
 def _allocate(name):
-    """按 DECLS 声明分配变量：数组每维 +1，标量返回默认值。"""
+    """Allocate a variable per its DECLS declaration: arrays +1 per dimension, scalars return a default."""
     kind, dims, dtype = DECLS[name]
     if kind == "scalar":
         return _SCALAR_DEFAULTS[dtype]
@@ -1831,9 +1834,9 @@ def _allocate(name):
 
 
 def __getattr__(name):
-    """PEP 562：首次访问 COMMON 变量时懒分配并缓存到模块全局。"""
+    """PEP 562: lazily allocate a COMMON variable on first access and cache it in module globals."""
     if name not in DECLS:
-        raise AttributeError("commons 中未声明的 COMMON 变量: %r" % name)
+        raise AttributeError("COMMON variable not declared in commons: %r" % name)
     value = _allocate(name)
     globals()[name] = value
     return value
